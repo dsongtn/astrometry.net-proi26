@@ -354,11 +354,11 @@ int main(int argc, char **args)
 
     i = optind;
 
-    // Job run engine loop 
+    // Job run engine loop
     while (1)
     {
         char *jobfn;
-        job_t *job;
+        job_t *job;  // what is in job struct? 
         struct timeval tv1, tv2;
 
         if (infn)

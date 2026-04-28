@@ -8,7 +8,7 @@
 #include "astrometry/fitstable.h"
 #include "astrometry/index.h"
 #include "astrometry/an-bool.h"
-
+// index_params for what ? 
 struct index_params {
     // catalog:
     const char* racol;
