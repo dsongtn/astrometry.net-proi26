@@ -54,13 +54,13 @@
 static an_option_t myopts[] = {
     {'h', "help", no_argument, NULL, "print this help"},
     {'v', "verbose", no_argument, NULL, "+verbose"},
-    {'c', "config",  required_argument, "file",
+    {'c', "config", required_argument, "file",
      "Use this config file (default: \"astrometry.cfg\" in the directory ../etc/ relative to the directory containing the \"astrometry-engine\" executable); 'none' for no config file"},
-    {'d', "base-dir",  required_argument, "dir", 
+    {'d', "base-dir", required_argument, "dir",
      "set base directory of all output filenames."},
-    {'C', "cancel",  required_argument, "file", 
-     "quit solving if this file appears" },
-    {'s', "solved",  required_argument, "file",
+    {'C', "cancel", required_argument, "file",
+     "quit solving if this file appears"},
+    {'s', "solved", required_argument, "file",
      "write to this file when a field is solved"},
     {'E', "to-stderr", no_argument, NULL,
      "send log message to stderr"},
@@ -78,57 +78,65 @@ static an_option_t myopts[] = {
      "IGNORED; purely to allow process to contain the job id!"},
 };
 
-static void print_help(const char* progname, bl* opts) {
+static void print_help(const char *progname, bl *opts)
+{
     printf("Usage:   %s [options] <augmented xylist (axy) file(s)>\n", progname);
     opts_print_help(opts, stdout, NULL, NULL);
 }
 
-FILE* datalogfid = NULL;
-static void close_datalogfid() {
-    if (datalogfid) {
+FILE *datalogfid = NULL;
+static void close_datalogfid()
+{
+    if (datalogfid)
+    {
         data_log_end();
-        if (fclose(datalogfid)) {
+        if (fclose(datalogfid))
+        {
             SYSERROR("Failed to close data log file");
         }
     }
 }
 
-int main(int argc, char** args) {
-    char* default_configfn = "astrometry.cfg";
-    char* default_config_path = "../etc";
-
+int main(int argc, char **args)
+{
+    char *default_configfn = "astrometry.cfg"; // hard link to cfg
+    char *default_config_path = "../etc";
+    // Spin up
     int c;
-    char* configfn = NULL;
+    char *configfn = NULL;
     int i;
-    engine_t* engine;
-    char* mydir = NULL;
-    char* basedir = NULL;
-    char* me;
+    engine_t *engine;
+    char *mydir = NULL;
+    char *basedir = NULL;
+    char *me;
     anbool help = FALSE;
-    sl* strings = sl_new(4);
-    char* cancelfn = NULL;
-    char* solvedfn = NULL;
+    sl *strings = sl_new(4);
+    char *cancelfn = NULL;
+    char *solvedfn = NULL;
     int loglvl = LOG_MSG;
     anbool tostderr = FALSE;
-    char* infn = NULL;
-    FILE* fin = NULL;
+    char *infn = NULL;
+    FILE *fin = NULL;
     anbool fromstdin = FALSE;
 
-    bl* opts = opts_from_array(myopts, sizeof(myopts)/sizeof(an_option_t), NULL);
-    sl* index_files = sl_new(4);
-    sl* index_dirs = sl_new(4);
+    bl *opts = opts_from_array(myopts, sizeof(myopts) / sizeof(an_option_t), NULL);
+    sl *index_files = sl_new(4);
+    sl *index_dirs = sl_new(4);
 
-    char* datalog = NULL;
+    char *datalog = NULL;
 
-    engine = engine_new();
+    engine = engine_new(); // start new engine
 
-    while (1) {
+    // run loop for CLI command ?
+    while (1)
+    {
         c = opts_getopt(opts, argc, args);
         if (c == -1)
             break;
-        switch (c) {
-	case 'j':
-	    break;
+        switch (c)
+        {
+        case 'j':
+            break;
         case 'D':
             datalog = optarg;
             break;
@@ -169,16 +177,18 @@ int main(int argc, char** args) {
             break;
         default:
             printf("Unknown flag %c\n", c);
-            exit( -1);
+            exit(-1);
         }
     }
 
-    if (optind == argc && !infn) {
+    if (optind == argc && !infn)
+    {
         // Need extra args: filename
         printf("You must specify at least one input file!\n\n");
         help = TRUE;
     }
-    if (help) {
+    if (help)
+    {
         print_help(args[0], opts);
         exit(0);
     }
@@ -190,9 +200,11 @@ int main(int argc, char** args) {
     if (tostderr)
         log_to(stderr);
 
-    if (datalog) {
+    if (datalog)
+    {
         datalogfid = fopen(datalog, "wb");
-        if (!datalogfid) {
+        if (!datalogfid)
+        {
             SYSERROR("Failed to open data log file \"%s\" for writing", datalog);
             return -1;
         }
@@ -203,15 +215,19 @@ int main(int argc, char** args) {
         data_log_start();
     }
 
-    if (infn) {
+    if (infn)
+    {
         logverb("Reading input filenames from %s\n", (fromstdin ? "stdin" : infn));
-        if (!fromstdin) {
+        if (!fromstdin)
+        {
             fin = fopen(infn, "rb");
-            if (!fin) {
+            if (!fin)
+            {
                 ERROR("Failed to open file %s for reading input filenames", infn);
                 exit(-1);
             }
-        } else
+        }
+        else
             fin = stdin;
     }
 
@@ -223,65 +239,81 @@ int main(int argc, char** args) {
     free(me);
 
     // Read config file
-    if (!configfn) {
+    if (!configfn)
+    {
         int i;
-        sl* trycf = sl_new(4);
+        sl *trycf = sl_new(4);
         sl_appendf(trycf, "%s/%s/%s", mydir, default_config_path, default_configfn);
         // if I'm in /usr/bin, look for config file in /etc
-        if (streq(mydir, "/usr/bin")) {
+        if (streq(mydir, "/usr/bin"))
+        {
             sl_appendf(trycf, "/etc/%s", default_configfn);
         }
         sl_appendf(trycf, "%s/%s", mydir, default_configfn);
         sl_appendf(trycf, "./%s", default_configfn);
         sl_appendf(trycf, "./%s/%s", default_config_path, default_configfn);
-        for (i=0; i<sl_size(trycf); i++) {
-            char* cf = sl_get(trycf, i);
-            if (file_exists(cf)) {
+        for (i = 0; i < sl_size(trycf); i++)
+        {
+            char *cf = sl_get(trycf, i);
+            if (file_exists(cf))
+            {
                 configfn = strdup(cf);
                 logverb("Using config file \"%s\"\n", cf);
                 break;
-            } else {
+            }
+            else
+            {
                 logverb("Config file \"%s\" doesn't exist.\n", cf);
             }
         }
-        if (!configfn) {
-            char* cflist = sl_join(trycf, "\n  ");
+        if (!configfn)
+        {
+            char *cflist = sl_join(trycf, "\n  ");
             logerr("Couldn't find config file: tried:\n  %s\n", cflist);
             free(cflist);
         }
         sl_free2(trycf);
     }
 
-    if (!streq(configfn, "none")) {
-        if (engine_parse_config_file(engine, configfn)) {
+    if (!streq(configfn, "none"))
+    {
+        if (engine_parse_config_file(engine, configfn))
+        {
             logerr("Failed to parse (or encountered an error while interpreting) config file \"%s\"\n", configfn);
-            exit( -1);
+            exit(-1);
         }
     }
 
-    if (sl_size(index_dirs)) {
+    if (sl_size(index_dirs))
+    {
         // save the engine_t state, add the search paths & auto-index them, then revert.
-        sl* saved_paths = engine->index_paths;
+        sl *saved_paths = engine->index_paths;
         engine->index_paths = index_dirs;
-        if (engine_autoindex_search_paths(engine)) {
+        if (engine_autoindex_search_paths(engine))
+        {
             logerr("Failed to search directories for index files: [%s]", sl_join(index_dirs, ", "));
-            exit( -1);
+            exit(-1);
         }
         engine->index_paths = saved_paths;
     }
 
-    if (sl_size(index_files)) {
+    if (sl_size(index_files))
+    {
         // Expand globs.
-        for (i=0; i<sl_size(index_files); i++) {
-            char* s = sl_get(index_files, i);
+        for (i = 0; i < sl_size(index_files); i++)
+        {
+            char *s = sl_get(index_files, i);
             glob_t myglob;
             int flags = GLOB_TILDE | GLOB_BRACE;
-            if (glob(s, flags, NULL, &myglob)) {
+            if (glob(s, flags, NULL, &myglob))
+            {
                 SYSERROR("Failed to expand wildcards in index-file path \"%s\"", s);
                 exit(-1);
             }
-            for (c=0; c<myglob.gl_pathc; c++) {
-                if (engine_add_index(engine, myglob.gl_pathv[c])) {
+            for (c = 0; c < myglob.gl_pathc; c++)
+            {
+                if (engine_add_index(engine, myglob.gl_pathv[c]))
+                {
                     ERROR("Failed to add index \"%s\"", myglob.gl_pathv[c]);
                     exit(-1);
                 }
@@ -290,24 +322,28 @@ int main(int argc, char** args) {
         }
     }
 
-    if (!pl_size(engine->indexes)) {
+    if (!pl_size(engine->indexes))
+    {
         logerr("\n\n"
                "---------------------------------------------------------------------\n"
                "You must list at least one index in the config file (%s)\n\n"
                "See http://astrometry.net/use.html about how to get some index files.\n"
                "---------------------------------------------------------------------\n"
-               "\n", configfn);
+               "\n",
+               configfn);
         exit(-1);
     }
 
-    if (engine->minwidth <= 0.0 || engine->maxwidth <= 0.0) {
+    if (engine->minwidth <= 0.0 || engine->maxwidth <= 0.0)
+    {
         logerr("\"minwidth\" and \"maxwidth\" in the config file %s must be positive!\n", configfn);
         exit(-1);
     }
 
     free(configfn);
 
-    if (!il_size(engine->default_depths)) {
+    if (!il_size(engine->default_depths))
+    {
         parse_depth_string(engine->default_depths,
                            "10 20 30 40 50 60 70 80 90 100 "
                            "110 120 130 140 150 160 170 180 190 200");
@@ -317,18 +353,24 @@ int main(int argc, char** args) {
     engine->solvedfn = solvedfn;
 
     i = optind;
-    while (1) {
-        char* jobfn;
-        job_t* job;
+
+    // Job run engine loop 
+    while (1)
+    {
+        char *jobfn;
+        job_t *job;
         struct timeval tv1, tv2;
 
-        if (infn) {
+        if (infn)
+        {
             // Read name of next input file to be read.
             logverb("\nWaiting for next input filename...\n");
             jobfn = read_string_terminated(fin, "\n\r\0", 3, FALSE);
             if (strlen(jobfn) == 0)
                 break;
-        } else {
+        }
+        else
+        {
             if (i == argc)
                 break;
             jobfn = args[i];
@@ -337,24 +379,27 @@ int main(int argc, char** args) {
         gettimeofday(&tv1, NULL);
         logmsg("Reading file \"%s\"...\n", jobfn);
         job = engine_read_job_file(engine, jobfn);
-        if (!job) {
+        if (!job)
+        {
             ERROR("Failed to read job file \"%s\"", jobfn);
             exit(-1);
         }
 
-	if (basedir) {
+        if (basedir) //Output setting
+        {
             logverb("Setting job's output base directory to %s\n", basedir);
             job_set_output_base_dir(job, basedir);
-	}
+        }
 
-        if (engine_run_job(engine, job))
+        if (engine_run_job(engine, job)) // Call engine to do job.
             logerr("Failed to run_job()\n");
 
         job_free(job);
         gettimeofday(&tv2, NULL);
-        logverb("Spent %g seconds on this field.\n", millis_between(&tv1, &tv2)/1000.0);
+        logverb("Spent %g seconds on this field.\n", millis_between(&tv1, &tv2) / 1000.0);
     }
 
+    // Clean engine after use
     engine_free(engine);
     sl_free2(strings);
     sl_free2(index_files);

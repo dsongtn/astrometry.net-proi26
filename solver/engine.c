@@ -61,7 +61,7 @@ char* engine_find_index(engine_t* engine, const char* name) {
             }
         else
             asprintf_safe(&path, "%s/%s", sl_get(engine->index_paths, j), name);
-        
+
         logverb("Trying path %s...\n", path);
         if (index_is_file_index(path))
             return path;
@@ -69,7 +69,7 @@ char* engine_find_index(engine_t* engine, const char* name) {
     }
     return NULL;
 }
-
+//staging of index files for comparision
 int engine_autoindex_search_paths(engine_t* engine) {
     int i;
     // Search the paths specified and add any indexes that are found.
@@ -132,7 +132,7 @@ int engine_autoindex_search_paths(engine_t* engine) {
     }
     return 0;
 }
-
+//adding index
 static int add_index(engine_t* engine, index_t* ind) {
     int k;
     // check that an index with the same id and healpix isn't already listed.
@@ -370,7 +370,7 @@ int engine_parse_config_file_stream(engine_t* engine, FILE* fconf) {
             }
             pl_append(engine->free_indexes, indx);
             logverb("Added index %s from indexset %s\n", indx->indexfn, ind);
-            
+
             i++;
         }
         pl_free(indexes);
@@ -477,7 +477,7 @@ static double job_imageh(job_t* job) {
 int engine_run_job(engine_t* engine, job_t* job) {
     onefield_t* bp = &(job->bp);
     solver_t* sp = &(bp->solver);
-    
+
     int i;
     double app_min_default;
     double app_max_default;
@@ -758,7 +758,7 @@ static anbool parse_job_from_qfits_header(const qfits_header* hdr, job_t* job) {
     sp->set_crpix_center = qfits_header_getboolean(hdr, "ANCRPIXC", FALSE);
     sp->crpix[0] = qfits_header_getdouble(hdr, "ANCRPIX1", sp->crpix[0]);
     sp->crpix[1] = qfits_header_getdouble(hdr, "ANCRPIX2", sp->crpix[1]);
-    sp->set_crpix = (sp->set_crpix_center || 
+    sp->set_crpix = (sp->set_crpix_center ||
                      // were the values set?
                      qfits_header_getstr(hdr, "ANCRPIX1") ||
                      qfits_header_getstr(hdr, "ANCRPIX2"));
@@ -954,7 +954,7 @@ static anbool parse_job_from_qfits_header(const qfits_header* hdr, job_t* job) {
     } while (0);
 
     sp->pixel_xscale = qfits_header_getdouble(hdr, "ANPXSCAL", 0.);
-    
+
     run = qfits_header_getboolean(hdr, "ANRUN", FALSE);
 
     // Default: solve first field.

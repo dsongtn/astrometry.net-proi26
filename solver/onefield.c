@@ -48,10 +48,10 @@ static anbool record_match_callback(MatchObj* mo, void* userdata);
 static time_t timer_callback(void* user_data);
 static void add_onefield_params(onefield_t* bp, qfits_header* hdr);
 static void load_and_parse_wcsfiles(onefield_t* bp);
-static void solve_fields(onefield_t* bp, sip_t* verify_wcs);
-static void remove_invalid_fields(il* fieldlist, int maxfield);
+static void solve_fields(onefield_t* bp, sip_t* verify_wcs); //orchestration- must be step 1
+static void remove_invalid_fields(il* fieldlist, int maxfield); // clean up ops
 static anbool is_field_solved(onefield_t* bp, int fieldnum);
-static int write_solutions(onefield_t* bp);
+static int write_solutions(onefield_t* bp); //solutions collection
 static void solved_field(onefield_t* bp, int fieldnum);
 static int compare_matchobjs(const void* v1, const void* v2);
 static void remove_duplicate_solutions(onefield_t* bp);
@@ -841,9 +841,9 @@ static void add_onefield_params(onefield_t* bp, qfits_header* hdr) {
     fits_add_long_comment(hdr, "Y col name: %s", bp->ycolname?bp->ycolname:"(null)");
     fits_add_long_comment(hdr, "Start obj: %i", sp->startobj);
     fits_add_long_comment(hdr, "End obj: %i", sp->endobj);
-	
+
     // 'Solved_in' is often a NULL pointer.
-    // If %s is a NULL pointer, vasprintf() causes a segmentation fault (due to strlen()) on Solaris -> added treatment of this case for portability. 
+    // If %s is a NULL pointer, vasprintf() causes a segmentation fault (due to strlen()) on Solaris -> added treatment of this case for portability.
     // GNU/Linux implementation of vasprintf() catches NULL pointer and prints "(null)" in header. Seems to be an issue on Solaris only.
     fits_add_long_comment(hdr, "Solved_in: %s", bp->solved_in?bp->solved_in:"(null)");
     fits_add_long_comment(hdr, "Solved_out: %s", bp->solved_out?bp->solved_out:"(null)");
@@ -885,7 +885,7 @@ static void remove_invalid_fields(il* fieldlist, int maxfield) {
     }
 }
 
-static void solve_fields(onefield_t* bp, sip_t* verify_wcs) {
+static void solve_fields(onefield_t* bp, sip_t* verify_wcs) { // orchestration for solver_run
     solver_t* sp = &(bp->solver);
     double last_utime, last_stime;
     double utime, stime;
@@ -1031,7 +1031,7 @@ static anbool is_field_solved(onefield_t* bp, int fieldnum) {
 }
 
 static void solved_field(onefield_t* bp, int fieldnum) {
-    // Record in solved file, or send to solved server.
+    // Record in solved file, or send to solved server. // what is
     if (bp->solved_out) {
         logmsg("Field %i solved: writing to file %s to indicate this.\n", fieldnum, bp->solved_out);
         if (solvedfile_set(bp->solved_out, fieldnum)) {
@@ -1306,7 +1306,7 @@ static int write_wcs_file(onefield_t* bp) {
 
         if (strlen(mo->fieldname))
             qfits_header_add(hdr, bp->fieldid_key, mo->fieldname, "Field name (copied from input field)", NULL);
-			
+
         if (qfits_header_dump(hdr, fout)) {
             logerr("Failed to write FITS WCS header.\n");
             return -1;
@@ -1409,7 +1409,7 @@ static int write_corr_file(onefield_t* bp) {
         fitstable_add_write_column(tab, itype, "index_id", "none");
         fitstable_add_write_column(tab, itype, "field_id", "none");
         fitstable_add_write_column(tab, dubl, "match_weight", "none");
-		
+
         if (mo->tagalong) {
             for (j=0; j<bl_size(mo->tagalong); j++) {
                 tagalong_t* tag = bl_access(mo->tagalong, j);
@@ -1497,7 +1497,7 @@ static int write_corr_file(onefield_t* bp) {
                 }
             }
         }
-		
+
         if (fitstable_fix_header(tab)) {
             ERROR("Failed to fix correspondence file header.");
             return -1;
