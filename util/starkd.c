@@ -135,7 +135,7 @@ void startree_search_for(const startree_t* s, const double* xyzcenter, double ra
         opts |= KD_OPTIONS_RETURN_POINTS;
 
     res = kdtree_rangesearch_options(s->tree, xyzcenter, radius2, opts);
-	
+
     if (!res || !res->nres) {
         if (xyzresults)
             *xyzresults = NULL;
@@ -584,7 +584,7 @@ static int write_to_file(startree_t* s, const char* fn, anbool flipped,
 
     if (flipped)
         il_free(wordsizes);
-    
+
     if (io)
         kdtree_fits_io_close(io);
     return 0;

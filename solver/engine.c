@@ -528,12 +528,12 @@ int engine_run_job(engine_t* engine, job_t* job) {
                 app_min = app_min_default;
             if (app_max == 0.0)
                 app_max = app_max_default;
-            sp->funits_lower = app_min;
-            sp->funits_upper = app_max;
+            sp->funits_lower = app_min; // lower scale bound for this job
+            sp->funits_upper = app_max; // upper scale bound
 
-            sp->startobj = startobj;
+            sp->startobj = startobj; // first field object considered
             if (endobj)
-                sp->endobj = endobj;
+                sp->endobj = endobj; // one past last field object
 
             // minimum quad size to try (in pixels)
             sp->quadsize_min = bp->quad_size_fraction_lo *
@@ -551,7 +551,7 @@ int engine_run_job(engine_t* engine, job_t* job) {
             for (k = 0; k < pl_size(engine->indexes); k++) {
                 index_t* index = pl_get(engine->indexes, k);
                 if (!index_overlaps_scale_range(index, fmin, fmax))
-                    continue;
+                    continue; // skip index outside image scale range
                 il_append(indexlist, k);
             }
 
@@ -579,7 +579,7 @@ int engine_run_job(engine_t* engine, job_t* job) {
                             index->indexname, job->search_radius, job->ra_center, job->dec_center);
                     continue;
                 }
-                add_index_to_onefield(engine, bp, ii);
+                add_index_to_onefield(engine, bp, ii); // store selected engine index slot in bp
             }
 
             il_free(indexlist);
@@ -587,7 +587,7 @@ int engine_run_job(engine_t* engine, job_t* job) {
             logverb("Running solver:\n");
             onefield_log_run_parameters(bp);
 
-            onefield_run(bp);
+            onefield_run(bp); // run solver with selected index candidates
 
             // we only want to try using the verify_wcses the first time.
             onefield_clear_verify_wcses(bp);
@@ -658,8 +658,8 @@ static void parse_sip_coeffs(const qfits_header* hdr, const char* prefix, sip_t*
 }
 
 static anbool parse_job_from_qfits_header(const qfits_header* hdr, job_t* job) {
-    onefield_t* bp = &(job->bp);
-    solver_t* sp = &(bp->solver);
+    onefield_t *bp = &(job->bp); // points to job-owned onefield_t
+    solver_t *sp = &(bp->solver); // points to solver_t embedded in bp
 
     double dnil = -LARGE_VAL;
     char *pstr;
