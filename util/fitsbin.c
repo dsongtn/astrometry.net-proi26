@@ -257,16 +257,7 @@ fitsbin_mmap_advice_t fitsbin_get_chunk_mmap_advice(
     if (!chunk) {
         return FITSBIN_MMAP_ADVICE_NORMAL;
     }
-
-    switch (chunk->mmap_region) {
-    case FITSBIN_MMAP_REGION_PAYLOAD:
-        return fitsbin_get_mmap_advice(fb);
-
-    case FITSBIN_MMAP_REGION_TOPOLOGY:
-        return FITSBIN_MMAP_ADVICE_NORMAL;
-    }
-
-    return FITSBIN_MMAP_ADVICE_NORMAL;
+    return fitsbin_get_mmap_advice(fb);
 }
 
 void fitsbin_mmap_advice_state_reset(

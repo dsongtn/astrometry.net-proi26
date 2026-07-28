@@ -4173,8 +4173,7 @@ static int solver_ab_candidate_prepare(
     const int* fieldstars,
     int dimquads,
     const solver_ab_snapshot_t* snapshot,
-    anbool current_parity,
-    const unsigned int* prepared_stars) {
+    anbool current_parity) {
     double starxyz[DQMAX * 3];
     double scale;
     double arcsecperpix;
@@ -4191,17 +4190,11 @@ static int solver_ab_candidate_prepare(
     thisquadno = result->inds[result_index];
     candidate->quadno = thisquadno;
     candidate->code_err = result->sdists[result_index];
-    if (prepared_stars) {
-        memcpy(star,
-               prepared_stars,
-               (size_t)dimquads * sizeof(*star));
-    } else {
-        if (quadfile_get_stars(
-                snapshot->index->quads,
-                thisquadno,
-                star)) {
-            return -1;
-        }
+    if (quadfile_get_stars(
+            snapshot->index->quads,
+            thisquadno,
+            star)) {
+        return -1;
     }
 
     if (snapshot->use_radec) {
@@ -4544,8 +4537,7 @@ static int solver_ab_record_hypothesis(
                 stars,
                 dimquad,
                 &executor->snapshot,
-                current_parity,
-                NULL)) {
+                current_parity)) {
             packet->evaluation_failed = TRUE;
             builder->fatal_error = TRUE;
             return -1;
@@ -6474,104 +6466,6 @@ static void solver_payload_advise_verification_search(
         options);
     (void)solver_payload_page_plan_flush(&page_plan);
     solver_payload_page_plan_destroy(&page_plan);
-}
-
-typedef struct solver_candidate_payload_workspace {
-    unsigned int* stars;
-    unsigned int* advice_starids;
-    unsigned char* valid;
-    size_t capacity;
-} solver_candidate_payload_workspace_t;
-
-static pthread_key_t solver_candidate_payload_workspace_key;
-static pthread_once_t solver_candidate_payload_workspace_once =
-    PTHREAD_ONCE_INIT;
-static int solver_candidate_payload_workspace_status = EAGAIN;
-
-static void solver_candidate_payload_workspace_destroy(void* opaque) {
-    solver_candidate_payload_workspace_t* workspace = opaque;
-
-    if (!workspace) {
-        return;
-    }
-    free(workspace->stars);
-    free(workspace->advice_starids);
-    free(workspace->valid);
-    free(workspace);
-}
-
-static void solver_candidate_payload_workspace_make_key(void) {
-    solver_candidate_payload_workspace_status =
-        pthread_key_create(
-            &solver_candidate_payload_workspace_key,
-            solver_candidate_payload_workspace_destroy);
-}
-
-static solver_candidate_payload_workspace_t*
-solver_candidate_payload_workspace_get(size_t needed) {
-    solver_candidate_payload_workspace_t* workspace;
-
-    if (!needed ||
-        needed > SIZE_MAX / (size_t)DQMAX ||
-        pthread_once(
-            &solver_candidate_payload_workspace_once,
-            solver_candidate_payload_workspace_make_key) ||
-        solver_candidate_payload_workspace_status) {
-        return NULL;
-    }
-    workspace = pthread_getspecific(
-        solver_candidate_payload_workspace_key);
-    if (!workspace) {
-        workspace = calloc(1, sizeof(*workspace));
-        if (!workspace ||
-            pthread_setspecific(
-                solver_candidate_payload_workspace_key,
-                workspace)) {
-            solver_candidate_payload_workspace_destroy(workspace);
-            return NULL;
-        }
-    }
-    if (workspace->capacity < needed) {
-        unsigned int* stars;
-        unsigned int* advice_starids;
-        unsigned char* valid;
-        size_t capacity = workspace->capacity
-            ? workspace->capacity : 16U;
-        size_t star_count;
-
-        while (capacity < needed) {
-            if (capacity > SIZE_MAX / 2U) {
-                return NULL;
-            }
-            capacity *= 2U;
-        }
-        if (capacity > SIZE_MAX / (size_t)DQMAX) {
-            return NULL;
-        }
-        star_count = capacity * (size_t)DQMAX;
-        if (star_count > SIZE_MAX / sizeof(*stars) ||
-            capacity > SIZE_MAX / sizeof(*valid)) {
-            return NULL;
-        }
-        stars = malloc(star_count * sizeof(*stars));
-        advice_starids = malloc(
-            star_count * sizeof(*advice_starids));
-        valid = malloc(capacity * sizeof(*valid));
-        if (!stars || !advice_starids || !valid) {
-            free(stars);
-            free(advice_starids);
-            free(valid);
-            return NULL;
-        }
-        free(workspace->stars);
-        free(workspace->advice_starids);
-        free(workspace->valid);
-        workspace->stars = stars;
-        workspace->advice_starids = advice_starids;
-        workspace->valid = valid;
-        workspace->capacity = capacity;
-    }
-    return workspace;
 }
 
 typedef struct solver_verification_score_slot {
