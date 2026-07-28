@@ -150,6 +150,8 @@ static fitsbin_t* new_fitsbin(const char* fn) {
  * configured production policy is consumed only by an explicit shard pass.
  */
 static ASTROMETRY_THREAD_LOCAL int fitsbin_thread_mmap_advice = -1;
+static ASTROMETRY_THREAD_LOCAL anbool
+    fitsbin_thread_payload_fully_resident = FALSE;
 
 static fitsbin_mmap_advice_t fitsbin_mmap_policy_initial_advice(
     fitsbin_mmap_policy_t policy) {
@@ -192,9 +194,10 @@ fitsbin_mmap_policy_t fitsbin_mmap_policy_parse(
 
 fitsbin_mmap_policy_t fitsbin_get_configured_mmap_policy(void) {
     /*
-     * Parallel shards traverse every mapped index component out of order.
-     * W2+ shard and preparation threads install RANDOM for all chunks.
-     * Serial callers have no thread-local advice and retain NORMAL.
+     * W2+ shard and preparation threads install RANDOM as the sparse payload
+     * policy. Compact traversal topology remains NORMAL through the chunk
+     * classification below. Serial callers have no thread-local advice and
+     * retain NORMAL for every component.
      */
     return FITSBIN_MMAP_POLICY_FIXED_RANDOM;
 }
@@ -256,6 +259,15 @@ fitsbin_mmap_advice_t fitsbin_get_chunk_mmap_advice(
     if (!chunk) {
         return FITSBIN_MMAP_ADVICE_NORMAL;
     }
+
+    /*
+     * Tree topology is repeatedly traversed in address-correlated order.
+     * Applying the sparse payload policy here disables useful kernel
+     * readahead and turns topology descent into synchronous one-page faults.
+     */
+    if (chunk->mmap_region == FITSBIN_MMAP_REGION_TOPOLOGY) {
+        return FITSBIN_MMAP_ADVICE_NORMAL;
+    }
     return fitsbin_get_mmap_advice(fb);
 }
 
@@ -314,6 +326,22 @@ fitsbin_mmap_advice_t fitsbin_mmap_current_advice(void) {
 
 anbool fitsbin_mmap_thread_advice_active(void) {
     return fitsbin_thread_mmap_advice >= 0;
+}
+
+void fitsbin_payload_set_thread_full_resident(void) {
+    fitsbin_thread_payload_fully_resident = TRUE;
+}
+
+void fitsbin_payload_clear_thread_full_resident(void) {
+    fitsbin_thread_payload_fully_resident = FALSE;
+}
+
+anbool fitsbin_payload_is_fully_resident(
+    const fitsbin_t* fb) {
+    if (!fb) {
+        return FALSE;
+    }
+    return fb->payload_fully_resident;
 }
 
 anbool fitsbin_mmap_policy_complete_pass(
@@ -406,6 +434,8 @@ int fitsbin_configure_index_mmap(fitsbin_t* fb) {
      * callers have no thread-local override and retain NORMAL.
      */
     fb->mmap_advice = fitsbin_mmap_current_advice();
+    fb->payload_fully_resident =
+        fitsbin_thread_payload_fully_resident;
     fb->mmap_advice_failed = FALSE;
 
     /*
@@ -423,31 +453,109 @@ int fitsbin_configure_index_mmap(fitsbin_t* fb) {
     return 0;
 }
 
-#define FITSBIN_PREFETCH_RANGE_LIMIT 256U
+#define FITSBIN_PREFETCH_RANGE_LIMIT \
+    FITSBIN_PREAD_ASYNC_RANGE_LIMIT
 #define FITSBIN_PREFETCH_COPY_CHUNK (16U * 1024U)
 #define FITSBIN_PAYLOAD_POPULATE_TOTAL_BUDGET \
     (16U * 1024U * 1024U)
+#define FITSBIN_PAYLOAD_IO_MAX_LANES 2
+#define FITSBIN_PAYLOAD_IO_MAX_JOBS 24U
+#define FITSBIN_PAYLOAD_IO_MAX_BYTES \
+    (64U * 1024U * 1024U)
+#define FITSBIN_PAYLOAD_IO_PRIORITY_COUNT 3U
+#define FITSBIN_PAYLOAD_IO_DEMAND_RESERVED_JOBS 1U
+#define FITSBIN_PAYLOAD_IO_DEMAND_RESERVED_BYTES \
+    (FITSBIN_PAYLOAD_IO_MAX_BYTES / 4U)
 
 typedef struct fitsbin_file_span {
     off_t begin;
     off_t end;
 } fitsbin_file_span_t;
 
+typedef struct fitsbin_prepared_pread_range {
+    off_t offset;
+    size_t size;
+    size_t logical_size;
+    void* destination;
+} fitsbin_prepared_pread_range_t;
+
+typedef enum fitsbin_payload_io_ticket_kind {
+    FITSBIN_PAYLOAD_IO_TICKET_PREFETCH = 0,
+    FITSBIN_PAYLOAD_IO_TICKET_DIRECT
+} fitsbin_payload_io_ticket_kind_t;
+
+typedef enum fitsbin_payload_io_ticket_state {
+    FITSBIN_PAYLOAD_IO_PLANNED = 0,
+    FITSBIN_PAYLOAD_IO_SUBMITTED,
+    FITSBIN_PAYLOAD_IO_READY,
+    FITSBIN_PAYLOAD_IO_FAILED,
+    FITSBIN_PAYLOAD_IO_CANCELLED
+} fitsbin_payload_io_ticket_state_t;
+
+struct fitsbin_payload_io_ticket {
+    fitsbin_file_span_t spans[FITSBIN_PREFETCH_RANGE_LIMIT];
+    fitsbin_prepared_pread_range_t* ranges;
+    size_t span_count;
+    size_t range_count;
+    size_t byte_count;
+    size_t logical_byte_count;
+    unsigned long long page_count;
+    unsigned long long sequence;
+    unsigned long long read_nanoseconds;
+    fitsbin_payload_io_ticket_state_t state;
+    fitsbin_payload_io_ticket_kind_t kind;
+    fitsbin_payload_io_priority_t priority;
+    struct fitsbin_payload_io_ticket* next;
+    int fd;
+    int saved_errno;
+    anbool cancel_requested;
+    anbool counters_applied;
+};
+
 static pthread_mutex_t fitsbin_payload_io_mutex =
     PTHREAD_MUTEX_INITIALIZER;
+/* Queue and ticket state changes. */
 static pthread_cond_t fitsbin_payload_io_cv =
+    PTHREAD_COND_INITIALIZER;
+/* Reader-credit availability, kept separate from ticket waiters. */
+static pthread_cond_t fitsbin_payload_io_credit_cv =
     PTHREAD_COND_INITIALIZER;
 static int fitsbin_payload_io_capacity = 1;
 static int fitsbin_payload_io_limit = 1;
 static int fitsbin_payload_io_active = 0;
 static size_t fitsbin_payload_io_waiters = 0U;
-static unsigned int fitsbin_payload_io_demand_pressure = 0U;
 static size_t fitsbin_payload_io_wait_helpers = 0U;
 static unsigned int fitsbin_payload_io_helper_windows = 0U;
 static unsigned long long fitsbin_payload_io_work_epoch = 0ULL;
+static pthread_t
+    fitsbin_payload_io_threads[FITSBIN_PAYLOAD_IO_MAX_LANES];
+static fitsbin_payload_io_ticket_t*
+    fitsbin_payload_io_queue_head[FITSBIN_PAYLOAD_IO_PRIORITY_COUNT];
+static fitsbin_payload_io_ticket_t*
+    fitsbin_payload_io_queue_tail[FITSBIN_PAYLOAD_IO_PRIORITY_COUNT];
+static size_t fitsbin_payload_io_service_jobs = 0U;
+static size_t fitsbin_payload_io_service_bytes = 0U;
+static unsigned long long fitsbin_payload_io_next_sequence = 0ULL;
+static unsigned long long fitsbin_payload_io_service_submitted = 0ULL;
+static unsigned long long fitsbin_payload_io_service_ready = 0ULL;
+static unsigned long long
+    fitsbin_payload_io_service_direct_submitted = 0ULL;
+static unsigned long long
+    fitsbin_payload_io_service_direct_ready = 0ULL;
+static unsigned long long fitsbin_payload_io_service_cancelled = 0ULL;
+static unsigned long long fitsbin_payload_io_service_failed = 0ULL;
+static unsigned long long fitsbin_payload_io_service_planned_bytes = 0ULL;
+static unsigned long long fitsbin_payload_io_service_read_nanoseconds = 0ULL;
+static int fitsbin_payload_io_service_lanes = 0;
+static anbool fitsbin_payload_io_service_running = FALSE;
+static anbool fitsbin_payload_io_service_accepting = FALSE;
+static anbool fitsbin_payload_io_service_stopping = FALSE;
 static ASTROMETRY_THREAD_LOCAL
     fitsbin_payload_io_wait_helper_fn
     fitsbin_payload_io_thread_wait_helper = NULL;
+static ASTROMETRY_THREAD_LOCAL
+    fitsbin_payload_io_stop_check_fn
+    fitsbin_payload_io_thread_stop_check = NULL;
 static ASTROMETRY_THREAD_LOCAL void*
     fitsbin_payload_io_thread_wait_opaque = NULL;
 static ASTROMETRY_THREAD_LOCAL anbool
@@ -480,25 +588,6 @@ static unsigned long long fitsbin_timespec_delta_nanoseconds(
         (unsigned long long)nanoseconds;
 }
 
-static void fitsbin_payload_io_publish_demand_pressure(void) {
-    int active = __atomic_load_n(
-        &fitsbin_payload_io_active,
-        __ATOMIC_ACQUIRE);
-    int limit = __atomic_load_n(
-        &fitsbin_payload_io_limit,
-        __ATOMIC_ACQUIRE);
-    unsigned int pressure =
-        __atomic_load_n(
-            &fitsbin_payload_io_waiters,
-            __ATOMIC_ACQUIRE) > 0U ||
-        active >= limit;
-
-    __atomic_store_n(
-        &fitsbin_payload_io_demand_pressure,
-        pressure,
-        __ATOMIC_RELEASE);
-}
-
 /* fitsbin_payload_io_mutex must be held. */
 static void fitsbin_payload_io_update_limit_locked(void) {
     int capacity = __atomic_load_n(
@@ -513,7 +602,6 @@ static void fitsbin_payload_io_update_limit_locked(void) {
         &fitsbin_payload_io_limit,
         limit,
         __ATOMIC_RELEASE);
-    fitsbin_payload_io_publish_demand_pressure();
 }
 
 void fitsbin_payload_io_configure_workers(int worker_count) {
@@ -531,29 +619,41 @@ void fitsbin_payload_io_configure_workers(int worker_count) {
         capacity,
         __ATOMIC_RELEASE);
     fitsbin_payload_io_update_limit_locked();
+    pthread_cond_broadcast(&fitsbin_payload_io_credit_cv);
     pthread_cond_broadcast(&fitsbin_payload_io_cv);
     pthread_mutex_unlock(&fitsbin_payload_io_mutex);
 }
 
 int fitsbin_payload_io_demand_busy(void) {
+    int active = __atomic_load_n(
+        &fitsbin_payload_io_active,
+        __ATOMIC_ACQUIRE);
+    int limit = __atomic_load_n(
+        &fitsbin_payload_io_limit,
+        __ATOMIC_ACQUIRE);
+
     return __atomic_load_n(
-        &fitsbin_payload_io_demand_pressure,
-        __ATOMIC_ACQUIRE) != 0U;
+        &fitsbin_payload_io_waiters,
+        __ATOMIC_ACQUIRE) > 0U ||
+        active >= limit;
 }
 
 int fitsbin_payload_io_set_thread_wait_helper(
     fitsbin_payload_io_wait_helper_fn helper,
+    fitsbin_payload_io_stop_check_fn stop_check,
     void* opaque) {
     if (!helper) {
         errno = EINVAL;
         return -1;
     }
     if (fitsbin_payload_io_thread_wait_helper ||
+        fitsbin_payload_io_thread_stop_check ||
         fitsbin_payload_io_thread_wait_active) {
         errno = EBUSY;
         return -1;
     }
     fitsbin_payload_io_thread_wait_helper = helper;
+    fitsbin_payload_io_thread_stop_check = stop_check;
     fitsbin_payload_io_thread_wait_opaque = opaque;
     return 0;
 }
@@ -562,10 +662,12 @@ void fitsbin_payload_io_clear_thread_wait_helper(void) {
     if (fitsbin_payload_io_thread_wait_active) {
         return;
     }
-    if (!fitsbin_payload_io_thread_wait_helper) {
+    if (!fitsbin_payload_io_thread_wait_helper &&
+        !fitsbin_payload_io_thread_stop_check) {
         return;
     }
     fitsbin_payload_io_thread_wait_helper = NULL;
+    fitsbin_payload_io_thread_stop_check = NULL;
     fitsbin_payload_io_thread_wait_opaque = NULL;
 }
 
@@ -585,6 +687,7 @@ void fitsbin_payload_io_notify_wait_helpers(void) {
     }
     pthread_mutex_lock(&fitsbin_payload_io_mutex);
     if (fitsbin_payload_io_wait_helper_count()) {
+        pthread_cond_broadcast(&fitsbin_payload_io_credit_cv);
         pthread_cond_broadcast(&fitsbin_payload_io_cv);
     }
     pthread_mutex_unlock(&fitsbin_payload_io_mutex);
@@ -596,6 +699,7 @@ void fitsbin_payload_io_begin_helper_window(void) {
         fitsbin_payload_io_helper_windows++;
     }
     fitsbin_payload_io_update_limit_locked();
+    pthread_cond_broadcast(&fitsbin_payload_io_credit_cv);
     pthread_cond_broadcast(&fitsbin_payload_io_cv);
     pthread_mutex_unlock(&fitsbin_payload_io_mutex);
 }
@@ -606,6 +710,7 @@ void fitsbin_payload_io_end_helper_window(void) {
         fitsbin_payload_io_helper_windows--;
     }
     fitsbin_payload_io_update_limit_locked();
+    pthread_cond_broadcast(&fitsbin_payload_io_credit_cv);
     pthread_cond_broadcast(&fitsbin_payload_io_cv);
     pthread_mutex_unlock(&fitsbin_payload_io_mutex);
 }
@@ -630,7 +735,6 @@ static int fitsbin_payload_io_try_acquire(void) {
                 TRUE,
                 __ATOMIC_ACQ_REL,
                 __ATOMIC_RELAXED)) {
-            fitsbin_payload_io_publish_demand_pressure();
             return TRUE;
         }
     }
@@ -660,8 +764,6 @@ static unsigned long long fitsbin_payload_io_acquire(void) {
             __ATOMIC_RELEASE);
         helper_waiter_registered = TRUE;
     }
-    fitsbin_payload_io_publish_demand_pressure();
-
     while (!fitsbin_payload_io_try_acquire()) {
         if (fitsbin_payload_io_thread_wait_helper &&
             !fitsbin_payload_io_thread_wait_active &&
@@ -704,7 +806,7 @@ static unsigned long long fitsbin_payload_io_acquire(void) {
             continue;
         }
         pthread_cond_wait(
-            &fitsbin_payload_io_cv,
+            &fitsbin_payload_io_credit_cv,
             &fitsbin_payload_io_mutex);
         pthread_mutex_unlock(&fitsbin_payload_io_mutex);
     }
@@ -718,8 +820,6 @@ static unsigned long long fitsbin_payload_io_acquire(void) {
         &fitsbin_payload_io_waiters,
         1U,
         __ATOMIC_RELEASE);
-    fitsbin_payload_io_publish_demand_pressure();
-
     if (!measured ||
         clock_gettime(CLOCK_MONOTONIC, &wait_finish)) {
         return 0U;
@@ -737,12 +837,11 @@ static void fitsbin_payload_io_release(void) {
 
     assert(previous > 0);
     (void)previous;
-    fitsbin_payload_io_publish_demand_pressure();
     if (__atomic_load_n(
             &fitsbin_payload_io_waiters,
             __ATOMIC_ACQUIRE)) {
         pthread_mutex_lock(&fitsbin_payload_io_mutex);
-        pthread_cond_signal(&fitsbin_payload_io_cv);
+        pthread_cond_signal(&fitsbin_payload_io_credit_cv);
         pthread_mutex_unlock(&fitsbin_payload_io_mutex);
     }
 }
@@ -1075,13 +1174,6 @@ int fitsbin_mapped_range_page_cover(
     return 0;
 }
 
-typedef struct fitsbin_prepared_pread_range {
-    off_t offset;
-    size_t size;
-    size_t logical_size;
-    void* destination;
-} fitsbin_prepared_pread_range_t;
-
 int fitsbin_pread_mapped_ranges(
     fitsbin_t* fb,
     const fitsbin_pread_range_t* ranges,
@@ -1274,6 +1366,123 @@ int fitsbin_pread_mapped_range(
     return fitsbin_pread_mapped_ranges(fb, &range, 1U);
 }
 
+static int fitsbin_prepare_direct_ranges(
+    fitsbin_t* fb,
+    const fitsbin_pread_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget,
+    fitsbin_prepared_pread_range_t* prepared,
+    size_t* physical_bytes_out,
+    size_t* logical_bytes_out,
+    unsigned long long* page_count_out) {
+    size_t physical_bytes = 0U;
+    size_t logical_bytes = 0U;
+    unsigned long long page_count = 0ULL;
+    size_t page_size;
+    size_t i;
+
+    if (!fb || !ranges || !range_count || !byte_budget ||
+        !prepared || !physical_bytes_out ||
+        !logical_bytes_out || !page_count_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (range_count > FITSBIN_PREAD_ASYNC_RANGE_LIMIT) {
+        errno = E2BIG;
+        return -1;
+    }
+    page_size = fb->mmap_page_size;
+    if (!page_size) {
+        long detected = sysconf(_SC_PAGESIZE);
+
+        if (detected <= 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        page_size = (size_t)detected;
+    }
+    for (i = 0U; i < range_count; i++) {
+        fitsbin_chunk_t* chunk;
+        size_t chunk_offset;
+        unsigned long long file_offset;
+        unsigned long long last_offset;
+        unsigned long long first_page;
+        unsigned long long last_page;
+        unsigned long long page_span;
+
+        if (!ranges[i].data || !ranges[i].size ||
+            !ranges[i].logical_size ||
+            ranges[i].logical_size > ranges[i].size ||
+            !ranges[i].destination) {
+            errno = EINVAL;
+            return -1;
+        }
+        chunk = fitsbin_find_data_chunk(
+            fb,
+            ranges[i].data,
+            ranges[i].size,
+            &chunk_offset);
+        if (!chunk || chunk->data_file_offset < 0 ||
+            chunk_offset > (size_t)LLONG_MAX ||
+            chunk->data_file_offset >
+                (off_t)LLONG_MAX - (off_t)chunk_offset) {
+            if (chunk) {
+                errno = EOVERFLOW;
+            }
+            return -1;
+        }
+        prepared[i].offset =
+            chunk->data_file_offset + (off_t)chunk_offset;
+        prepared[i].size = ranges[i].size;
+        prepared[i].logical_size = ranges[i].logical_size;
+        prepared[i].destination = ranges[i].destination;
+        if (ranges[i].size > (size_t)LLONG_MAX ||
+            prepared[i].offset >
+                (off_t)LLONG_MAX -
+                    (off_t)ranges[i].size) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        if (ranges[i].size > SIZE_MAX - physical_bytes ||
+            ranges[i].logical_size >
+                SIZE_MAX - logical_bytes) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        physical_bytes += ranges[i].size;
+        logical_bytes += ranges[i].logical_size;
+        if (physical_bytes > byte_budget) {
+            errno = E2BIG;
+            return -1;
+        }
+        file_offset =
+            (unsigned long long)prepared[i].offset;
+        if ((unsigned long long)ranges[i].size - 1ULL >
+            ULLONG_MAX - file_offset) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        last_offset = file_offset +
+            (unsigned long long)ranges[i].size - 1ULL;
+        first_page = file_offset /
+            (unsigned long long)page_size;
+        last_page = last_offset /
+            (unsigned long long)page_size;
+        page_span = last_page - first_page;
+        if (page_span == ULLONG_MAX ||
+            page_span + 1ULL >
+                ULLONG_MAX - page_count) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        page_count += page_span + 1ULL;
+    }
+    *physical_bytes_out = physical_bytes;
+    *logical_bytes_out = logical_bytes;
+    *page_count_out = page_count;
+    return 0;
+}
+
 static int fitsbin_compare_file_span(
     const void* left,
     const void* right) {
@@ -1295,28 +1504,28 @@ static int fitsbin_compare_file_span(
     return 0;
 }
 
-int fitsbin_prefetch_ranges(
+static int fitsbin_prepare_prefetch_spans(
     fitsbin_t* fb,
     const fitsbin_prefetch_range_t* ranges,
     size_t range_count,
-    size_t byte_budget) {
-    fitsbin_file_span_t spans[FITSBIN_PREFETCH_RANGE_LIMIT];
-    unsigned char scratch[FITSBIN_PREFETCH_COPY_CHUNK];
+    size_t byte_budget,
+    fitsbin_file_span_t* spans,
+    size_t* span_count,
+    size_t* byte_count) {
     struct stat source;
-    struct timespec read_start;
-    struct timespec read_finish;
     size_t accepted = 0U;
     size_t actual_bytes = 0U;
     size_t page_size;
     size_t i;
     size_t merged;
-    unsigned long long waited;
-    unsigned long long read_nanoseconds = 0ULL;
-    anbool measured;
-    int fd;
-    int rc = 0;
 
-    if (!fb || !ranges || !range_count || !byte_budget) {
+    if (!span_count || !byte_count) {
+        errno = EINVAL;
+        return -1;
+    }
+    *span_count = 0U;
+    *byte_count = 0U;
+    if (!fb || !ranges || !range_count || !byte_budget || !spans) {
         return 0;
     }
     if (range_count > FITSBIN_PREFETCH_RANGE_LIMIT) {
@@ -1420,7 +1629,889 @@ int fitsbin_prefetch_ranges(
         spans[accepted++] = spans[i];
         actual_bytes += span_bytes;
     }
-    merged = accepted;
+    *span_count = accepted;
+    *byte_count = actual_bytes;
+    return 0;
+}
+
+static int fitsbin_payload_io_duplicate_fd(int fd) {
+    int duplicate;
+
+#if defined(F_DUPFD_CLOEXEC)
+    duplicate = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+#else
+    duplicate = dup(fd);
+    if (duplicate >= 0) {
+        (void)fcntl(duplicate, F_SETFD, FD_CLOEXEC);
+    }
+#endif
+    return duplicate;
+}
+
+static anbool fitsbin_payload_io_priority_valid(
+    fitsbin_payload_io_priority_t priority) {
+    switch (priority) {
+    case FITSBIN_PAYLOAD_IO_PRIORITY_DEMAND:
+    case FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT:
+    case FITSBIN_PAYLOAD_IO_PRIORITY_SPECULATIVE:
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* fitsbin_payload_io_mutex must be held. */
+static anbool fitsbin_payload_io_queue_empty_locked(void) {
+    size_t priority;
+
+    for (priority = 0U;
+         priority < FITSBIN_PAYLOAD_IO_PRIORITY_COUNT;
+         priority++) {
+        if (fitsbin_payload_io_queue_head[priority]) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* fitsbin_payload_io_mutex must be held. */
+static fitsbin_payload_io_ticket_t*
+fitsbin_payload_io_dequeue_locked(void) {
+    size_t priority;
+
+    for (priority = 0U;
+         priority < FITSBIN_PAYLOAD_IO_PRIORITY_COUNT;
+         priority++) {
+        fitsbin_payload_io_ticket_t* ticket =
+            fitsbin_payload_io_queue_head[priority];
+
+        if (!ticket) {
+            continue;
+        }
+        fitsbin_payload_io_queue_head[priority] = ticket->next;
+        if (!fitsbin_payload_io_queue_head[priority]) {
+            fitsbin_payload_io_queue_tail[priority] = NULL;
+        }
+        ticket->next = NULL;
+        return ticket;
+    }
+    return NULL;
+}
+
+/* fitsbin_payload_io_mutex must be held. */
+static anbool fitsbin_payload_io_remove_queued_locked(
+    fitsbin_payload_io_ticket_t* target) {
+    size_t priority;
+
+    if (!target) {
+        return FALSE;
+    }
+    for (priority = 0U;
+         priority < FITSBIN_PAYLOAD_IO_PRIORITY_COUNT;
+         priority++) {
+        fitsbin_payload_io_ticket_t* previous = NULL;
+        fitsbin_payload_io_ticket_t* ticket =
+            fitsbin_payload_io_queue_head[priority];
+
+        while (ticket) {
+            if (ticket == target) {
+                if (previous) {
+                    previous->next = ticket->next;
+                } else {
+                    fitsbin_payload_io_queue_head[priority] =
+                        ticket->next;
+                }
+                if (fitsbin_payload_io_queue_tail[priority] ==
+                    ticket) {
+                    fitsbin_payload_io_queue_tail[priority] =
+                        previous;
+                }
+                ticket->next = NULL;
+                return TRUE;
+            }
+            previous = ticket;
+            ticket = ticket->next;
+        }
+    }
+    return FALSE;
+}
+
+/* fitsbin_payload_io_mutex must be held. */
+static void fitsbin_payload_io_cancel_queued_locked(
+    fitsbin_payload_io_ticket_t* ticket) {
+    if (!ticket ||
+        ticket->state != FITSBIN_PAYLOAD_IO_SUBMITTED ||
+        !__atomic_load_n(
+            &ticket->cancel_requested,
+            __ATOMIC_ACQUIRE) ||
+        !fitsbin_payload_io_remove_queued_locked(ticket)) {
+        return;
+    }
+    assert(fitsbin_payload_io_service_jobs > 0U);
+    assert(fitsbin_payload_io_service_bytes >=
+           ticket->byte_count);
+    fitsbin_payload_io_service_jobs--;
+    fitsbin_payload_io_service_bytes -= ticket->byte_count;
+    if (ticket->fd >= 0) {
+        close(ticket->fd);
+        ticket->fd = -1;
+    }
+    ticket->state = FITSBIN_PAYLOAD_IO_CANCELLED;
+    fitsbin_payload_io_service_cancelled++;
+    pthread_cond_broadcast(&fitsbin_payload_io_cv);
+}
+
+/* fitsbin_payload_io_mutex must be held. */
+static anbool fitsbin_payload_io_admit_locked(
+    const fitsbin_payload_io_ticket_t* ticket) {
+    size_t max_jobs = FITSBIN_PAYLOAD_IO_MAX_JOBS;
+    size_t max_bytes = FITSBIN_PAYLOAD_IO_MAX_BYTES;
+
+    if (!ticket ||
+        !fitsbin_payload_io_priority_valid(ticket->priority)) {
+        return FALSE;
+    }
+    if (ticket->priority != FITSBIN_PAYLOAD_IO_PRIORITY_DEMAND) {
+        max_jobs -= FITSBIN_PAYLOAD_IO_DEMAND_RESERVED_JOBS;
+        max_bytes -= FITSBIN_PAYLOAD_IO_DEMAND_RESERVED_BYTES;
+    }
+    if (fitsbin_payload_io_service_jobs >= max_jobs ||
+        ticket->byte_count > max_bytes ||
+        fitsbin_payload_io_service_bytes >
+            max_bytes - ticket->byte_count) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* fitsbin_payload_io_mutex must be held. */
+static void fitsbin_payload_io_enqueue_locked(
+    fitsbin_payload_io_ticket_t* ticket) {
+    size_t priority = (size_t)ticket->priority;
+
+    if (fitsbin_payload_io_queue_tail[priority]) {
+        fitsbin_payload_io_queue_tail[priority]->next = ticket;
+    } else {
+        fitsbin_payload_io_queue_head[priority] = ticket;
+    }
+    fitsbin_payload_io_queue_tail[priority] = ticket;
+}
+
+static void fitsbin_payload_io_ticket_free_storage(
+    fitsbin_payload_io_ticket_t* ticket) {
+    if (!ticket) {
+        return;
+    }
+    if (ticket->fd >= 0) {
+        close(ticket->fd);
+    }
+    free(ticket->ranges);
+    free(ticket);
+}
+
+static void* fitsbin_payload_io_service_worker(void* opaque) {
+    unsigned char scratch[FITSBIN_PREFETCH_COPY_CHUNK];
+
+    (void)opaque;
+    while (1) {
+        fitsbin_payload_io_ticket_t* ticket;
+        struct timespec read_start;
+        struct timespec read_finish;
+        unsigned long long read_nanoseconds = 0ULL;
+        anbool measured;
+        anbool cancelled;
+        anbool acquired = FALSE;
+        size_t work_index;
+        int saved_errno = 0;
+        int status = 0;
+
+        pthread_mutex_lock(&fitsbin_payload_io_mutex);
+        /*
+         * Keep unstarted work visible in the priority queues until this lane
+         * owns a credit. A newly queued demand ticket can then move ahead of
+         * preparation, and queued cancellation can retire without waiting.
+         */
+        while (1) {
+            while (fitsbin_payload_io_queue_empty_locked() &&
+                   !fitsbin_payload_io_service_stopping) {
+                pthread_cond_wait(
+                    &fitsbin_payload_io_cv,
+                    &fitsbin_payload_io_mutex);
+            }
+            if (fitsbin_payload_io_queue_empty_locked() &&
+                fitsbin_payload_io_service_stopping) {
+                pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+                return NULL;
+            }
+            if (fitsbin_payload_io_try_acquire()) {
+                acquired = TRUE;
+                break;
+            }
+            __atomic_add_fetch(
+                &fitsbin_payload_io_waiters,
+                1U,
+                __ATOMIC_RELEASE);
+            if (fitsbin_payload_io_try_acquire()) {
+                size_t previous = __atomic_fetch_sub(
+                    &fitsbin_payload_io_waiters,
+                    1U,
+                    __ATOMIC_ACQ_REL);
+
+                (void)previous;
+                assert(previous > 0U);
+                acquired = TRUE;
+                break;
+            }
+            pthread_cond_wait(
+                &fitsbin_payload_io_credit_cv,
+                &fitsbin_payload_io_mutex);
+            {
+                size_t previous = __atomic_fetch_sub(
+                    &fitsbin_payload_io_waiters,
+                    1U,
+                    __ATOMIC_ACQ_REL);
+
+                (void)previous;
+                assert(previous > 0U);
+            }
+        }
+        ticket = fitsbin_payload_io_dequeue_locked();
+        assert(ticket);
+        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+
+        cancelled = __atomic_load_n(
+            &ticket->cancel_requested,
+            __ATOMIC_ACQUIRE);
+        measured = acquired && !cancelled &&
+            clock_gettime(CLOCK_MONOTONIC, &read_start) == 0;
+        if (ticket->kind == FITSBIN_PAYLOAD_IO_TICKET_DIRECT) {
+            for (work_index = 0U;
+                 work_index < ticket->range_count && !cancelled;
+                 work_index++) {
+                fitsbin_prepared_pread_range_t* range =
+                    &ticket->ranges[work_index];
+
+                if (fitsbin_pread_all(
+                        ticket->fd,
+                        range->destination,
+                        range->size,
+                        range->offset)) {
+                    saved_errno = errno ? errno : EIO;
+                    status = -1;
+                    break;
+                }
+                cancelled = __atomic_load_n(
+                    &ticket->cancel_requested,
+                    __ATOMIC_ACQUIRE);
+            }
+        } else {
+            for (work_index = 0U;
+                 work_index < ticket->span_count && !cancelled;
+                 work_index++) {
+                off_t cursor = ticket->spans[work_index].begin;
+
+                while (cursor < ticket->spans[work_index].end) {
+                    size_t remaining = (size_t)(
+                        ticket->spans[work_index].end - cursor);
+                    size_t request = MIN(remaining, sizeof(scratch));
+
+                    if (fitsbin_pread_all(
+                            ticket->fd,
+                            scratch,
+                            request,
+                            cursor)) {
+                        saved_errno = errno ? errno : EIO;
+                        status = -1;
+                        break;
+                    }
+                    cursor += (off_t)request;
+                    cancelled = __atomic_load_n(
+                        &ticket->cancel_requested,
+                        __ATOMIC_ACQUIRE);
+                    if (cancelled) {
+                        break;
+                    }
+                }
+                if (status) {
+                    break;
+                }
+            }
+        }
+        if (measured &&
+            clock_gettime(CLOCK_MONOTONIC, &read_finish) == 0) {
+                read_nanoseconds =
+                    fitsbin_timespec_delta_nanoseconds(
+                        &read_finish,
+                        &read_start);
+        }
+        if (acquired) {
+            fitsbin_payload_io_release();
+        }
+        if (ticket->fd >= 0) {
+            close(ticket->fd);
+            ticket->fd = -1;
+        }
+
+        pthread_mutex_lock(&fitsbin_payload_io_mutex);
+        assert(fitsbin_payload_io_service_jobs > 0U);
+        assert(fitsbin_payload_io_service_bytes >=
+               ticket->byte_count);
+        fitsbin_payload_io_service_jobs--;
+        fitsbin_payload_io_service_bytes -= ticket->byte_count;
+        ticket->read_nanoseconds = read_nanoseconds;
+        fitsbin_payload_io_service_read_nanoseconds += read_nanoseconds;
+        if (__atomic_load_n(
+                &ticket->cancel_requested,
+                __ATOMIC_ACQUIRE) ||
+            cancelled) {
+            ticket->state = FITSBIN_PAYLOAD_IO_CANCELLED;
+            fitsbin_payload_io_service_cancelled++;
+        } else if (status) {
+            ticket->saved_errno = saved_errno;
+            ticket->state = FITSBIN_PAYLOAD_IO_FAILED;
+            fitsbin_payload_io_service_failed++;
+        } else {
+            ticket->state = FITSBIN_PAYLOAD_IO_READY;
+            fitsbin_payload_io_service_ready++;
+            if (ticket->kind == FITSBIN_PAYLOAD_IO_TICKET_DIRECT) {
+                fitsbin_payload_io_service_direct_ready++;
+            }
+        }
+        pthread_cond_broadcast(&fitsbin_payload_io_cv);
+        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+    }
+    return NULL;
+}
+
+int fitsbin_payload_io_service_start(int lane_count) {
+    int created = 0;
+    int status = 0;
+
+    if (lane_count <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    lane_count = MIN(lane_count, FITSBIN_PAYLOAD_IO_MAX_LANES);
+
+    pthread_mutex_lock(&fitsbin_payload_io_mutex);
+    if (fitsbin_payload_io_service_running) {
+        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+        return 0;
+    }
+    fitsbin_payload_io_service_running = TRUE;
+    fitsbin_payload_io_service_accepting = TRUE;
+    fitsbin_payload_io_service_stopping = FALSE;
+    fitsbin_payload_io_service_lanes = lane_count;
+    fitsbin_payload_io_service_submitted = 0ULL;
+    fitsbin_payload_io_service_ready = 0ULL;
+    fitsbin_payload_io_service_direct_submitted = 0ULL;
+    fitsbin_payload_io_service_direct_ready = 0ULL;
+    fitsbin_payload_io_service_cancelled = 0ULL;
+    fitsbin_payload_io_service_failed = 0ULL;
+    fitsbin_payload_io_service_planned_bytes = 0ULL;
+    fitsbin_payload_io_service_read_nanoseconds = 0ULL;
+    while (created < lane_count) {
+        status = pthread_create(
+            &fitsbin_payload_io_threads[created],
+            NULL,
+            fitsbin_payload_io_service_worker,
+            NULL);
+        if (status) {
+            break;
+        }
+        created++;
+    }
+    if (!status) {
+        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+        return 0;
+    }
+    fitsbin_payload_io_service_accepting = FALSE;
+    fitsbin_payload_io_service_stopping = TRUE;
+    fitsbin_payload_io_service_lanes = created;
+    pthread_cond_broadcast(&fitsbin_payload_io_cv);
+    pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+
+    while (created > 0) {
+        created--;
+        pthread_join(fitsbin_payload_io_threads[created], NULL);
+    }
+    pthread_mutex_lock(&fitsbin_payload_io_mutex);
+    fitsbin_payload_io_service_running = FALSE;
+    fitsbin_payload_io_service_stopping = FALSE;
+    fitsbin_payload_io_service_lanes = 0;
+    pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+    errno = status;
+    return -1;
+}
+
+void fitsbin_payload_io_service_stop(void) {
+    int lane_count;
+    int lane;
+
+    pthread_mutex_lock(&fitsbin_payload_io_mutex);
+    if (!fitsbin_payload_io_service_running) {
+        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+        return;
+    }
+    fitsbin_payload_io_service_accepting = FALSE;
+    fitsbin_payload_io_service_stopping = TRUE;
+    lane_count = fitsbin_payload_io_service_lanes;
+    pthread_cond_broadcast(&fitsbin_payload_io_cv);
+    pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+
+    for (lane = 0; lane < lane_count; lane++) {
+        pthread_join(fitsbin_payload_io_threads[lane], NULL);
+    }
+
+    pthread_mutex_lock(&fitsbin_payload_io_mutex);
+    assert(fitsbin_payload_io_queue_empty_locked());
+    assert(!fitsbin_payload_io_service_jobs);
+    assert(!fitsbin_payload_io_service_bytes);
+    logverb("[fitsbin] payload-broker submitted=%llu ready=%llu "
+            "direct_submitted=%llu direct_ready=%llu "
+            "cancelled=%llu failed=%llu planned_bytes=%llu "
+            "read_wall=%.6f\n",
+            fitsbin_payload_io_service_submitted,
+            fitsbin_payload_io_service_ready,
+            fitsbin_payload_io_service_direct_submitted,
+            fitsbin_payload_io_service_direct_ready,
+            fitsbin_payload_io_service_cancelled,
+            fitsbin_payload_io_service_failed,
+            fitsbin_payload_io_service_planned_bytes,
+            (double)fitsbin_payload_io_service_read_nanoseconds /
+                1000000000.0);
+    fitsbin_payload_io_service_running = FALSE;
+    fitsbin_payload_io_service_stopping = FALSE;
+    fitsbin_payload_io_service_lanes = 0;
+    pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+}
+
+static int fitsbin_payload_io_submit_ticket(
+    fitsbin_payload_io_ticket_t* ticket,
+    fitsbin_payload_io_ticket_t** ticket_out) {
+    anbool admitted;
+
+    pthread_mutex_lock(&fitsbin_payload_io_mutex);
+    admitted =
+        fitsbin_payload_io_service_running &&
+        fitsbin_payload_io_service_accepting &&
+        fitsbin_payload_io_admit_locked(ticket);
+    if (!admitted) {
+        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+        fitsbin_payload_io_ticket_free_storage(ticket);
+        return 0;
+    }
+    ticket->sequence = ++fitsbin_payload_io_next_sequence;
+    ticket->state = FITSBIN_PAYLOAD_IO_SUBMITTED;
+    fitsbin_payload_io_enqueue_locked(ticket);
+    fitsbin_payload_io_service_jobs++;
+    fitsbin_payload_io_service_bytes += ticket->byte_count;
+    fitsbin_payload_io_service_submitted++;
+    if (ticket->kind == FITSBIN_PAYLOAD_IO_TICKET_DIRECT) {
+        fitsbin_payload_io_service_direct_submitted++;
+    }
+    fitsbin_payload_io_service_planned_bytes +=
+        (unsigned long long)ticket->byte_count;
+    *ticket_out = ticket;
+    pthread_cond_signal(&fitsbin_payload_io_cv);
+    pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+    return 1;
+}
+
+int fitsbin_pread_mapped_ranges_submit(
+    fitsbin_t* fb,
+    const fitsbin_pread_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget,
+    fitsbin_payload_io_priority_t priority,
+    fitsbin_payload_io_ticket_t** ticket_out) {
+    fitsbin_payload_io_ticket_t* ticket;
+    int fd;
+    int duplicate;
+
+    if (!ticket_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    *ticket_out = NULL;
+    if (!fb || !ranges || !range_count || !byte_budget ||
+        !fitsbin_payload_io_priority_valid(priority)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (range_count > FITSBIN_PREAD_ASYNC_RANGE_LIMIT) {
+        errno = E2BIG;
+        return -1;
+    }
+    pthread_mutex_lock(&fitsbin_payload_io_mutex);
+    if (!fitsbin_payload_io_service_running ||
+        !fitsbin_payload_io_service_accepting) {
+        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+        return 0;
+    }
+    pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+
+    ticket = calloc(1, sizeof(*ticket));
+    if (!ticket) {
+        return -1;
+    }
+    ticket->fd = -1;
+    ticket->state = FITSBIN_PAYLOAD_IO_PLANNED;
+    ticket->kind = FITSBIN_PAYLOAD_IO_TICKET_DIRECT;
+    ticket->priority = priority;
+    if (range_count > SIZE_MAX / sizeof(ticket->ranges[0])) {
+        fitsbin_payload_io_ticket_free_storage(ticket);
+        errno = EOVERFLOW;
+        return -1;
+    }
+    ticket->ranges = calloc(
+        range_count, sizeof(ticket->ranges[0]));
+    if (!ticket->ranges) {
+        fitsbin_payload_io_ticket_free_storage(ticket);
+        return -1;
+    }
+    if (fitsbin_prepare_direct_ranges(
+            fb,
+            ranges,
+            range_count,
+            byte_budget,
+            ticket->ranges,
+            &ticket->byte_count,
+            &ticket->logical_byte_count,
+            &ticket->page_count)) {
+        fitsbin_payload_io_ticket_free_storage(ticket);
+        return -1;
+    }
+    ticket->range_count = range_count;
+    fd = fitsbin_payload_fd_get(fb);
+    if (fd < 0) {
+        fitsbin_payload_io_ticket_free_storage(ticket);
+        return -1;
+    }
+    duplicate = fitsbin_payload_io_duplicate_fd(fd);
+    if (duplicate < 0) {
+        fitsbin_payload_io_ticket_free_storage(ticket);
+        return -1;
+    }
+    ticket->fd = duplicate;
+    return fitsbin_payload_io_submit_ticket(ticket, ticket_out);
+}
+
+int fitsbin_prefetch_ranges_submit(
+    fitsbin_t* fb,
+    const fitsbin_prefetch_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget,
+    fitsbin_payload_io_ticket_t** ticket_out) {
+    fitsbin_payload_io_ticket_t* ticket;
+    int fd;
+    int duplicate;
+
+    if (!ticket_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    *ticket_out = NULL;
+    if (fitsbin_payload_is_fully_resident(fb)) {
+        return 0;
+    }
+    pthread_mutex_lock(&fitsbin_payload_io_mutex);
+    if (!fitsbin_payload_io_service_running ||
+        !fitsbin_payload_io_service_accepting) {
+        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+        return 0;
+    }
+    pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+
+    ticket = calloc(1, sizeof(*ticket));
+    if (!ticket) {
+        return -1;
+    }
+    ticket->fd = -1;
+    ticket->state = FITSBIN_PAYLOAD_IO_PLANNED;
+    ticket->kind = FITSBIN_PAYLOAD_IO_TICKET_PREFETCH;
+    ticket->priority = FITSBIN_PAYLOAD_IO_PRIORITY_SPECULATIVE;
+    if (fitsbin_prepare_prefetch_spans(
+            fb,
+            ranges,
+            range_count,
+            byte_budget,
+            ticket->spans,
+            &ticket->span_count,
+            &ticket->byte_count)) {
+        fitsbin_payload_io_ticket_free_storage(ticket);
+        return -1;
+    }
+    if (!ticket->span_count) {
+        fitsbin_payload_io_ticket_free_storage(ticket);
+        return 0;
+    }
+    fd = fitsbin_payload_fd_get(fb);
+    if (fd < 0) {
+        fitsbin_payload_io_ticket_free_storage(ticket);
+        return -1;
+    }
+    duplicate = fitsbin_payload_io_duplicate_fd(fd);
+    if (duplicate < 0) {
+        fitsbin_payload_io_ticket_free_storage(ticket);
+        return -1;
+    }
+    ticket->fd = duplicate;
+    return fitsbin_payload_io_submit_ticket(ticket, ticket_out);
+}
+
+static int fitsbin_payload_io_ticket_wait_internal(
+    fitsbin_t* fb,
+    fitsbin_payload_io_ticket_t* ticket,
+    anbool cancel) {
+    struct timespec wait_start;
+    struct timespec wait_finish;
+    unsigned long long waited = 0ULL;
+    unsigned long long read_nanoseconds;
+    size_t span_count;
+    size_t range_count;
+    size_t byte_count;
+    size_t logical_byte_count;
+    unsigned long long page_count;
+    fitsbin_payload_io_ticket_kind_t kind;
+    anbool helper_registered = FALSE;
+    anbool retry_helper = TRUE;
+    anbool measured;
+    fitsbin_payload_io_ticket_state_t state;
+    int saved_errno;
+
+    if (!fb || !ticket) {
+        errno = EINVAL;
+        return -1;
+    }
+    measured = clock_gettime(CLOCK_MONOTONIC, &wait_start) == 0;
+    pthread_mutex_lock(&fitsbin_payload_io_mutex);
+    if (cancel) {
+        __atomic_store_n(
+            &ticket->cancel_requested,
+            TRUE,
+            __ATOMIC_RELEASE);
+        fitsbin_payload_io_cancel_queued_locked(ticket);
+        pthread_cond_broadcast(&fitsbin_payload_io_cv);
+    }
+    if (fitsbin_payload_io_thread_wait_helper &&
+        !fitsbin_payload_io_thread_wait_active &&
+        ticket->state == FITSBIN_PAYLOAD_IO_SUBMITTED) {
+        __atomic_add_fetch(
+            &fitsbin_payload_io_wait_helpers,
+            1U,
+            __ATOMIC_RELEASE);
+        helper_registered = TRUE;
+    }
+    while (ticket->state == FITSBIN_PAYLOAD_IO_SUBMITTED) {
+        if (fitsbin_payload_io_thread_stop_check &&
+            fitsbin_payload_io_thread_stop_check(
+                fitsbin_payload_io_thread_wait_opaque)) {
+            __atomic_store_n(
+                &ticket->cancel_requested,
+                TRUE,
+                __ATOMIC_RELEASE);
+            fitsbin_payload_io_cancel_queued_locked(ticket);
+            pthread_cond_broadcast(&fitsbin_payload_io_cv);
+        }
+        if (ticket->state != FITSBIN_PAYLOAD_IO_SUBMITTED) {
+            continue;
+        }
+        if (fitsbin_payload_io_thread_wait_helper &&
+            !__atomic_load_n(
+                &ticket->cancel_requested,
+                __ATOMIC_ACQUIRE) &&
+            !fitsbin_payload_io_thread_wait_active &&
+            (retry_helper ||
+             fitsbin_payload_io_thread_work_epoch !=
+                 __atomic_load_n(
+                     &fitsbin_payload_io_work_epoch,
+                     __ATOMIC_ACQUIRE))) {
+            fitsbin_payload_io_wait_helper_fn helper =
+                fitsbin_payload_io_thread_wait_helper;
+            void* helper_opaque =
+                fitsbin_payload_io_thread_wait_opaque;
+            int helped;
+
+            fitsbin_payload_io_thread_work_epoch =
+                __atomic_load_n(
+                    &fitsbin_payload_io_work_epoch,
+                    __ATOMIC_ACQUIRE);
+            fitsbin_payload_io_thread_wait_active = TRUE;
+            pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+            helped = helper(helper_opaque);
+            pthread_mutex_lock(&fitsbin_payload_io_mutex);
+            fitsbin_payload_io_thread_wait_active = FALSE;
+            retry_helper = helped != 0;
+            if (retry_helper) {
+                continue;
+            }
+        }
+        if (ticket->state != FITSBIN_PAYLOAD_IO_SUBMITTED) {
+            continue;
+        }
+        pthread_cond_wait(
+            &fitsbin_payload_io_cv,
+            &fitsbin_payload_io_mutex);
+    }
+    if (helper_registered) {
+        size_t previous = __atomic_fetch_sub(
+            &fitsbin_payload_io_wait_helpers,
+            1U,
+            __ATOMIC_ACQ_REL);
+
+        (void)previous;
+        assert(previous > 0U);
+    }
+    state = ticket->state;
+    saved_errno = ticket->saved_errno;
+    read_nanoseconds = ticket->read_nanoseconds;
+    span_count = ticket->span_count;
+    range_count = ticket->range_count;
+    byte_count = ticket->byte_count;
+    logical_byte_count = ticket->logical_byte_count;
+    page_count = ticket->page_count;
+    kind = ticket->kind;
+    if (ticket->counters_applied) {
+        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+        errno = EALREADY;
+        return -1;
+    }
+    ticket->counters_applied = TRUE;
+    pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+
+    if (measured &&
+        clock_gettime(CLOCK_MONOTONIC, &wait_finish) == 0) {
+        waited = fitsbin_timespec_delta_nanoseconds(
+            &wait_finish,
+            &wait_start);
+    }
+    __atomic_add_fetch(
+        &fb->payload_wait_nanoseconds,
+        waited,
+        __ATOMIC_RELAXED);
+    if (state == FITSBIN_PAYLOAD_IO_READY &&
+        kind == FITSBIN_PAYLOAD_IO_TICKET_DIRECT) {
+        __atomic_add_fetch(
+            &fb->payload_read_batches,
+            1ULL,
+            __ATOMIC_RELAXED);
+        __atomic_add_fetch(
+            &fb->payload_read_calls,
+            (unsigned long long)range_count,
+            __ATOMIC_RELAXED);
+        __atomic_add_fetch(
+            &fb->payload_read_bytes,
+            (unsigned long long)byte_count,
+            __ATOMIC_RELAXED);
+        __atomic_add_fetch(
+            &fb->payload_read_logical_bytes,
+            (unsigned long long)logical_byte_count,
+            __ATOMIC_RELAXED);
+        __atomic_add_fetch(
+            &fb->payload_read_pages,
+            page_count,
+            __ATOMIC_RELAXED);
+        __atomic_add_fetch(
+            &fb->payload_read_nanoseconds,
+            read_nanoseconds,
+            __ATOMIC_RELAXED);
+        return (int)range_count;
+    }
+    if (state == FITSBIN_PAYLOAD_IO_READY) {
+        __atomic_add_fetch(
+            &fb->payload_warm_calls,
+            1ULL,
+            __ATOMIC_RELAXED);
+        __atomic_add_fetch(
+            &fb->payload_warm_ranges,
+            (unsigned long long)span_count,
+            __ATOMIC_RELAXED);
+        __atomic_add_fetch(
+            &fb->payload_warm_bytes,
+            (unsigned long long)byte_count,
+            __ATOMIC_RELAXED);
+        __atomic_add_fetch(
+            &fb->payload_warm_nanoseconds,
+            read_nanoseconds,
+            __ATOMIC_RELAXED);
+        return (int)span_count;
+    }
+    if (state == FITSBIN_PAYLOAD_IO_FAILED) {
+        __atomic_add_fetch(
+            &fb->payload_failures,
+            1ULL,
+            __ATOMIC_RELAXED);
+        errno = saved_errno ? saved_errno : EIO;
+        return -1;
+    }
+    errno = ECANCELED;
+    return 0;
+}
+
+int fitsbin_payload_io_ticket_wait(
+    fitsbin_t* fb,
+    fitsbin_payload_io_ticket_t* ticket) {
+    return fitsbin_payload_io_ticket_wait_internal(
+        fb, ticket, FALSE);
+}
+
+int fitsbin_payload_io_ticket_cancel_and_wait(
+    fitsbin_t* fb,
+    fitsbin_payload_io_ticket_t* ticket) {
+    return fitsbin_payload_io_ticket_wait_internal(
+        fb, ticket, TRUE);
+}
+
+void fitsbin_payload_io_ticket_destroy(
+    fitsbin_payload_io_ticket_t* ticket) {
+    anbool terminal;
+
+    if (!ticket) {
+        return;
+    }
+    pthread_mutex_lock(&fitsbin_payload_io_mutex);
+    terminal = ticket->state == FITSBIN_PAYLOAD_IO_READY ||
+        ticket->state == FITSBIN_PAYLOAD_IO_FAILED ||
+        ticket->state == FITSBIN_PAYLOAD_IO_CANCELLED;
+    if (!terminal || !ticket->counters_applied) {
+        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+        return;
+    }
+    pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+    fitsbin_payload_io_ticket_free_storage(ticket);
+}
+
+int fitsbin_prefetch_ranges(
+    fitsbin_t* fb,
+    const fitsbin_prefetch_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget) {
+    fitsbin_file_span_t spans[FITSBIN_PREFETCH_RANGE_LIMIT];
+    unsigned char scratch[FITSBIN_PREFETCH_COPY_CHUNK];
+    struct timespec read_start;
+    struct timespec read_finish;
+    size_t actual_bytes = 0U;
+    size_t i;
+    size_t merged;
+    unsigned long long waited;
+    unsigned long long read_nanoseconds = 0ULL;
+    anbool measured;
+    int fd;
+    int rc = 0;
+
+    if (fitsbin_payload_is_fully_resident(fb)) {
+        return 0;
+    }
+    if (fitsbin_prepare_prefetch_spans(
+            fb,
+            ranges,
+            range_count,
+            byte_budget,
+            spans,
+            &merged,
+            &actual_bytes)) {
+        return -1;
+    }
     if (!merged) {
         return 0;
     }
@@ -2480,6 +3571,11 @@ int fitsbin_close(fitsbin_t* fb) {
         free(fb->tables);
     }
 
+    if (fb->owns_fits && fb->fits) {
+        anqfits_close(fb->fits);
+        fb->fits = NULL;
+    }
+
     free(fb);
     return rtn;
 }
@@ -2911,12 +4007,20 @@ fitsbin_t* fitsbin_open_fits(anqfits_t* fits) {
 
 fitsbin_t* fitsbin_open(const char* fn) {
     anqfits_t* fits;
+    fitsbin_t* fb;
+
     fits = anqfits_open(fn);
     if (!fits) {
         ERROR("Failed to open file \"%s\"", fn);
         return NULL;
     }
-    return fitsbin_open_fits(fits);
+    fb = fitsbin_open_fits(fits);
+    if (!fb) {
+        anqfits_close(fits);
+        return NULL;
+    }
+    fb->owns_fits = TRUE;
+    return fb;
 }
 
 fitsbin_t* fitsbin_open_in_memory() {

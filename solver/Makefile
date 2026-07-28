@@ -564,7 +564,7 @@ control-program-2: control-program.o $(SLIB)
 		engine.o codetree.o codefile.o onefield.o solverutils.o quad-utils.o image2xy-files.o solvedfile.o solver.o tweak2.o verify.o \
 		$(addprefix ../qfits-an/,anqfits.o qfits_tools.o qfits_table.o qfits_float.o qfits_error.o qfits_time.o qfits_card.o qfits_header.o qfits_rw.o qfits_memory.o qfits_convert.o qfits_byteswap.o) \
 		$(addprefix ../libkd/,kdtree.o kdtree_dim.o kdtree_fits_io.o kdint_ddd.o kdint_dds.o kdint_ddu.o kdint_dss.o kdint_duu.o kdint_fff.o kdint_lll.o) \
-		$(addprefix ../util/,index.o indexset.o multiindex.o codekd.o quadfile.o matchfile.o matchobj.o rdlist.o starkd.o starxy.o scamp-catalog.o healpix.o fitsbin.o fitsfile.o fitstable.o image2xy.o dsmooth.o dallpeaks.o dcen3x3.o dfind.o dobjects.o dmedsmooth.o dpeaks.o dsigma.o simplexy.o resample.o ctmf.o dselip.o permutedsort.o sip.o sip_qfits.o sip-utils.o fit-wcs.o gslutils.o starutil.o xylist.o fitsioutils.o datalog.o fileutils.o ioutils.o mathutil.o bl.o bl-sort.o tic.o log.o errors.o an-endian.o) \
+		$(addprefix ../util/,index.o index_residency.o indexset.o multiindex.o codekd.o quadfile.o matchfile.o matchobj.o rdlist.o starkd.o starxy.o scamp-catalog.o healpix.o fitsbin.o fitsfile.o fitstable.o image2xy.o dsmooth.o dallpeaks.o dcen3x3.o dfind.o dobjects.o dmedsmooth.o dpeaks.o dsigma.o simplexy.o resample.o ctmf.o dselip.o permutedsort.o sip.o sip_qfits.o sip-utils.o fit-wcs.o gslutils.o starutil.o xylist.o fitsioutils.o datalog.o fileutils.o ioutils.o mathutil.o bl.o bl-sort.o tic.o log.o errors.o an-endian.o) \
 		$(CFITS_LIB) $(LDLIBS)
 
 whynot: whynot.o $(PLOTSTUFF) $(CAIRO_SLIB) $(SLIB)

@@ -265,7 +265,8 @@ void test_production_mmap_component_classification(CuTest* ct) {
 
     /*
      * Use a controlled RANDOM mapping policy. The reader still assigns
-     * distinct region classes, but every chunk receives the same advice.
+     * distinct region classes: sparse DATA/PERM payload stays RANDOM while
+     * repeatedly traversed topology stays NORMAL.
      */
     fitsbin_mmap_set_thread_advice(FITSBIN_MMAP_ADVICE_RANDOM);
     io = kdtree_fits_open(fn);
@@ -306,7 +307,7 @@ void test_production_mmap_component_classification(CuTest* ct) {
                 chunk->mmap_region);
             CuAssertIntEquals(
                 ct,
-                FITSBIN_MMAP_ADVICE_RANDOM,
+                FITSBIN_MMAP_ADVICE_NORMAL,
                 fitsbin_get_chunk_mmap_advice(fb, chunk));
         }
     }

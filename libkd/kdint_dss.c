@@ -4,6 +4,7 @@
 */
 
 #include <errno.h>
+#include <limits.h>
 
 #include "kdtree.h"
 #include "kdtree_internal_common.h"
@@ -799,6 +800,88 @@ static int kdtree_direct_flush_leased_wave(
     return 0;
 }
 
+typedef struct kdtree_direct_plan_state {
+    kdtree_direct_plan_ranges_fn emit_ranges;
+    void* emit_opaque;
+    kdtree_direct_range_request_t
+        requests[KDTREE_DIRECT_DSS_WAVE_TASKS];
+    size_t nrequests;
+} kdtree_direct_plan_state_t;
+
+static int kdtree_direct_emit_plan_batch(
+    kdtree_direct_plan_state_t* state) {
+    int saved_errno;
+
+    if (!state->nrequests) {
+        return 0;
+    }
+    errno = 0;
+    if (state->emit_ranges(
+            state->emit_opaque,
+            state->requests,
+            state->nrequests)) {
+        saved_errno = errno ? errno : EIO;
+        state->nrequests = 0U;
+        errno = saved_errno;
+        return -1;
+    }
+    state->nrequests = 0U;
+    return 0;
+}
+
+static int kdtree_direct_flush_plan(
+    void* opaque,
+    const kdtree_t* kd,
+    kdtree_qres_t* result,
+    const etype* query,
+    double maxd2,
+    const kdtree_direct_span_t* spans,
+    size_t nspans,
+    int first,
+    int last,
+    anbool final) {
+    kdtree_direct_plan_state_t* state = opaque;
+    size_t count;
+    size_t span_index;
+
+    (void)result;
+    (void)query;
+    (void)maxd2;
+    if (nspans) {
+        if (!state || !kd || !spans ||
+            nspans > KDTREE_DIRECT_SPAN_CAPACITY ||
+            state->nrequests >= KDTREE_DIRECT_DSS_WAVE_TASKS ||
+            first < 0 || last < first || last >= kd->ndata) {
+            errno = EINVAL;
+            return -1;
+        }
+        count = (size_t)last - (size_t)first + 1U;
+        if (count > (size_t)INT_MAX) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        for (span_index = 0U; span_index < nspans; span_index++) {
+            if (spans[span_index].left < first ||
+                spans[span_index].right < spans[span_index].left ||
+                spans[span_index].right > last) {
+                errno = EINVAL;
+                return -1;
+            }
+        }
+        state->requests[state->nrequests].first = first;
+        state->requests[state->nrequests].count = (int)count;
+        state->nrequests++;
+        if (state->nrequests == KDTREE_DIRECT_DSS_WAVE_TASKS &&
+            kdtree_direct_emit_plan_batch(state)) {
+            return -1;
+        }
+    }
+    if (final && kdtree_direct_emit_plan_batch(state)) {
+        return -1;
+    }
+    return 0;
+}
+
 static kdtree_qres_t* kdtree_rangesearch_direct_dss_core(
     const kdtree_t* kd,
     kdtree_qres_t* result,
@@ -808,7 +891,9 @@ static kdtree_qres_t* kdtree_rangesearch_direct_dss_core(
     size_t max_points,
     size_t merge_gap_points,
     kdtree_direct_flush_fn flush,
-    void* flush_opaque) {
+    void* flush_opaque,
+    anbool produce_result,
+    int* walk_status) {
     const int supported_options = KD_OPTIONS_SMALL_RADIUS |
         KD_OPTIONS_COMPUTE_DISTS |
         KD_OPTIONS_NO_RESIZE_RESULTS |
@@ -828,6 +913,13 @@ static kdtree_qres_t* kdtree_rangesearch_direct_dss_core(
     int batch_last = -1;
     anbool owns_result = FALSE;
 
+    if (walk_status) {
+        *walk_status = -1;
+    }
+    if (!produce_result && result) {
+        errno = EINVAL;
+        return NULL;
+    }
     if (!kd || !query || !flush || !max_points || maxd2 < 0.0 ||
         options != supported_options || kd->treetype != KDTT_DSS ||
         !kd->split.any || kd->ndim <= 0 ||
@@ -843,40 +935,42 @@ static kdtree_qres_t* kdtree_rangesearch_direct_dss_core(
     tlinf = use_tquery ? (ttype)ceil(dtlinf) : 0;
     use_tsplit = use_tquery && (dtlinf < TTYPE_MAX);
 
-    if (result) {
-        if (!result->capacity) {
+    if (produce_result) {
+        if (result) {
+            if (!result->capacity) {
+                if (!resize_results(result,
+                                    KDTREE_MAX_RESULTS,
+                                    D,
+                                    TRUE,
+                                    FALSE)) {
+                    errno = ENOMEM;
+                    return NULL;
+                }
+            } else if (!resize_results(result,
+                                       result->capacity,
+                                       D,
+                                       TRUE,
+                                       FALSE)) {
+                errno = ENOMEM;
+                return NULL;
+            }
+            result->nres = 0;
+        } else {
+            result = CALLOC(1, sizeof(kdtree_qres_t));
+            if (!result) {
+                errno = ENOMEM;
+                return NULL;
+            }
+            owns_result = TRUE;
             if (!resize_results(result,
                                 KDTREE_MAX_RESULTS,
                                 D,
                                 TRUE,
                                 FALSE)) {
+                kdtree_free_query(result);
                 errno = ENOMEM;
                 return NULL;
             }
-        } else if (!resize_results(result,
-                                   result->capacity,
-                                   D,
-                                   TRUE,
-                                   FALSE)) {
-            errno = ENOMEM;
-            return NULL;
-        }
-        result->nres = 0;
-    } else {
-        result = CALLOC(1, sizeof(kdtree_qres_t));
-        if (!result) {
-            errno = ENOMEM;
-            return NULL;
-        }
-        owns_result = TRUE;
-        if (!resize_results(result,
-                            KDTREE_MAX_RESULTS,
-                            D,
-                            TRUE,
-                            FALSE)) {
-            kdtree_free_query(result);
-            errno = ENOMEM;
-            return NULL;
         }
     }
 
@@ -981,6 +1075,9 @@ static kdtree_qres_t* kdtree_rangesearch_direct_dss_core(
               TRUE)) {
         goto bailout;
     }
+    if (walk_status) {
+        *walk_status = 0;
+    }
     return result;
 
 bailout:
@@ -990,6 +1087,40 @@ bailout:
         result->nres = 0;
     }
     return NULL;
+}
+
+int kdtree_rangesearch_direct_dss_plan(
+    const kdtree_t* kd,
+    const double* query,
+    double maxd2,
+    int options,
+    size_t max_points,
+    size_t merge_gap_points,
+    kdtree_direct_plan_ranges_fn emit_ranges,
+    void* emit_opaque) {
+    kdtree_direct_plan_state_t state;
+    int walk_status = -1;
+
+    if (!emit_ranges) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    memset(&state, 0, sizeof(state));
+    state.emit_ranges = emit_ranges;
+    state.emit_opaque = emit_opaque;
+    (void)kdtree_rangesearch_direct_dss_core(
+        kd,
+        NULL,
+        query,
+        maxd2,
+        options,
+        max_points,
+        merge_gap_points,
+        kdtree_direct_flush_plan,
+        &state,
+        FALSE,
+        &walk_status);
+    return walk_status;
 }
 
 kdtree_qres_t* kdtree_rangesearch_direct_dss(
@@ -1019,7 +1150,9 @@ kdtree_qres_t* kdtree_rangesearch_direct_dss(
         max_points,
         merge_gap_points,
         kdtree_direct_flush_inline,
-        &reader);
+        &reader,
+        TRUE,
+        NULL);
 }
 
 kdtree_qres_t* kdtree_rangesearch_direct_dss_leased(
@@ -1054,7 +1187,9 @@ kdtree_qres_t* kdtree_rangesearch_direct_dss_leased(
         max_points,
         merge_gap_points,
         kdtree_direct_flush_leased_wave,
-        &state);
+        &state,
+        TRUE,
+        NULL);
 }
 
 #undef KDTREE_DIRECT_SPAN_CAPACITY

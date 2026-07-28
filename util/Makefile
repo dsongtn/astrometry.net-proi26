@@ -51,7 +51,7 @@ ANFILES_OBJ :=
 ANUTILS_DEPS :=
 
 ifndef NO_QFITS
-ANFILES_OBJ += multiindex.o index.o indexset.o \
+ANFILES_OBJ += multiindex.o index.o index_residency.o indexset.o \
 	codekd.o starkd.o rdlist.o xylist.o \
 	starxy.o qidxfile.o quadfile.o scamp.o scamp-catalog.o \
 	tabsort.o wcs-xy2rd.o wcs-rd2xy.o matchfile.o
@@ -127,7 +127,8 @@ ANUTILS_H := an-bool.h an-endian.h an-opts.h an-thread-pthreads.h \
 	bl-sort.h  bt.h cairoutils.h \
 	codekd.h errors.h fitsbin.h fitsfile.h fitsioutils.h \
 	fitstable.h os-features-config.h os-features.h gslutils.h \
-	healpix-utils.h healpix.h index.h intmap.h ioutils.h fileutils.h \
+	healpix-utils.h healpix.h index.h index_residency.h intmap.h ioutils.h \
+	fileutils.h \
 	keywords.h log.h \
 	mathutil.h permutedsort.h qidxfile.h quadfile.h rdlist.h scamp-catalog.h \
 	fit-wcs.h sip-utils.h sip.h sip_qfits.h starkd.h starutil.h starutil.inc \
@@ -353,13 +354,13 @@ ALL_TEST_FILES = test_bl test_bt test_endian test_fitstable test_xylist \
 	test_anwcs test_sip-utils test_errors test_multiindex \
 	test_convolve_image test_qsort_r test_wcs test_big_tables \
 	test_dfind test_ctmf test_dsmooth test_dcen3x3 test_simplexy \
-	test_fit_wcs test_matchfile test_index_metadata
+	test_fit_wcs test_matchfile test_index_metadata test_index_residency
 
 # test_quadfile -- takes a long time!
 
 ALL_TEST_EXTRA_OBJS =
 ALL_TEST_LIBS = $(ANFILES_SLIB)
-ALL_TEST_EXTRA_LDFLAGS =
+ALL_TEST_EXTRA_LDFLAGS = -Wl,--wrap=pread64
 
 include $(COMMON)/makefile.tests
 
@@ -396,7 +397,8 @@ NORMAL_TESTS := test_big_tables test_qsort_r \
 	test_anwcs test_wcs test_fitstable test_fitsbin \
 	test_fitsioutils test_xylist test_rdlist test_bl test_bt test_endian \
 	test_healpix test_log test_ioutils test_scamp_catalog test_starutil \
-	test_svd test_fit_wcs test_quadfile test_index_metadata
+	test_svd test_fit_wcs test_quadfile test_index_metadata \
+	test_index_residency
 
 $(NORMAL_TESTS): $(ANFILES_SLIB)
 

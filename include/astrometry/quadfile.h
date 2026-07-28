@@ -65,6 +65,17 @@ int quadfile_prefetch_stars(const quadfile_t* qf,
                             int nquads);
 
 /*
+ * Submit a complete bounded set of Quad rows to the payload loader. The
+ * returned ticket must be waited or cancelled before the quadfile is closed.
+ * Refusal returns zero and leaves the original mapped lookup authoritative.
+ */
+int quadfile_prefetch_stars_submit(
+    const quadfile_t* qf,
+    const unsigned int* quadids,
+    int nquads,
+    fitsbin_payload_io_ticket_t** ticket);
+
+/*
  * Advise the mapped pages containing the selected Quad rows. This does not
  * read the rows and never uses the compatibility payload descriptor. It
  * returns the number of advised spans, zero when inapplicable, or -1 on

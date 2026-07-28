@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <unistd.h>
 
 #include "starkd.h"
 #include "kdtree.h"
@@ -745,6 +746,70 @@ int startree_prefetch_stars(startree_t* s,
         (size_t)accepted,
         512U * 1024U);
     return 0;
+}
+
+int startree_prefetch_stars_submit(
+    startree_t* s,
+    const unsigned int* starids,
+    int nstars,
+    fitsbin_payload_io_ticket_t** ticket) {
+    fitsbin_prefetch_range_t ranges[160];
+    fitsbin_t* fb;
+    size_t row_size;
+    size_t byte_budget;
+    size_t per_range_budget;
+    long detected_page_size;
+    int accepted;
+    int i;
+
+    if (!ticket) {
+        return -1;
+    }
+    *ticket = NULL;
+    if (!s || !s->tree || !starids || nstars <= 0 ||
+        !s->tree->io || !s->tree->io_is_fitsbin ||
+        !s->tree->data.any || Ndata(s) <= 0) {
+        return 0;
+    }
+    detected_page_size = sysconf(_SC_PAGESIZE);
+    if (detected_page_size <= 0) {
+        return 0;
+    }
+    row_size = kdtree_sizeof_data(s->tree) / (size_t)Ndata(s);
+    if (!row_size || (size_t)detected_page_size >
+        (SIZE_MAX - row_size) / 2U) {
+        return 0;
+    }
+    accepted = MIN(
+        nstars,
+        (int)(sizeof(ranges) / sizeof(ranges[0])));
+    per_range_budget = row_size +
+        2U * (size_t)detected_page_size;
+    if ((size_t)accepted > SIZE_MAX / per_range_budget) {
+        return 0;
+    }
+    byte_budget = (size_t)accepted * per_range_budget;
+    fb = s->tree->io;
+
+    for (i = 0; i < accepted; i++) {
+        int data_index;
+
+        if (starids[i] >= (unsigned int)Ndata(s)) {
+            return 0;
+        }
+        data_index = startree_data_index(s, (int)starids[i]);
+        if (data_index < 0) {
+            return 0;
+        }
+        ranges[i].data = kdtree_get_data(s->tree, data_index);
+        ranges[i].size = row_size;
+    }
+    return fitsbin_prefetch_ranges_submit(
+        fb,
+        ranges,
+        (size_t)accepted,
+        byte_budget,
+        ticket);
 }
 
 #define STARTREE_MAPPED_ADVICE_RANGE_LIMIT 256U

@@ -14,6 +14,150 @@
 #include "qfits_rw.h"
 #include "starutil.h"
 
+#include <pthread.h>
+
+static index_residency_t* active_index_residency = NULL;
+static size_t active_index_residency_readers = 0U;
+static pthread_mutex_t active_index_residency_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t active_index_residency_cond =
+    PTHREAD_COND_INITIALIZER;
+
+int index_bind_residency_service(index_residency_t* service) {
+    int status = 0;
+
+    if (!service) {
+        return -1;
+    }
+    pthread_mutex_lock(&active_index_residency_mutex);
+    if (active_index_residency) {
+        status = -1;
+    } else {
+        active_index_residency = service;
+    }
+    pthread_mutex_unlock(&active_index_residency_mutex);
+    return status;
+}
+
+void index_unbind_residency_service(index_residency_t* service) {
+    pthread_mutex_lock(&active_index_residency_mutex);
+    if (active_index_residency == service) {
+        active_index_residency = NULL;
+    }
+    while (active_index_residency_readers) {
+        pthread_cond_wait(
+            &active_index_residency_cond,
+            &active_index_residency_mutex);
+    }
+    pthread_mutex_unlock(&active_index_residency_mutex);
+}
+
+anbool index_residency_service_active(void) {
+    anbool active;
+
+    pthread_mutex_lock(&active_index_residency_mutex);
+    active = active_index_residency != NULL;
+    pthread_mutex_unlock(&active_index_residency_mutex);
+    return active;
+}
+
+static index_residency_t* index_borrow_residency_service(void) {
+    index_residency_t* service;
+
+    pthread_mutex_lock(&active_index_residency_mutex);
+    service = active_index_residency;
+    if (service) {
+        active_index_residency_readers++;
+    }
+    pthread_mutex_unlock(&active_index_residency_mutex);
+    return service;
+}
+
+static void index_return_residency_service(
+    index_residency_t* service) {
+    if (!service) {
+        return;
+    }
+    pthread_mutex_lock(&active_index_residency_mutex);
+    if (active_index_residency_readers) {
+        active_index_residency_readers--;
+    }
+    if (!active_index_residency_readers) {
+        pthread_cond_broadcast(
+            &active_index_residency_cond);
+    }
+    pthread_mutex_unlock(&active_index_residency_mutex);
+}
+
+static anbool index_try_resident_open(index_t* index) {
+    index_residency_t* service;
+    index_residency_handle_t* handle = NULL;
+    index_residency_result_t result;
+    const char* backing_path;
+    anqfits_t* resident_fits;
+
+    if (!index || !index->indexfn ||
+        index->residency || index->residency_source) {
+        return FALSE;
+    }
+    service = index_borrow_residency_service();
+    if (!service) {
+        return FALSE;
+    }
+    result = index_residency_acquire(
+        service,
+        index->indexfn,
+        &handle);
+    index_return_residency_service(service);
+    if (result == INDEX_RESIDENCY_SOURCE_LEASE &&
+        handle) {
+        index->residency_source = handle;
+        return FALSE;
+    }
+    if (result != INDEX_RESIDENCY_ACCEPTED || !handle) {
+        index_residency_release(handle);
+        return FALSE;
+    }
+    backing_path = index_residency_handle_path(handle);
+    resident_fits = backing_path ? anqfits_open(backing_path) : NULL;
+    if (!resident_fits) {
+        index_residency_release(handle);
+        return FALSE;
+    }
+    if (index->fits) {
+        anqfits_close(index->fits);
+    }
+    index->fits = resident_fits;
+    index->residency = handle;
+    return TRUE;
+}
+
+int index_get_source_file_stat(
+    const index_t* index,
+    struct stat* identity) {
+    const struct stat* resident_identity;
+
+    if (!index || !identity) {
+        return -1;
+    }
+    if (index->residency) {
+        resident_identity =
+            index_residency_handle_source_stat(index->residency);
+        if (!resident_identity) {
+            return -1;
+        }
+        *identity = *resident_identity;
+        return 0;
+    }
+    if (index->quads && index->quads->fb &&
+        !fitsbin_get_open_file_stat(
+            index->quads->fb,
+            identity)) {
+        return 0;
+    }
+    return index->indexfn ? stat(index->indexfn, identity) : -1;
+}
+
 anbool index_overlaps_scale_range(index_t* meta,
                                   double quadlo, double quadhi) {
     anbool rtn =
@@ -255,6 +399,10 @@ static void set_meta(index_t* index) {
 }
 
 static int index_reload_internal(index_t* index, anbool metadata_only) {
+    anbool full_resident = index && index->residency;
+
+    if (full_resident)
+        fitsbin_payload_set_thread_full_resident();
     // Read .skdt file...
     if (!index->starkd) {
         if (metadata_only) {
@@ -293,10 +441,29 @@ static int index_reload_internal(index_t* index, anbool metadata_only) {
             goto bailout;
         }
     }
+    if (full_resident)
+        fitsbin_payload_clear_thread_full_resident();
     return 0;
 
  bailout:
+    if (full_resident)
+        fitsbin_payload_clear_thread_full_resident();
     return -1;
+}
+
+static int index_reopen_original_backing(index_t* index) {
+    if (!index || !index->residency || !index->indexfn) {
+        return -1;
+    }
+    index_unload(index);
+    if (index->fits) {
+        anqfits_close(index->fits);
+        index->fits = NULL;
+    }
+    index_residency_release(index->residency);
+    index->residency = NULL;
+    index->fits = anqfits_open(index->indexfn);
+    return index->fits ? 0 : -1;
 }
 
 int index_dimquads(index_t* indx) {
@@ -330,17 +497,27 @@ index_t* index_load(const char* indexname, int flags, index_t* dest) {
         ERROR("Did not find file for index named %s", dest->indexname);
         goto bailout;
     }
-    dest->fits = anqfits_open(dest->indexfn);
+    if (!(flags & INDEX_ONLY_LOAD_METADATA))
+        (void)index_try_resident_open(dest);
+    if (!dest->fits)
+        dest->fits = anqfits_open(dest->indexfn);
     if (!dest->fits) {
         ERROR("Failed to open FITS file %s", dest->indexfn);
         goto bailout;
     }
-    if (index_reload_internal(dest, flags & INDEX_ONLY_LOAD_METADATA)) {
-        goto bailout;
+    if (index_reload_internal(
+            dest, flags & INDEX_ONLY_LOAD_METADATA)) {
+        if (!dest->residency ||
+            index_reopen_original_backing(dest) ||
+            index_reload_internal(dest, FALSE)) {
+            goto bailout;
+        }
     }
 
     free(dest->indexname);
-    dest->indexname = strdup(quadfile_get_filename(dest->quads));
+    dest->indexname = strdup(
+        dest->residency ? dest->indexfn :
+        quadfile_get_filename(dest->quads));
     set_meta(dest);
 
     logverb("Index scale: [%g, %g] arcmin, [%g, %g] arcsec\n",
@@ -368,6 +545,21 @@ index_t* index_load(const char* indexname, int flags, index_t* dest) {
 }
 
 int index_reload(index_t* index) {
+    int status;
+
+    if (!index) {
+        return -1;
+    }
+    if (!index->codekd && !index->quads && !index->starkd) {
+        (void)index_try_resident_open(index);
+    }
+    status = index_reload_internal(index, FALSE);
+    if (!status || !index->residency) {
+        return status;
+    }
+    if (index_reopen_original_backing(index)) {
+        return -1;
+    }
     return index_reload_internal(index, FALSE);
 }
 
@@ -499,14 +691,20 @@ int index_close_payload_fds(index_t* ind) {
 
 void index_close(index_t* index) {
     if (!index) return;
-    free(index->indexname);
-    free(index->indexfn);
-    free(index->cutband);
-    index->indexname = index->indexfn = NULL;
     index_unload(index);
     if (index->fits)
         anqfits_close(index->fits);
     index->fits = NULL;
+    if (index->residency)
+        index_residency_release(index->residency);
+    index->residency = NULL;
+    if (index->residency_source)
+        index_residency_release(index->residency_source);
+    index->residency_source = NULL;
+    free(index->indexname);
+    free(index->indexfn);
+    free(index->cutband);
+    index->indexname = index->indexfn = NULL;
 }
 
 void index_free(index_t* index) {

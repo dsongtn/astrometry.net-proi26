@@ -149,7 +149,7 @@ void test_fitsbin_mmap_advice(CuTest* ct) {
         fitsbin_get_chunk_mmap_advice(&fb, &payload));
     CuAssertIntEquals(
         ct,
-        fb.mmap_advice,
+        FITSBIN_MMAP_ADVICE_NORMAL,
         fitsbin_get_chunk_mmap_advice(&fb, &topology));
 
     fitsbin_mmap_clear_thread_advice();

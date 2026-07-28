@@ -22,6 +22,91 @@ typedef struct direct_reader {
     int largest_count;
 } direct_reader_t;
 
+#define DIRECT_PLAN_CAPTURE_LIMIT 1024U
+
+typedef struct direct_plan_capture {
+    const kdtree_t* kd;
+    kdtree_direct_range_request_t
+        requests[DIRECT_PLAN_CAPTURE_LIMIT];
+    size_t batch_counts[DIRECT_PLAN_CAPTURE_LIMIT];
+    size_t nrequests;
+    size_t nbatches;
+    size_t releases;
+} direct_plan_capture_t;
+
+static int direct_plan_capture_ranges(
+    void* opaque,
+    const kdtree_direct_range_request_t* requests,
+    size_t nrequests) {
+    direct_plan_capture_t* capture = opaque;
+    size_t request_index;
+
+    if (!capture || !capture->kd || !requests || !nrequests ||
+        nrequests > KDTREE_DIRECT_DSS_WAVE_TASKS ||
+        capture->nbatches >= DIRECT_PLAN_CAPTURE_LIMIT ||
+        nrequests > DIRECT_PLAN_CAPTURE_LIMIT - capture->nrequests) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (request_index = 0U;
+         request_index < nrequests;
+         request_index++) {
+        const kdtree_direct_range_request_t* request =
+            &requests[request_index];
+
+        if (request->first < 0 || request->count <= 0 ||
+            request->count > capture->kd->ndata ||
+            request->first > capture->kd->ndata - request->count) {
+            errno = ERANGE;
+            return -1;
+        }
+    }
+    capture->batch_counts[capture->nbatches++] = nrequests;
+    memcpy(&capture->requests[capture->nrequests],
+           requests,
+           nrequests * sizeof(*requests));
+    capture->nrequests += nrequests;
+    return 0;
+}
+
+static int direct_leased_capture_read(
+    void* opaque,
+    const kdtree_direct_range_request_t* requests,
+    size_t nrequests,
+    kdtree_direct_range_t* ranges) {
+    direct_plan_capture_t* capture = opaque;
+    size_t request_index;
+
+    if (!ranges || direct_plan_capture_ranges(
+            opaque, requests, nrequests)) {
+        return -1;
+    }
+    for (request_index = 0U;
+         request_index < nrequests;
+         request_index++) {
+        const kdtree_direct_range_request_t* request =
+            &requests[request_index];
+
+        ranges[request_index].data = capture->kd->data.s +
+            (size_t)request->first * (size_t)capture->kd->ndim;
+        ranges[request_index].perm = capture->kd->perm
+            ? capture->kd->perm + request->first
+            : NULL;
+        ranges[request_index].lease = capture;
+    }
+    return 0;
+}
+
+static void direct_leased_capture_release(
+    void* opaque,
+    void* lease) {
+    direct_plan_capture_t* capture = opaque;
+
+    if (capture && lease == capture) {
+        capture->releases++;
+    }
+}
+
 static uint32_t direct_test_prng(uint32_t* state) {
     uint32_t value = *state;
 
@@ -311,6 +396,98 @@ static void direct_test_tree(
     direct_reader_cleanup(&reader);
 
     kd->perm = saved_permutation ? saved_permutation : kd->perm;
+    kdtree_free(kd);
+}
+
+void test_kdtree_direct_dss_plan_matches_leased_requests(
+    CuTest* ct) {
+    const int options =
+        KD_OPTIONS_SMALL_RADIUS |
+        KD_OPTIONS_COMPUTE_DISTS |
+        KD_OPTIONS_NO_RESIZE_RESULTS |
+        KD_OPTIONS_USE_SPLIT;
+    const int npoints = 513;
+    const int ndim = 4;
+    const double query[4] = {0.50, 0.50, 0.50, 0.50};
+    direct_plan_capture_t planned;
+    direct_plan_capture_t leased;
+    double* data;
+    kdtree_t* kd;
+    kdtree_qres_t* result;
+    u16* saved_data;
+    u32* saved_perm;
+    int plan_status;
+
+    data = direct_test_points(npoints, ndim);
+    CuAssertPtrNotNull(ct, data);
+    kd = kdtree_build(
+        NULL,
+        data,
+        npoints,
+        ndim,
+        9,
+        KDTT_DSS,
+        KD_BUILD_SPLIT |
+            KD_BUILD_SPLITDIM |
+            KD_BUILD_LINEAR_LR);
+    free(data);
+    CuAssertPtrNotNull(ct, kd);
+
+    memset(&planned, 0, sizeof(planned));
+    planned.kd = kd;
+    saved_data = kd->data.s;
+    saved_perm = kd->perm;
+    kd->data.s = NULL;
+    kd->perm = NULL;
+    plan_status = kdtree_rangesearch_direct_dss_plan(
+        kd,
+        query,
+        4.0,
+        options,
+        7U,
+        3U,
+        direct_plan_capture_ranges,
+        &planned);
+    kd->data.s = saved_data;
+    kd->perm = saved_perm;
+    CuAssertIntEquals(ct, 0, plan_status);
+    CuAssert(ct, "range plan must emit requests", planned.nrequests > 0U);
+
+    memset(&leased, 0, sizeof(leased));
+    leased.kd = kd;
+    result = kdtree_rangesearch_direct_dss_leased(
+        kd,
+        NULL,
+        query,
+        4.0,
+        options,
+        7U,
+        3U,
+        direct_leased_capture_read,
+        direct_leased_capture_release,
+        &leased,
+        NULL);
+    CuAssertPtrNotNull(ct, result);
+    CuAssertIntEquals(
+        ct, (int)planned.nbatches, (int)leased.nbatches);
+    CuAssertIntEquals(
+        ct, (int)planned.nrequests, (int)leased.nrequests);
+    CuAssertIntEquals(
+        ct, (int)leased.nrequests, (int)leased.releases);
+    CuAssert(
+        ct,
+        "range plan must preserve leased batch boundaries",
+        !memcmp(planned.batch_counts,
+                leased.batch_counts,
+                planned.nbatches * sizeof(planned.batch_counts[0])));
+    CuAssert(
+        ct,
+        "range plan must preserve leased request order",
+        !memcmp(planned.requests,
+                leased.requests,
+                planned.nrequests * sizeof(planned.requests[0])));
+
+    kdtree_free_query(result);
     kdtree_free(kd);
 }
 

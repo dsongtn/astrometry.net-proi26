@@ -7,6 +7,7 @@
 #include <math.h>
 #include <string.h>
 #include <assert.h>
+#include <unistd.h>
 
 #include "quadfile.h"
 #include "qfits_header.h"
@@ -405,6 +406,66 @@ int quadfile_prefetch_stars(const quadfile_t* qf,
         (size_t)accepted,
         256U * 1024U);
     return 0;
+}
+
+int quadfile_prefetch_stars_submit(
+    const quadfile_t* qf,
+    const unsigned int* quadids,
+    int nquads,
+    fitsbin_payload_io_ticket_t** ticket) {
+    fitsbin_prefetch_range_t ranges[32];
+    size_t row_size;
+    size_t byte_budget;
+    size_t per_range_budget;
+    long detected_page_size;
+    int accepted;
+    int i;
+
+    if (!ticket) {
+        return -1;
+    }
+    *ticket = NULL;
+    if (!qf || !quadids || nquads <= 0 || !qf->fb ||
+        !qf->quadarray || qf->dimquads <= 0 ||
+        (size_t)qf->dimquads > SIZE_MAX / sizeof(uint32_t)) {
+        return 0;
+    }
+    detected_page_size = sysconf(_SC_PAGESIZE);
+    if (detected_page_size <= 0) {
+        return 0;
+    }
+    row_size = (size_t)qf->dimquads * sizeof(uint32_t);
+    if ((size_t)detected_page_size >
+        (SIZE_MAX - row_size) / 2U) {
+        return 0;
+    }
+    accepted = MIN(
+        nquads,
+        (int)(sizeof(ranges) / sizeof(ranges[0])));
+    per_range_budget = row_size +
+        2U * (size_t)detected_page_size;
+    if ((size_t)accepted > SIZE_MAX / per_range_budget) {
+        return 0;
+    }
+    byte_budget = (size_t)accepted * per_range_budget;
+
+    for (i = 0; i < accepted; i++) {
+        const uint32_t* row;
+
+        if (quadids[i] >= qf->numquads) {
+            return 0;
+        }
+        row = qf->quadarray +
+            (size_t)quadids[i] * (size_t)qf->dimquads;
+        ranges[i].data = row;
+        ranges[i].size = row_size;
+    }
+    return fitsbin_prefetch_ranges_submit(
+        qf->fb,
+        ranges,
+        (size_t)accepted,
+        byte_budget,
+        ticket);
 }
 
 #define QUADFILE_MAPPED_ADVICE_RANGE_LIMIT 256U

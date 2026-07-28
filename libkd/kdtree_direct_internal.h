@@ -39,6 +39,15 @@ typedef struct kdtree_direct_range_request {
 } kdtree_direct_range_request_t;
 
 /*
+ * Receives the exact range batches that the leased direct search would pass
+ * to read_ranges(). The request array is valid only for the callback.
+ */
+typedef int (*kdtree_direct_plan_ranges_fn)(
+    void* opaque,
+    const kdtree_direct_range_request_t* requests,
+    size_t nrequests);
+
+/*
  * Success fills every range with non-NULL data and lease, plus perm when the
  * tree has one. The pointers remain valid until release_range() receives each
  * lease. Failure may return partial non-NULL leases; libkd releases each one
@@ -91,6 +100,21 @@ typedef struct kdtree_direct_dss_executor {
 int kdtree_direct_dss_task_execute(
     const kdtree_direct_dss_task_input_t* input,
     kdtree_direct_dss_task_output_t* output);
+
+/*
+ * Plans the exact range batches for a direct DSS search without reading DATA
+ * or PERM. The callback observes the same canonical batches, max_points, and
+ * merge_gap_points policy as kdtree_rangesearch_direct_dss_leased().
+ */
+int kdtree_rangesearch_direct_dss_plan(
+    const kdtree_t* kd,
+    const double* query,
+    double maxd2,
+    int options,
+    size_t max_points,
+    size_t merge_gap_points,
+    kdtree_direct_plan_ranges_fn emit_ranges,
+    void* emit_opaque);
 
 /*
  * Exact split-tree search for the double/U16/U16 CodeKD representation.

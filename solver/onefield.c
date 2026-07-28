@@ -382,13 +382,7 @@ static void onefield_job_index_cache_entry_free(
 static int onefield_job_index_open_identity(
     index_t* index,
     struct stat* identity) {
-    if (!index || !identity ||
-        !index->quads || !index->quads->fb) {
-        return -1;
-    }
-    return fitsbin_get_open_file_stat(
-        index->quads->fb,
-        identity);
+    return index_get_source_file_stat(index, identity);
 }
 
 static anbool onefield_job_index_path_matches(
@@ -715,6 +709,14 @@ static void onefield_job_index_cache_prepare(
     char* pending_path;
 
     if (!bp || !configured_path) {
+        return;
+    }
+    /*
+     * Full-cohort residency already owns preparation. A second mapping lane
+     * could retain a source-backed index just before the resident copy becomes
+     * ready, bypassing the prepared backing for the lifetime of that handoff.
+     */
+    if (index_residency_service_active()) {
         return;
     }
     cache = bp->job_field_cache;

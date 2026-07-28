@@ -213,6 +213,17 @@ int startree_prefetch_stars(startree_t* s,
                             int nstars);
 
 /*
+ * Submit a complete bounded set of StarKD coordinate rows to the payload
+ * loader. The returned ticket must be waited or cancelled before the tree is
+ * closed. Refusal leaves the original mapped lookup authoritative.
+ */
+int startree_prefetch_stars_submit(
+    startree_t* s,
+    const unsigned int* starids,
+    int nstars,
+    fitsbin_payload_io_ticket_t** ticket);
+
+/*
  * Advise mapped coordinate rows for selected canonical star IDs. If a tree
  * needs an inverse permutation that has not already been built, this
  * advisory operation declines the request rather than constructing it. It

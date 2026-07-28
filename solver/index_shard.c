@@ -1971,6 +1971,7 @@ static void index_shard_request_stop(index_shard_thread_state_t *shared) {
       &shared->worker_stop_requested,
       TRUE,
       __ATOMIC_RELEASE);
+  fitsbin_payload_io_notify_wait_helpers();
 
   if (!was_stopped && index_shard_trace_enabled()) {
     logmsg("[index-shard] stop-request pass_wall=%.6f\n",
@@ -2024,6 +2025,7 @@ static void index_shard_request_fatal_stop(index_shard_thread_state_t *shared) {
       &shared->worker_stop_requested,
       TRUE,
       __ATOMIC_RELEASE);
+  fitsbin_payload_io_notify_wait_helpers();
 
   index_shard_wake_pass_waiters(shared);
   index_shard_wake_queue_waiters(shared);
@@ -2051,6 +2053,7 @@ static void index_shard_publish_committed_solve(
       &shared->worker_stop_requested,
       TRUE,
       __ATOMIC_RELEASE);
+  fitsbin_payload_io_notify_wait_helpers();
 
   index_shard_wake_pass_waiters(shared);
   index_shard_wake_queue_waiters(shared);
@@ -2956,6 +2959,17 @@ static int index_shard_payload_wait_help(void *opaque) {
   return 1;
 }
 
+static int index_shard_payload_wait_stop(void *opaque) {
+  index_shard_worker_context_t *ctx = opaque;
+
+  if (!ctx || !ctx->pool) {
+    return TRUE;
+  }
+  return __atomic_load_n(
+      &ctx->pool->shared.worker_stop_requested,
+      __ATOMIC_ACQUIRE) != 0;
+}
+
 /* queue_mutex must be held. */
 static int index_shard_helper_cancel_for_pool_locked(
     index_shard_thread_state_t *shared,
@@ -3479,6 +3493,10 @@ static size_t index_shard_claim_limit_locked(
   return shared->nindexes;
 }
 
+static void index_shard_worker_cleanup_pass(
+    index_shard_worker_context_t *ctx,
+    index_shard_thread_state_t *shared);
+
 static void index_shard_advance_canonical_cursor_locked(
     index_shard_thread_state_t *shared) {
   while (shared->canonical_scan_cursor < shared->nindexes &&
@@ -3644,6 +3662,17 @@ index_shard_select_work(
     if (!shared->outer_running) {
       pthread_mutex_unlock(&shared->queue_mutex);
       return INDEX_SHARD_WORK_DONE;
+    }
+    if (worker->local_context_ready) {
+      /*
+       * No new outer task can become claimable for this worker in the
+       * current band. Release its index-local context before it waits for
+       * index-free helper packages from the remaining owners.
+       */
+      pthread_mutex_unlock(&shared->queue_mutex);
+      index_shard_worker_cleanup_pass(worker, shared);
+      pthread_mutex_lock(&shared->queue_mutex);
+      continue;
     }
     shared->queue_waiters++;
     helper_selection = pthread_cond_wait(
@@ -4004,6 +4033,7 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
   fitsbin_payload_io_clear_thread_wait_helper();
   (void)fitsbin_payload_io_set_thread_wait_helper(
       index_shard_payload_wait_help,
+      index_shard_payload_wait_stop,
       ctx);
   rc = shared->hooks->solve_one_index(&ctx->local_bp, index);
   fitsbin_payload_io_clear_thread_wait_helper();
@@ -4919,6 +4949,11 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
 
   index_shard_global_pool = pool;
   fitsbin_payload_io_configure_workers(worker_count);
+  if (worker_count > 1 &&
+      fitsbin_payload_io_service_start(MIN(worker_count, 2))) {
+    logverb("[index-shard] payload loader unavailable; "
+            "using synchronous fallback\n");
+  }
 
   logverb("[index-shard] workers=%i mode=pthread "
           "inverse_cache_budget=%zu\n",
@@ -4984,6 +5019,7 @@ void index_shard_pool_stop(onefield_t *bp) {
   for (i = 0; i < pool->worker_count; i++) {
     pthread_join(pool->threads[i], NULL);
   }
+  fitsbin_payload_io_service_stop();
   fitsbin_payload_io_configure_workers(1);
 
   free(pool->threads);
@@ -5202,9 +5238,9 @@ static int index_shard_pool_submit(
           "candidates=%zu engine_pass=%zu depth_index=%zu scale_index=%zu "
           "startobj=%i endobj=%i scheduler=affinity-first chunk=1 "
           "inner_scheduler=owner-helper-groups "
-          "mmap_pass=%u mmap_advice=%s "
+          "mmap_pass=%u mmap_advice=%s mmap_topology=normal "
           "mmap_policy=parallel-random-serial-normal "
-          "page_delivery=bounded-populate "
+          "page_delivery=bounded-pread-broker loader_lanes=%i "
           "payload_io=batched-pread-mmap-fallback credits=%i "
           "outer_admission=full-owner-affinity\n",
           worker_count,
@@ -5217,6 +5253,7 @@ static int index_shard_pool_submit(
           base_sp->endobj,
           shared->mmap_pass_number,
           fitsbin_mmap_advice_name(shared->mmap_advice),
+          MIN(worker_count, 2),
           worker_count);
 
   return 0;
@@ -5765,7 +5802,7 @@ index_shard_solve_impl(onefield_t *bp,
           state.master_committed);
 
   logverb("[index-shard] mmap-policy "
-         "policy=%s effective=%s pass=%u "
+         "policy=%s effective=%s topology=normal pass=%u "
          "clean_unsolved_passes=%u transitions=%u "
          "transitioned=%i completed=%i exhaustive=%i "
          "solved=%i cancelled=%i advice_failures=%llu\n",

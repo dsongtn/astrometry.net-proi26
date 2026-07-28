@@ -153,6 +153,7 @@ struct fitsbin_t {
     char* filename;
 
     anqfits_t* fits;
+    anbool owns_fits;
 
     bl* chunks;
 
@@ -188,6 +189,12 @@ struct fitsbin_t {
     // Enables bounded, caller-directed population of mapped payload pages.
     anbool mmap_prefetch_enabled;
     anbool mmap_prefetch_failed;
+
+    /*
+     * Captured source policy. This marks a source whose payload is already
+     * fully resident; it does not change mapping or solver behavior itself.
+     */
+    anbool payload_fully_resident;
 
     /*
      * A separately opened buffered-I/O description for exact payload reads.
@@ -277,6 +284,20 @@ typedef struct fitsbin_prefetch_range {
     size_t size;
 } fitsbin_prefetch_range_t;
 
+typedef struct fitsbin_payload_io_ticket
+    fitsbin_payload_io_ticket_t;
+
+/*
+ * Loader dequeue order is demand, current-index preparation, then
+ * speculation. Non-demand admission leaves one job and one quarter of the
+ * in-flight byte ceiling available for demand.
+ */
+typedef enum fitsbin_payload_io_priority {
+    FITSBIN_PAYLOAD_IO_PRIORITY_DEMAND = 0,
+    FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
+    FITSBIN_PAYLOAD_IO_PRIORITY_SPECULATIVE
+} fitsbin_payload_io_priority_t;
+
 typedef struct fitsbin_payload_io_stats {
     unsigned long long read_calls;
     unsigned long long read_batches;
@@ -303,6 +324,13 @@ typedef struct fitsbin_payload_io_stats {
 void fitsbin_payload_io_configure_workers(int worker_count);
 
 /*
+ * Start or stop the bounded payload loader. The service is advisory: callers
+ * retain their original synchronous path when startup or submission fails.
+ */
+int fitsbin_payload_io_service_start(int lane_count);
+void fitsbin_payload_io_service_stop(void);
+
+/*
  * Cheap advisory predicate for optional work that may compete with payload
  * demand. It is nonzero while all reader credits are occupied or any demand
  * reader is waiting. A zero result grants no credit and may become stale
@@ -313,12 +341,16 @@ int fitsbin_payload_io_demand_busy(void);
 /*
  * Optional worker callback used only while a buffered demand reader has no
  * payload credit. It may execute one bounded, index-free helper package; a
- * nonzero return requests one immediate credit/helper retry.
+ * nonzero return requests one immediate credit/helper retry. The optional
+ * stop callback is sampled while a submitted ticket is pending; a nonzero
+ * result cooperatively cancels that ticket.
  */
 typedef int (*fitsbin_payload_io_wait_helper_fn)(void* opaque);
+typedef int (*fitsbin_payload_io_stop_check_fn)(void* opaque);
 
 int fitsbin_payload_io_set_thread_wait_helper(
     fitsbin_payload_io_wait_helper_fn helper,
+    fitsbin_payload_io_stop_check_fn stop_check,
     void* opaque);
 void fitsbin_payload_io_clear_thread_wait_helper(void);
 
@@ -344,6 +376,8 @@ typedef struct fitsbin_pread_range {
 } fitsbin_pread_range_t;
 
 #define FITSBIN_PREAD_RANGE_LIMIT 16U
+/* Direct async tickets own up to this many prepared range records. */
+#define FITSBIN_PREAD_ASYNC_RANGE_LIMIT 256U
 
 /*
  * Resolve the file-page covering interval for one exact mapped request.
@@ -372,6 +406,27 @@ int fitsbin_pread_mapped_ranges(
     size_t range_count);
 
 /*
+ * Submit a fully validated direct read into caller-owned unpublished storage.
+ * All mapped ranges are resolved before queueing and no mapped pointer is
+ * retained. The complete physical byte count must fit byte_budget.
+ *
+ * Return 1 when queued, zero when bounded service capacity is unavailable,
+ * and -1 for invalid input or failed preparation. After a return of 1, every
+ * destination must remain allocated and inaccessible to the caller until
+ * ticket_wait() or ticket_cancel_and_wait() returns. Only a positive wait
+ * result permits publication; failure or cancellation invalidates the whole
+ * batch even when some destination bytes were written. The source fitsbin
+ * must remain live through the wait so operation counters can be applied.
+ */
+int fitsbin_pread_mapped_ranges_submit(
+    fitsbin_t* fb,
+    const fitsbin_pread_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget,
+    fitsbin_payload_io_priority_t priority,
+    fitsbin_payload_io_ticket_t** ticket);
+
+/*
  * Read the exact mapped payload bytes through the dedicated buffered-I/O
  * description.  The mapped address is used only to resolve the immutable file
  * offset; bytes are returned in caller storage.
@@ -388,13 +443,47 @@ int fitsbin_pread_mapped_range(
  * Warm a bounded group of upcoming mapped ranges through exact buffered
  * reads.  Input order selects the lead window; accepted ranges are then page
  * aligned, sorted, deduplicated, and merged only when overlapping/adjacent.
- * Correctness never depends on this advisory operation.
+ * Correctness never depends on this advisory operation. A fully resident source
+ * returns zero without issuing I/O or changing warm counters.
  */
 int fitsbin_prefetch_ranges(
     fitsbin_t* fb,
     const fitsbin_prefetch_range_t* ranges,
     size_t range_count,
     size_t byte_budget);
+
+/*
+ * Submit one completed-read page-cache preparation to the bounded loader.
+ * The mapped ranges are resolved to immutable file offsets before return;
+ * loader threads retain neither mapped pointers nor fitsbin state.
+ *
+ * Return 1 when queued, zero when the optional service or bounded capacity is
+ * unavailable, and -1 for an invalid or failed preparation. The caller must
+ * wait (or cancel and wait) before closing the source fitsbin. A fully
+ * resident source returns zero without creating a ticket.
+ */
+int fitsbin_prefetch_ranges_submit(
+    fitsbin_t* fb,
+    const fitsbin_prefetch_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget,
+    fitsbin_payload_io_ticket_t** ticket);
+
+/*
+ * Wait for one ticket and apply operation-specific I/O counters to the
+ * still-live fitsbin. A failed or cancelled operation leaves the original
+ * synchronous solver path valid. A direct ticket returns its range count only
+ * after every destination is complete. destroy() is valid only after one of
+ * the wait functions.
+ */
+int fitsbin_payload_io_ticket_wait(
+    fitsbin_t* fb,
+    fitsbin_payload_io_ticket_t* ticket);
+int fitsbin_payload_io_ticket_cancel_and_wait(
+    fitsbin_t* fb,
+    fitsbin_payload_io_ticket_t* ticket);
+void fitsbin_payload_io_ticket_destroy(
+    fitsbin_payload_io_ticket_t* ticket);
 
 /*
  * Populate every page-aligned mapped range without copying payload bytes.
@@ -635,6 +724,15 @@ fitsbin_mmap_advice_t fitsbin_mmap_current_advice(void);
 
 /* TRUE only while an outer shard worker owns the current index open. */
 anbool fitsbin_mmap_thread_advice_active(void);
+
+/*
+ * Mark index components opened by this thread as fully resident. The marker
+ * is captured by fitsbin_configure_index_mmap() and has no effect by itself.
+ */
+void fitsbin_payload_set_thread_full_resident(void);
+void fitsbin_payload_clear_thread_full_resident(void);
+anbool fitsbin_payload_is_fully_resident(
+    const fitsbin_t* fb);
 
 /*
  * Changes the logical advice and optionally reapplies it to existing chunks.

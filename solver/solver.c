@@ -97,6 +97,7 @@ typedef struct solver_codekd_cache_entry {
     uint32_t lru_next;
     uint32_t free_next;
     unsigned int pin_count;
+    unsigned int plan_hold_count;
     solver_codekd_cache_state_t state;
     solver_codekd_cache_class_t cache_class;
     anbool listed;
@@ -120,6 +121,7 @@ typedef struct solver_codekd_reader {
         helper_outputs[KDTREE_DIRECT_DSS_WAVE_TASKS];
     size_t cache_bytes;
     size_t total_pins;
+    size_t total_plan_holds;
     anbool helper_hard_failure;
 } solver_codekd_reader_t;
 
@@ -175,6 +177,12 @@ static void solver_codekd_reader_destroy(void* opaque) {
                    "cache entry slot=%zu pins=%u\n",
                    i,
                    reader->cache[i].pin_count);
+        }
+        if (reader->cache[i].plan_hold_count) {
+            logerr("[solver-codekd-helper] destroying held "
+                   "cache entry slot=%zu holds=%u\n",
+                   i,
+                   reader->cache[i].plan_hold_count);
         }
         free(reader->cache[i].data);
         free(reader->cache[i].perm);
@@ -565,7 +573,8 @@ static void solver_codekd_cache_list_push_mru(
     uint32_t* tail;
     uint32_t index = solver_codekd_cache_index(reader, entry);
 
-    if (entry->listed || entry->pin_count || !entry->valid) {
+    if (entry->listed || entry->pin_count ||
+        entry->plan_hold_count || !entry->valid) {
         reader->helper_hard_failure = TRUE;
         errno = EPROTO;
         return;
@@ -610,7 +619,7 @@ static void solver_codekd_cache_promote(
             solver_codekd_cache_list_remove(reader, old);
         }
         old->cache_class = SOLVER_CODEKD_CACHE_CLASS_EVICTABLE;
-        if (!old->pin_count) {
+        if (!old->pin_count && !old->plan_hold_count) {
             solver_codekd_cache_list_push_mru(reader, old);
         }
     }
@@ -619,7 +628,7 @@ static void solver_codekd_cache_promote(
     }
     entry->cache_class = SOLVER_CODEKD_CACHE_CLASS_PROTECTED;
     segment->protected_entry = index;
-    if (!entry->pin_count) {
+    if (!entry->pin_count && !entry->plan_hold_count) {
         solver_codekd_cache_list_push_mru(reader, entry);
     }
 }
@@ -667,7 +676,7 @@ static void solver_codekd_cache_detach(
         entry->state != SOLVER_CODEKD_CACHE_VALID) {
         return;
     }
-    if (entry->pin_count) {
+    if (entry->pin_count || entry->plan_hold_count) {
         reader->helper_hard_failure = TRUE;
         errno = EPROTO;
         return;
@@ -728,6 +737,7 @@ static void solver_codekd_cache_free_push(
     entry->lru_previous = SOLVER_CODEKD_CACHE_NONE;
     entry->lru_next = SOLVER_CODEKD_CACHE_NONE;
     entry->pin_count = 0U;
+    entry->plan_hold_count = 0U;
     entry->state = SOLVER_CODEKD_CACHE_FREE;
     entry->cache_class = SOLVER_CODEKD_CACHE_CLASS_NONE;
     entry->listed = FALSE;
@@ -758,6 +768,9 @@ static solver_codekd_cache_entry_t* solver_codekd_cache_take(
     }
     entry = &reader->cache[index];
     solver_codekd_cache_detach(reader, entry);
+    if (reader->helper_hard_failure) {
+        return NULL;
+    }
     return entry;
 }
 
@@ -775,6 +788,9 @@ static int solver_codekd_cache_reclaim_storage(
     }
     entry = &reader->cache[index];
     solver_codekd_cache_detach(reader, entry);
+    if (reader->helper_hard_failure) {
+        return -1;
+    }
     solver_codekd_cache_release_storage(reader, entry);
     solver_codekd_cache_free_push(reader, entry);
     return 0;
@@ -789,7 +805,8 @@ static int solver_codekd_cache_reserve(
     size_t perm_growth;
     size_t growth;
 
-    if (!reader || !entry || entry->pin_count) {
+    if (!reader || !entry || entry->pin_count ||
+        entry->plan_hold_count) {
         if (reader) {
             reader->helper_hard_failure = TRUE;
         }
@@ -983,6 +1000,62 @@ static int solver_codekd_pin_range(
     return 0;
 }
 
+static int solver_codekd_hold_entry(
+    solver_codekd_reader_t* reader,
+    solver_codekd_cache_entry_t* entry) {
+    if (!reader || !entry ||
+        entry->state == SOLVER_CODEKD_CACHE_FREE ||
+        entry->plan_hold_count == UINT_MAX ||
+        reader->total_plan_holds == SIZE_MAX) {
+        if (reader) {
+            reader->helper_hard_failure = TRUE;
+        }
+        errno = EPROTO;
+        return -1;
+    }
+    if (!entry->plan_hold_count && entry->listed) {
+        solver_codekd_cache_list_remove(reader, entry);
+        if (reader->helper_hard_failure) {
+            errno = EPROTO;
+            return -1;
+        }
+    }
+    entry->plan_hold_count++;
+    reader->total_plan_holds++;
+    return 0;
+}
+
+static void solver_codekd_release_entry_hold(
+    solver_codekd_reader_t* reader,
+    solver_codekd_cache_entry_t* entry) {
+    if (!reader || !entry || !entry->plan_hold_count ||
+        !reader->total_plan_holds) {
+        if (reader) {
+            reader->helper_hard_failure = TRUE;
+        }
+        errno = EPROTO;
+        return;
+    }
+    entry->plan_hold_count--;
+    reader->total_plan_holds--;
+    if (entry->plan_hold_count || entry->pin_count ||
+        entry->state != SOLVER_CODEKD_CACHE_VALID ||
+        !entry->valid) {
+        return;
+    }
+    if (!entry->segment) {
+        reader->helper_hard_failure = TRUE;
+        errno = EPROTO;
+        return;
+    }
+    if (entry->segment->protected_entry ==
+        SOLVER_CODEKD_CACHE_NONE) {
+        solver_codekd_cache_promote(reader, entry);
+    } else {
+        solver_codekd_cache_list_push_mru(reader, entry);
+    }
+}
+
 typedef struct solver_codekd_range_plan {
     const void* data_cover_source;
     const void* perm_cover_source;
@@ -1104,6 +1177,238 @@ static anbool solver_codekd_plan_contains(
               outer->perm_cover_size,
               inner->perm_cover_file_offset,
               inner->perm_cover_size)));
+}
+
+#define SOLVER_CODEKD_DELIVERY_ENTRY_LIMIT \
+    (FITSBIN_PREAD_ASYNC_RANGE_LIMIT / 2U)
+
+typedef struct solver_codekd_delivery_item {
+    solver_codekd_cache_entry_t* entry;
+    off_t data_file_offset;
+    off_t perm_file_offset;
+    size_t data_size;
+    size_t perm_size;
+    anbool owns_loading;
+} solver_codekd_delivery_item_t;
+
+typedef struct solver_codekd_delivery {
+    solver_codekd_reader_t* reader;
+    solver_codekd_file_segment_t* segment;
+    fitsbin_t* fitsbin;
+    fitsbin_payload_io_ticket_t* ticket;
+    solver_codekd_delivery_item_t
+        items[SOLVER_CODEKD_DELIVERY_ENTRY_LIMIT];
+    fitsbin_pread_range_t
+        io_ranges[FITSBIN_PREAD_ASYNC_RANGE_LIMIT];
+    size_t item_count;
+    size_t io_count;
+    size_t io_bytes;
+    anbool reader_bound;
+    anbool completed;
+} solver_codekd_delivery_t;
+
+static solver_codekd_delivery_item_t*
+solver_codekd_delivery_find_item(
+    solver_codekd_delivery_t* delivery,
+    solver_codekd_cache_entry_t* entry) {
+    size_t i;
+
+    if (!delivery || !entry) {
+        return NULL;
+    }
+    for (i = 0U; i < delivery->item_count; i++) {
+        if (delivery->items[i].entry == entry) {
+            return &delivery->items[i];
+        }
+    }
+    return NULL;
+}
+
+static solver_codekd_delivery_item_t*
+solver_codekd_delivery_find_loading_cover(
+    solver_codekd_delivery_t* delivery,
+    const solver_codekd_range_plan_t* plan) {
+    size_t i;
+
+    if (!delivery || !plan) {
+        return NULL;
+    }
+    for (i = 0U; i < delivery->item_count; i++) {
+        solver_codekd_delivery_item_t* item =
+            &delivery->items[i];
+
+        if (!item->owns_loading || !item->entry ||
+            item->entry->state != SOLVER_CODEKD_CACHE_LOADING) {
+            continue;
+        }
+        if (solver_codekd_cache_range_contains(
+                item->data_file_offset,
+                item->data_size,
+                plan->data_cover_file_offset,
+                plan->data_cover_size) &&
+            ((!plan->perm_cover_size && !item->perm_size) ||
+             (plan->perm_cover_size && item->perm_size &&
+              solver_codekd_cache_range_contains(
+                  item->perm_file_offset,
+                  item->perm_size,
+                  plan->perm_cover_file_offset,
+                  plan->perm_cover_size)))) {
+            return item;
+        }
+    }
+    return NULL;
+}
+
+static int solver_codekd_delivery_hold_valid(
+    solver_codekd_delivery_t* delivery,
+    solver_codekd_cache_entry_t* entry) {
+    solver_codekd_delivery_item_t* item;
+
+    if (solver_codekd_delivery_find_item(delivery, entry)) {
+        return 0;
+    }
+    if (delivery->item_count >=
+        SOLVER_CODEKD_DELIVERY_ENTRY_LIMIT) {
+        errno = E2BIG;
+        return -1;
+    }
+    if (solver_codekd_hold_entry(delivery->reader, entry)) {
+        return -1;
+    }
+    item = &delivery->items[delivery->item_count++];
+    memset(item, 0, sizeof(*item));
+    item->entry = entry;
+    return 0;
+}
+
+static int solver_codekd_delivery_add_loading(
+    solver_codekd_delivery_t* delivery,
+    const solver_codekd_range_plan_t* plan) {
+    solver_codekd_delivery_item_t* item;
+    solver_codekd_cache_entry_t* entry;
+    size_t added_ranges = plan->perm_cover_size ? 2U : 1U;
+
+    if (delivery->item_count >=
+            SOLVER_CODEKD_DELIVERY_ENTRY_LIMIT ||
+        added_ranges >
+            FITSBIN_PREAD_ASYNC_RANGE_LIMIT - delivery->io_count ||
+        plan->data_cover_size > SIZE_MAX - plan->perm_cover_size ||
+        plan->data_cover_size + plan->perm_cover_size >
+            SIZE_MAX - delivery->io_bytes ||
+        plan->data_cover_size + plan->perm_cover_size >
+            SOLVER_CODEKD_RANGE_CACHE_BYTES / 2U -
+                MIN(delivery->io_bytes,
+                    SOLVER_CODEKD_RANGE_CACHE_BYTES / 2U)) {
+        errno = E2BIG;
+        return -1;
+    }
+    entry = solver_codekd_cache_take(delivery->reader);
+    if (!entry) {
+        return -1;
+    }
+    if (solver_codekd_cache_reserve(
+            delivery->reader,
+            entry,
+            plan->data_cover_size,
+            plan->perm_cover_size)) {
+        solver_codekd_cache_release_storage(
+            delivery->reader, entry);
+        solver_codekd_cache_free_push(delivery->reader, entry);
+        return -1;
+    }
+    if (solver_codekd_hold_entry(delivery->reader, entry)) {
+        solver_codekd_cache_release_storage(
+            delivery->reader, entry);
+        solver_codekd_cache_free_push(delivery->reader, entry);
+        return -1;
+    }
+
+    item = &delivery->items[delivery->item_count++];
+    memset(item, 0, sizeof(*item));
+    item->entry = entry;
+    item->data_file_offset = plan->data_cover_file_offset;
+    item->perm_file_offset = plan->perm_cover_file_offset;
+    item->data_size = plan->data_cover_size;
+    item->perm_size = plan->perm_cover_size;
+    item->owns_loading = TRUE;
+
+    delivery->io_ranges[delivery->io_count].data =
+        plan->data_cover_source;
+    delivery->io_ranges[delivery->io_count].size =
+        plan->data_cover_size;
+    delivery->io_ranges[delivery->io_count].logical_size =
+        plan->data_logical_size;
+    delivery->io_ranges[delivery->io_count].destination =
+        entry->data;
+    delivery->io_count++;
+    if (plan->perm_cover_size) {
+        delivery->io_ranges[delivery->io_count].data =
+            plan->perm_cover_source;
+        delivery->io_ranges[delivery->io_count].size =
+            plan->perm_cover_size;
+        delivery->io_ranges[delivery->io_count].logical_size =
+            plan->perm_logical_size;
+        delivery->io_ranges[delivery->io_count].destination =
+            entry->perm;
+        delivery->io_count++;
+    }
+    delivery->io_bytes +=
+        plan->data_cover_size + plan->perm_cover_size;
+    return 0;
+}
+
+static int solver_codekd_delivery_plan_ranges(
+    void* opaque,
+    const kdtree_direct_range_request_t* requests,
+    size_t nrequests) {
+    solver_codekd_delivery_t* delivery = opaque;
+    size_t request_index;
+
+    if (!delivery || !delivery->reader || !requests || !nrequests ||
+        nrequests > KDTREE_DIRECT_DSS_WAVE_TASKS) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (request_index = 0U;
+         request_index < nrequests;
+         request_index++) {
+        solver_codekd_range_plan_t plan;
+        solver_codekd_cache_entry_t* entry;
+
+        if (solver_codekd_prepare_range_plan(
+                delivery->reader,
+                &requests[request_index],
+                &plan)) {
+            return -1;
+        }
+        entry = solver_codekd_cache_find(
+            delivery->reader,
+            delivery->segment,
+            plan.data_cover_file_offset,
+            plan.data_cover_size,
+            plan.perm_cover_file_offset,
+            plan.perm_cover_size);
+        if (delivery->reader->helper_hard_failure) {
+            errno = EPROTO;
+            return -1;
+        }
+        if (entry) {
+            if (solver_codekd_delivery_hold_valid(
+                    delivery, entry)) {
+                return -1;
+            }
+            continue;
+        }
+        if (solver_codekd_delivery_find_loading_cover(
+                delivery, &plan)) {
+            continue;
+        }
+        if (solver_codekd_delivery_add_loading(
+                delivery, &plan)) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int solver_codekd_plan_entry_offsets(
@@ -1415,6 +1720,9 @@ static void solver_codekd_release_range(
     if (entry->pin_count) {
         return;
     }
+    if (entry->plan_hold_count) {
+        return;
+    }
     if (entry->segment->protected_entry ==
         SOLVER_CODEKD_CACHE_NONE) {
         solver_codekd_cache_promote(reader, entry);
@@ -1598,6 +1906,291 @@ static anbool solver_codekd_direct_capable(
         range_size == perm_bytes;
 }
 
+static void solver_codekd_delivery_unbind(
+    solver_codekd_delivery_t* delivery) {
+    if (!delivery || !delivery->reader_bound) {
+        return;
+    }
+    solver_codekd_reader_unbind(delivery->reader);
+    delivery->reader_bound = FALSE;
+}
+
+static int solver_codekd_delivery_discard(
+    solver_codekd_delivery_t* delivery) {
+    size_t i;
+    int failed;
+
+    if (!delivery) {
+        return 0;
+    }
+    if (delivery->ticket) {
+        (void)fitsbin_payload_io_ticket_cancel_and_wait(
+            delivery->fitsbin, delivery->ticket);
+        fitsbin_payload_io_ticket_destroy(delivery->ticket);
+        delivery->ticket = NULL;
+    }
+    solver_codekd_delivery_unbind(delivery);
+    for (i = delivery->item_count; i > 0U; i--) {
+        solver_codekd_delivery_item_t* item =
+            &delivery->items[i - 1U];
+
+        if (!item->entry) {
+            continue;
+        }
+        solver_codekd_release_entry_hold(
+            delivery->reader, item->entry);
+        if (item->owns_loading &&
+            item->entry->state == SOLVER_CODEKD_CACHE_LOADING) {
+            solver_codekd_cache_release_storage(
+                delivery->reader, item->entry);
+            solver_codekd_cache_free_push(
+                delivery->reader, item->entry);
+        }
+    }
+    failed = delivery->reader &&
+        delivery->reader->helper_hard_failure;
+    free(delivery);
+    return failed ? -1 : 0;
+}
+
+static solver_codekd_delivery_t* solver_codekd_delivery_begin(
+    const kdtree_t* tree) {
+    solver_codekd_delivery_t* delivery;
+    solver_codekd_reader_t* reader;
+    fitsbin_t* fitsbin;
+
+    if (!solver_codekd_direct_capable(tree)) {
+        return NULL;
+    }
+    fitsbin = (fitsbin_t*)tree->io;
+    if (fitsbin_payload_is_fully_resident(fitsbin)) {
+        return NULL;
+    }
+    reader = solver_codekd_reader_get();
+    if (!reader) {
+        return NULL;
+    }
+    if (reader->helper_hard_failure) {
+        errno = EPROTO;
+        return NULL;
+    }
+    delivery = calloc(1, sizeof(*delivery));
+    if (!delivery) {
+        return NULL;
+    }
+    if (solver_codekd_reader_bind(reader, tree, fitsbin)) {
+        free(delivery);
+        return NULL;
+    }
+    delivery->reader = reader;
+    delivery->segment = reader->active_segment;
+    delivery->fitsbin = fitsbin;
+    delivery->reader_bound = TRUE;
+    return delivery;
+}
+
+static int solver_codekd_delivery_rollback_query(
+    solver_codekd_delivery_t* delivery,
+    size_t item_count,
+    size_t io_count,
+    size_t io_bytes) {
+    if (!delivery || item_count > delivery->item_count ||
+        io_count > delivery->io_count ||
+        io_bytes > delivery->io_bytes) {
+        if (delivery && delivery->reader) {
+            delivery->reader->helper_hard_failure = TRUE;
+        }
+        errno = EPROTO;
+        return -1;
+    }
+    while (delivery->item_count > item_count) {
+        solver_codekd_delivery_item_t* item =
+            &delivery->items[delivery->item_count - 1U];
+
+        if (!item->entry) {
+            delivery->reader->helper_hard_failure = TRUE;
+            errno = EPROTO;
+        } else {
+            solver_codekd_release_entry_hold(
+                delivery->reader, item->entry);
+            if (item->owns_loading) {
+                if (item->entry->state !=
+                    SOLVER_CODEKD_CACHE_LOADING) {
+                    delivery->reader->helper_hard_failure = TRUE;
+                    errno = EPROTO;
+                } else {
+                    solver_codekd_cache_release_storage(
+                        delivery->reader, item->entry);
+                    solver_codekd_cache_free_push(
+                        delivery->reader, item->entry);
+                }
+            }
+        }
+        memset(item, 0, sizeof(*item));
+        delivery->item_count--;
+    }
+    delivery->io_count = io_count;
+    delivery->io_bytes = io_bytes;
+    return delivery->reader->helper_hard_failure ? -1 : 0;
+}
+
+static int solver_codekd_delivery_add_query(
+    solver_codekd_delivery_t* delivery,
+    const double* query,
+    double maxd2,
+    int options) {
+    size_t item_count;
+    size_t io_count;
+    size_t io_bytes;
+    int status;
+    int saved_errno;
+
+    if (!delivery || !delivery->reader_bound || !query) {
+        errno = EINVAL;
+        return -1;
+    }
+    item_count = delivery->item_count;
+    io_count = delivery->io_count;
+    io_bytes = delivery->io_bytes;
+    status = kdtree_rangesearch_direct_dss_plan(
+        delivery->reader->tree,
+        query,
+        maxd2,
+        options,
+        SOLVER_CODEKD_DIRECT_MAX_POINTS,
+        0U,
+        solver_codekd_delivery_plan_ranges,
+        delivery);
+    if (!status) {
+        return 0;
+    }
+    saved_errno = errno;
+    if (saved_errno == EPROTO) {
+        delivery->reader->helper_hard_failure = TRUE;
+    }
+    if (solver_codekd_delivery_rollback_query(
+            delivery,
+            item_count,
+            io_count,
+            io_bytes)) {
+        return -1;
+    }
+    errno = saved_errno;
+    return -1;
+}
+
+static int solver_codekd_delivery_submit(
+    solver_codekd_delivery_t* delivery) {
+    int status;
+
+    if (!delivery || !delivery->reader_bound ||
+        !delivery->item_count) {
+        return 0;
+    }
+    if (!delivery->io_count) {
+        delivery->completed = TRUE;
+        solver_codekd_delivery_unbind(delivery);
+        return 1;
+    }
+    status = fitsbin_pread_mapped_ranges_submit(
+        delivery->fitsbin,
+        delivery->io_ranges,
+        delivery->io_count,
+        delivery->io_bytes,
+        FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
+        &delivery->ticket);
+    solver_codekd_delivery_unbind(delivery);
+    if (status < 0) {
+        return -1;
+    }
+    if (status > 0 && !delivery->ticket) {
+        delivery->reader->helper_hard_failure = TRUE;
+        errno = EPROTO;
+        return -1;
+    }
+    return status > 0 ? 1 : 0;
+}
+
+static int solver_codekd_delivery_wait(
+    solver_codekd_delivery_t* delivery) {
+    size_t i;
+    int status;
+
+    if (!delivery || delivery->completed) {
+        return delivery ? 1 : 0;
+    }
+    if (!delivery->ticket) {
+        return 0;
+    }
+    status = fitsbin_payload_io_ticket_wait(
+        delivery->fitsbin, delivery->ticket);
+    fitsbin_payload_io_ticket_destroy(delivery->ticket);
+    delivery->ticket = NULL;
+    if (status <= 0) {
+        return 0;
+    }
+    if (!delivery->segment || !delivery->segment->page_size) {
+        errno = EPROTO;
+        return -1;
+    }
+    for (i = 0U; i < delivery->item_count; i++) {
+        solver_codekd_delivery_item_t* item =
+            &delivery->items[i];
+
+        if (item->owns_loading &&
+            (!item->entry ||
+             item->entry->state != SOLVER_CODEKD_CACHE_LOADING ||
+             !item->entry->plan_hold_count)) {
+            errno = EPROTO;
+            return -1;
+        }
+    }
+    for (i = 0U; i < delivery->item_count; i++) {
+        solver_codekd_delivery_item_t* item =
+            &delivery->items[i];
+
+        if (!item->owns_loading) {
+            continue;
+        }
+        solver_codekd_cache_publish(
+            delivery->reader,
+            item->entry,
+            delivery->segment,
+            item->data_file_offset,
+            item->data_size,
+            item->perm_file_offset,
+            item->perm_size);
+        if (delivery->reader->helper_hard_failure) {
+            errno = EPROTO;
+            return -1;
+        }
+    }
+    delivery->completed = TRUE;
+    return 1;
+}
+
+static int solver_codekd_delivery_release(
+    solver_codekd_delivery_t* delivery) {
+    size_t i;
+    int failed;
+
+    if (!delivery) {
+        return 0;
+    }
+    if (!delivery->completed) {
+        return solver_codekd_delivery_discard(delivery);
+    }
+    for (i = delivery->item_count; i > 0U; i--) {
+        solver_codekd_release_entry_hold(
+            delivery->reader,
+            delivery->items[i - 1U].entry);
+    }
+    failed = delivery->reader &&
+        delivery->reader->helper_hard_failure;
+    free(delivery);
+    return failed ? -1 : 0;
+}
+
 static kdtree_qres_t* solver_codekd_rangesearch(
     const kdtree_t* tree,
     kdtree_qres_t* result,
@@ -1622,6 +2215,16 @@ static kdtree_qres_t* solver_codekd_rangesearch(
             maxd2,
             options);
     }
+    if (tree->io && tree->io_is_fitsbin &&
+        fitsbin_payload_is_fully_resident(
+            (const fitsbin_t*)tree->io)) {
+        return kdtree_rangesearch_options_reuse(
+            tree,
+            result,
+            query,
+            maxd2,
+            options);
+    }
     if (!solver_codekd_direct_capable(tree)) {
         return kdtree_rangesearch_options_reuse(
             tree,
@@ -1639,7 +2242,11 @@ static kdtree_qres_t* solver_codekd_rangesearch(
             maxd2,
             options);
     }
-    reader->helper_hard_failure = FALSE;
+    if (reader->helper_hard_failure) {
+        logerr("[solver-codekd-io] persistent cache failure\n");
+        errno = EPROTO;
+        return NULL;
+    }
     if (solver_codekd_reader_bind(
             reader,
             tree,
@@ -6222,6 +6829,7 @@ typedef struct solver_payload_page_plan {
     size_t range_capacity;
     size_t logical_bytes;
     anbool failed;
+    anbool async_delivery;
     fitsbin_prefetch_range_t
         inline_ranges[SOLVER_PAYLOAD_PAGE_PLAN_INLINE_RANGES];
 } solver_payload_page_plan_t;
@@ -6248,6 +6856,14 @@ static void solver_payload_page_plan_destroy(
     memset(plan, 0, sizeof(*plan));
 }
 
+static void solver_payload_page_plan_init_async(
+    solver_payload_page_plan_t* plan) {
+    solver_payload_page_plan_init(plan);
+    if (plan) {
+        plan->async_delivery = TRUE;
+    }
+}
+
 static void solver_payload_page_plan_fail(
     solver_payload_page_plan_t* plan) {
     if (!plan || plan->failed) {
@@ -6262,7 +6878,8 @@ static int solver_payload_page_plan_enabled(
     solver_payload_page_plan_t* plan = userdata;
 
     if (!plan || !mapping || plan->failed ||
-        fitsbin_payload_io_demand_busy()) {
+        (!plan->async_delivery &&
+         fitsbin_payload_io_demand_busy())) {
         return FALSE;
     }
     if (plan->fitsbin && plan->fitsbin != mapping) {
@@ -6333,6 +6950,10 @@ static int solver_payload_page_plan_emit(
     if (!plan->fitsbin) {
         plan->fitsbin = hint->mapping;
     }
+    if (plan->async_delivery &&
+        plan->range_count >= SOLVER_PAYLOAD_PAGE_PLAN_MAX_RANGES) {
+        return 0;
+    }
     if (plan->range_count == SIZE_MAX ||
         solver_payload_page_plan_reserve(
             plan, plan->range_count + 1U)) {
@@ -6393,7 +7014,12 @@ static int solver_payload_page_plan_add_query(
         !tree->io || !tree->io_is_fitsbin) {
         return 0;
     }
-    if (fitsbin_payload_io_demand_busy()) {
+    if (fitsbin_payload_is_fully_resident(
+            (const fitsbin_t*)tree->io)) {
+        return 0;
+    }
+    if (!plan->async_delivery &&
+        fitsbin_payload_io_demand_busy()) {
         if (!plan->fitsbin) {
             plan->fitsbin = tree->io;
         }
@@ -6448,28 +7074,135 @@ static int solver_payload_page_plan_flush(
     return status;
 }
 
-static void solver_payload_advise_verification_search(
-    solver_t* solver,
-    const MatchObj* mo) {
-    solver_payload_page_plan_t page_plan;
-    int options =
-        KD_OPTIONS_SMALL_RADIUS |
-        KD_OPTIONS_RETURN_POINTS;
+static int solver_payload_page_plan_deliver(
+    solver_payload_page_plan_t* plan) {
+    fitsbin_payload_io_ticket_t* ticket = NULL;
+    size_t budget;
+    int status;
 
-    if (!solver || !mo || !solver->index ||
-        !solver->index->starkd ||
-        !solver->index->starkd->tree) {
-        return;
+    if (!plan) {
+        return -1;
     }
-    solver_payload_page_plan_init(&page_plan);
-    (void)solver_payload_page_plan_add_query(
-        &page_plan,
-        solver->index->starkd->tree,
-        mo->center,
-        square(mo->radius),
-        options);
-    (void)solver_payload_page_plan_flush(&page_plan);
-    solver_payload_page_plan_destroy(&page_plan);
+    if (plan->failed || !plan->fitsbin || !plan->range_count) {
+        return solver_payload_page_plan_flush(plan);
+    }
+    budget = solver_payload_page_plan_budget(plan);
+    if (!budget) {
+        return solver_payload_page_plan_flush(plan);
+    }
+    status = fitsbin_prefetch_ranges_submit(
+        plan->fitsbin,
+        plan->ranges,
+        plan->range_count,
+        budget,
+        &ticket);
+    if (status > 0 && ticket) {
+        errno = 0;
+        status = fitsbin_payload_io_ticket_wait(
+            plan->fitsbin, ticket);
+        {
+            int saved_errno = errno;
+
+            fitsbin_payload_io_ticket_destroy(ticket);
+            if (status > 0) {
+                return status;
+            }
+            if (!status && saved_errno == ECANCELED) {
+                return 0;
+            }
+        }
+    }
+    return solver_payload_page_plan_flush(plan);
+}
+
+#define SOLVER_PAYLOAD_CANDIDATE_BATCH 32U
+
+static int solver_payload_wait_advisory_ticket(
+    fitsbin_t* fitsbin,
+    fitsbin_payload_io_ticket_t** ticket) {
+    fitsbin_payload_io_ticket_t* pending;
+    int status;
+
+    if (!ticket || !*ticket) {
+        return 0;
+    }
+    pending = *ticket;
+    *ticket = NULL;
+    status = fitsbin_payload_io_ticket_wait(fitsbin, pending);
+    fitsbin_payload_io_ticket_destroy(pending);
+    return status;
+}
+
+static size_t solver_payload_prepare_candidate_rows(
+    const kdtree_qres_t* result,
+    size_t first,
+    int dimquads,
+    solver_t* solver) {
+    fitsbin_payload_io_ticket_t* ticket = NULL;
+    unsigned int quadids[SOLVER_PAYLOAD_CANDIDATE_BATCH];
+    unsigned int starids[
+        SOLVER_PAYLOAD_CANDIDATE_BATCH * DQMAX];
+    unsigned int stars[DQMAX];
+    quadfile_t* quads;
+    startree_t* starkd;
+    size_t count;
+    size_t star_count = 0U;
+    size_t i;
+    int status;
+
+    if (!result || !solver || !solver->index ||
+        !solver->index->quads || !solver->index->starkd ||
+        first >= (size_t)result->nres || dimquads <= 0 ||
+        dimquads > DQMAX) {
+        return 0U;
+    }
+    quads = solver->index->quads;
+    starkd = solver->index->starkd;
+    count = MIN(
+        (size_t)result->nres - first,
+        (size_t)SOLVER_PAYLOAD_CANDIDATE_BATCH);
+    if (count < (size_t)SOLVER_PAYLOAD_CANDIDATE_BATCH) {
+        return 0U;
+    }
+    for (i = 0U; i < count; i++) {
+        int quadid = result->inds[first + i];
+
+        if (quadid < 0 || (unsigned int)quadid >= quads->numquads) {
+            return 0U;
+        }
+        quadids[i] = (unsigned int)quadid;
+    }
+    status = quadfile_prefetch_stars_submit(
+        quads, quadids, (int)count, &ticket);
+    if (status <= 0 || !ticket ||
+        solver_payload_wait_advisory_ticket(
+            quads->fb, &ticket) <= 0 ||
+        solver_poll_worker_stop(solver)) {
+        return 0U;
+    }
+
+    for (i = 0U; i < count; i++) {
+        int star_index;
+
+        if (quadfile_get_stars(quads, quadids[i], stars)) {
+            return 0U;
+        }
+        for (star_index = 0;
+             star_index < dimquads;
+             star_index++) {
+            starids[star_count++] = stars[star_index];
+        }
+    }
+    ticket = NULL;
+    status = startree_prefetch_stars_submit(
+        starkd, starids, (int)star_count, &ticket);
+    if (status > 0 && ticket) {
+        if (solver_payload_wait_advisory_ticket(
+                starkd->tree->io, &ticket) > 0) {
+            return count;
+        }
+    }
+    return 0U;
 }
 
 typedef struct solver_verification_score_slot {
@@ -6589,7 +7322,8 @@ static int solver_ab_try_verification_wave(
     int dimquads,
     int quads_tried,
     solver_t* solver,
-    anbool current_parity) {
+    anbool current_parity,
+    size_t* payload_prepared) {
     solver_ab_packet_t packet;
     solver_ab_snapshot_t snapshot;
     solver_verification_candidate_runtime_t* runtime = NULL;
@@ -6613,6 +7347,9 @@ static int solver_ab_try_verification_wave(
     int candidate_index;
     int handled = 0;
 
+    if (payload_prepared) {
+        *payload_prepared = 0U;
+    }
     if (!result || !field_xy || !fieldstars || !solver ||
         result->nres < 2 ||
         result->nres > (int)INDEX_SHARD_HELPER_MAX_TASKS ||
@@ -6622,6 +7359,7 @@ static int solver_ab_try_verification_wave(
     }
     available = index_shard_helper_prepare_reserve();
     if (!available) {
+        index_shard_helper_prepare_cancel();
         return 0;
     }
 
@@ -6630,7 +7368,7 @@ static int solver_ab_try_verification_wave(
     memset(tasks, 0, sizeof(tasks));
     memset(inputs, 0, sizeof(inputs));
     memset(&run_stats, 0, sizeof(run_stats));
-    solver_payload_page_plan_init(&page_plan);
+    solver_payload_page_plan_init_async(&page_plan);
 
     if (solver_ab_packet_reserve_candidates(
             &packet, (size_t)result->nres) !=
@@ -6674,6 +7412,19 @@ static int solver_ab_try_verification_wave(
          candidate_index++) {
         solver_ab_candidate_t* candidate =
             &packet.candidates[candidate_index];
+
+        if (!(candidate_index %
+              (int)SOLVER_PAYLOAD_CANDIDATE_BATCH)) {
+            size_t prepared = solver_payload_prepare_candidate_rows(
+                result,
+                (size_t)candidate_index,
+                dimquads,
+                solver);
+            if (prepared && payload_prepared) {
+                *payload_prepared =
+                    (size_t)candidate_index + prepared;
+            }
+        }
         if (solver_ab_candidate_prepare(
                 candidate,
                 result,
@@ -6694,7 +7445,6 @@ static int solver_ab_try_verification_wave(
     if (verify_count < 2U) {
         goto cleanup;
     }
-
     verify_wall_start = monotonic_seconds();
     for (candidate_index = 0;
          candidate_index < result->nres;
@@ -6754,11 +7504,10 @@ static int solver_ab_try_verification_wave(
             break;
         }
     }
-    (void)solver_payload_page_plan_flush(&page_plan);
+    (void)solver_payload_page_plan_deliver(&page_plan);
     if (slot_cursor != verify_count) {
         goto cleanup;
     }
-
     peak_budget = solver_verification_wave_memory_budget();
     slot_cursor = 0U;
     for (candidate_index = 0;
@@ -6858,11 +7607,35 @@ static int solver_ab_try_verification_wave(
         goto cleanup;
     }
 
-    run_status = index_shard_helper_run(
-        &solver_verification_helper_ops,
-        tasks,
-        task_count,
-        &run_stats);
+    if (task_count == 1U) {
+        index_shard_helper_task_status_t task_status;
+
+        index_shard_helper_prepare_cancel();
+        task_status = solver_verification_helper_execute(
+            tasks[0].input,
+            tasks[0].input_bytes,
+            tasks[0].output,
+            tasks[0].output_bytes);
+        if (task_status == INDEX_SHARD_HELPER_TASK_STOPPED) {
+            (void)solver_poll_worker_stop(solver);
+            solver->quit_now = TRUE;
+            handled = 1;
+            goto cleanup;
+        }
+        if (task_status != INDEX_SHARD_HELPER_TASK_OK) {
+            goto cleanup;
+        }
+        run_status = INDEX_SHARD_HELPER_OK;
+        run_stats.owner_tasks = 1U;
+        run_stats.owner_work_units = tasks[0].work_units;
+        run_stats.max_concurrent_tasks = 1U;
+    } else {
+        run_status = index_shard_helper_run(
+            &solver_verification_helper_ops,
+            tasks,
+            task_count,
+            &run_stats);
+    }
     if (run_status == INDEX_SHARD_HELPER_UNAVAILABLE ||
         run_status == INDEX_SHARD_HELPER_TASK_FAILED) {
         goto cleanup;
@@ -7016,6 +7789,9 @@ static int solver_ab_try_verification_wave(
     handled = 1;
 
 cleanup:
+    if (!handled && payload_prepared) {
+        *payload_prepared = 0U;
+    }
     index_shard_helper_prepare_cancel();
     solver_payload_page_plan_destroy(&page_plan);
     solver_verification_wave_cleanup(
@@ -7252,16 +8028,242 @@ static size_t solver_ab_descriptor_expansion(
     return expansion;
 }
 
-static int solver_ab_descriptor_reduce_output(
+#define SOLVER_AB_IO_BATCH_DESCRIPTORS \
+    (SOLVER_PAYLOAD_PAGE_PLAN_INLINE_RANGES / 2U)
+#define SOLVER_AB_IO_BATCH_SLOTS 2U
+#define SOLVER_AB_IO_PROBE_DESCRIPTORS \
+    MAX(1U, SOLVER_AB_IO_BATCH_DESCRIPTORS / \
+        (SOLVER_AB_IO_BATCH_SLOTS * 4U))
+
+typedef enum solver_ab_io_batch_state {
+    SOLVER_AB_IO_BATCH_EMPTY = 0,
+    SOLVER_AB_IO_BATCH_PLANNED,
+    SOLVER_AB_IO_BATCH_SUBMITTED,
+    SOLVER_AB_IO_BATCH_READY,
+    SOLVER_AB_IO_BATCH_EXECUTING,
+    SOLVER_AB_IO_BATCH_RETIRED,
+    SOLVER_AB_IO_BATCH_CANCELLED
+} solver_ab_io_batch_state_t;
+
+typedef struct solver_ab_io_batch {
+    solver_codekd_delivery_t* delivery;
+    size_t first;
+    size_t count;
+    size_t io_count;
+    unsigned long long sequence;
+    anbool plan_probed;
+    anbool io_submitted;
+    anbool io_ready;
+    solver_ab_io_batch_state_t state;
+} solver_ab_io_batch_t;
+
+static anbool solver_ab_io_submit_invariant(int error) {
+    return error == EPROTO;
+}
+
+static void solver_ab_io_batch_prepare_ready(
+    const solver_ab_descriptor_output_t* output,
+    size_t first,
+    unsigned long long sequence,
+    solver_ab_io_batch_t* batch) {
+    memset(batch, 0, sizeof(*batch));
+    batch->first = first;
+    batch->sequence = sequence;
+    if (!output || first >= output->descriptor_count) {
+        batch->state = SOLVER_AB_IO_BATCH_EMPTY;
+        return;
+    }
+    batch->count = output->descriptor_count - first;
+    batch->state = SOLVER_AB_IO_BATCH_READY;
+}
+
+static int solver_ab_io_batch_prepare(
     solver_t* solver,
     const solver_ab_descriptor_output_t* output,
+    size_t first,
+    size_t descriptor_limit,
+    unsigned long long sequence,
+    solver_ab_io_batch_t* batch) {
+    const kdtree_t* tree;
+    size_t target_count;
+    size_t planned_count = 0U;
+    size_t end;
+    size_t descriptor_index;
+    int options =
+        KD_OPTIONS_SMALL_RADIUS |
+        KD_OPTIONS_COMPUTE_DISTS |
+        KD_OPTIONS_NO_RESIZE_RESULTS |
+        KD_OPTIONS_USE_SPLIT;
+    int submitted;
+
+    memset(batch, 0, sizeof(*batch));
+    batch->state = SOLVER_AB_IO_BATCH_PLANNED;
+    batch->first = first;
+    batch->sequence = sequence;
+    if (!output || first >= output->descriptor_count) {
+        batch->state = SOLVER_AB_IO_BATCH_EMPTY;
+        return 0;
+    }
+    batch->count = MIN(
+        MAX((size_t)1U, descriptor_limit),
+        output->descriptor_count - first);
+    target_count = batch->count;
+    if (!solver || !solver->index || !solver->index->codekd ||
+        !solver->index->codekd->tree) {
+        batch->plan_probed = TRUE;
+        batch->state = SOLVER_AB_IO_BATCH_READY;
+        return 0;
+    }
+    tree = solver->index->codekd->tree;
+    errno = 0;
+    batch->delivery = solver_codekd_delivery_begin(tree);
+    if (!batch->delivery) {
+        batch->plan_probed = TRUE;
+        batch->state = SOLVER_AB_IO_BATCH_READY;
+        return errno == EPROTO ? -1 : 0;
+    }
+    end = first + target_count;
+
+    for (descriptor_index = first;
+         descriptor_index < end;
+         descriptor_index++) {
+        const solver_ab_descriptor_t* descriptor =
+            &output->descriptors[descriptor_index];
+
+        if (solver_codekd_delivery_add_query(
+                batch->delivery,
+                descriptor->code,
+                descriptor->tol2,
+                options)) {
+            if (batch->delivery->reader->helper_hard_failure) {
+                (void)solver_codekd_delivery_discard(
+                    batch->delivery);
+                batch->delivery = NULL;
+                return -1;
+            }
+            break;
+        }
+        planned_count++;
+        if (batch->delivery->io_bytes >=
+            SOLVER_CODEKD_RANGE_CACHE_BYTES / 2U) {
+            break;
+        }
+    }
+    batch->plan_probed = TRUE;
+    if (!planned_count) {
+        int discard_status =
+            solver_codekd_delivery_discard(batch->delivery);
+
+        batch->delivery = NULL;
+        batch->count = 1U;
+        batch->state = SOLVER_AB_IO_BATCH_READY;
+        return discard_status ? -1 : 0;
+    }
+    batch->count = planned_count;
+    batch->io_count = batch->delivery->io_count;
+    submitted =
+        solver_codekd_delivery_submit(batch->delivery);
+    if (submitted < 0) {
+        int saved_errno = errno;
+        anbool invariant =
+            solver_ab_io_submit_invariant(saved_errno);
+        int discard_status;
+
+        if (invariant) {
+            batch->delivery->reader->helper_hard_failure = TRUE;
+        }
+        discard_status =
+            solver_codekd_delivery_discard(batch->delivery);
+        batch->delivery = NULL;
+        batch->state = SOLVER_AB_IO_BATCH_READY;
+        errno = saved_errno;
+        return invariant || discard_status ? -1 : 0;
+    }
+    if (submitted > 0 && !batch->delivery->completed) {
+        batch->io_submitted = TRUE;
+        batch->state = SOLVER_AB_IO_BATCH_SUBMITTED;
+    } else if (submitted > 0) {
+        batch->state = SOLVER_AB_IO_BATCH_READY;
+    } else {
+        int discard_status =
+            solver_codekd_delivery_discard(batch->delivery);
+
+        batch->delivery = NULL;
+        batch->state = SOLVER_AB_IO_BATCH_READY;
+        if (discard_status) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int solver_ab_io_batch_wait(
+    solver_ab_io_batch_t* batch) {
+    int wait_status;
+
+    if (!batch ||
+        batch->state != SOLVER_AB_IO_BATCH_SUBMITTED ||
+        !batch->delivery) {
+        return 0;
+    }
+    wait_status = solver_codekd_delivery_wait(batch->delivery);
+    if (wait_status <= 0) {
+        int release_status =
+            solver_codekd_delivery_release(batch->delivery);
+
+        batch->delivery = NULL;
+        batch->state = SOLVER_AB_IO_BATCH_READY;
+        return wait_status < 0 || release_status ? -1 : 0;
+    }
+    batch->io_ready = TRUE;
+    batch->state = SOLVER_AB_IO_BATCH_READY;
+    return 0;
+}
+
+static int solver_ab_io_batch_retire(
+    solver_ab_io_batch_t* batch) {
+    int status;
+
+    if (!batch) {
+        return 0;
+    }
+    status = solver_codekd_delivery_release(batch->delivery);
+    batch->delivery = NULL;
+    batch->state = SOLVER_AB_IO_BATCH_RETIRED;
+    return status;
+}
+
+static int solver_ab_io_batch_cancel(
+    solver_ab_io_batch_t* batch) {
+    int status;
+
+    if (!batch) {
+        return 0;
+    }
+    status = solver_codekd_delivery_release(batch->delivery);
+    batch->delivery = NULL;
+    batch->state = SOLVER_AB_IO_BATCH_CANCELLED;
+    return status;
+}
+
+static int solver_ab_descriptor_reduce_range(
+    solver_t* solver,
+    const solver_ab_descriptor_output_t* output,
+    size_t first,
+    size_t count,
     int dimquads,
     kdtree_qres_t** query_result,
     unsigned long long* reduced) {
+    size_t end;
     size_t descriptor_index;
 
-    for (descriptor_index = 0U;
-         descriptor_index < output->descriptor_count;
+    if (!solver || !output || first > output->descriptor_count ||
+        count > output->descriptor_count - first) {
+        return -1;
+    }
+    end = first + count;
+    for (descriptor_index = first;
+         descriptor_index < end;
          descriptor_index++) {
         const solver_ab_descriptor_t* descriptor =
             &output->descriptors[descriptor_index];
@@ -7293,6 +8295,117 @@ static int solver_ab_descriptor_reduce_output(
         if (solver->quit_now) {
             return 1;
         }
+    }
+    return 0;
+}
+
+static int solver_ab_descriptor_reduce_output(
+    solver_t* solver,
+    const solver_ab_descriptor_output_t* output,
+    int dimquads,
+    kdtree_qres_t** query_result,
+    unsigned long long* reduced) {
+    solver_ab_io_batch_t batches[SOLVER_AB_IO_BATCH_SLOTS];
+    size_t next = 0U;
+    size_t current = 0U;
+    size_t planning_limit =
+        SOLVER_AB_IO_PROBE_DESCRIPTORS;
+    size_t slot;
+    unsigned long long sequence = 0ULL;
+    anbool planning_enabled = TRUE;
+    int status = 0;
+
+    memset(batches, 0, sizeof(batches));
+    if (next < output->descriptor_count) {
+        if (solver_ab_io_batch_prepare(
+                solver,
+                output,
+                next,
+                planning_limit,
+                sequence++,
+                &batches[0])) {
+            status = -1;
+            goto cleanup;
+        }
+        next += batches[0].count;
+    }
+
+    while (batches[current].state != SOLVER_AB_IO_BATCH_EMPTY) {
+        solver_ab_io_batch_t* batch = &batches[current];
+        size_t next_slot =
+            (current + 1U) % SOLVER_AB_IO_BATCH_SLOTS;
+
+        status = solver_ab_io_batch_wait(batch);
+        if (batch->state != SOLVER_AB_IO_BATCH_READY) {
+            status = -1;
+            break;
+        }
+        if (status) {
+            break;
+        }
+        if (batch->plan_probed) {
+            if (batch->io_count && batch->io_submitted &&
+                batch->io_ready) {
+                planning_limit = MIN(
+                    (size_t)SOLVER_AB_IO_BATCH_DESCRIPTORS,
+                    MAX(
+                        (size_t)SOLVER_AB_IO_PROBE_DESCRIPTORS,
+                        batch->count * 2U));
+            } else {
+                planning_enabled = FALSE;
+            }
+        }
+        if (next < output->descriptor_count) {
+            if (planning_enabled) {
+                if (solver_ab_io_batch_prepare(
+                        solver,
+                        output,
+                        next,
+                        planning_limit,
+                        sequence++,
+                        &batches[next_slot])) {
+                    (void)solver_ab_io_batch_retire(batch);
+                    status = -1;
+                    break;
+                }
+            } else {
+                solver_ab_io_batch_prepare_ready(
+                    output,
+                    next,
+                    sequence++,
+                    &batches[next_slot]);
+            }
+            next += batches[next_slot].count;
+        } else {
+            memset(&batches[next_slot], 0,
+                   sizeof(batches[next_slot]));
+        }
+        batch->state = SOLVER_AB_IO_BATCH_EXECUTING;
+        status = solver_ab_descriptor_reduce_range(
+            solver,
+            output,
+            batch->first,
+            batch->count,
+            dimquads,
+            query_result,
+            reduced);
+        if (solver_ab_io_batch_retire(batch)) {
+            status = -1;
+        }
+        if (status) {
+            break;
+        }
+        current = next_slot;
+    }
+
+ cleanup:
+    for (slot = 0U; slot < SOLVER_AB_IO_BATCH_SLOTS; slot++) {
+        if (solver_ab_io_batch_cancel(&batches[slot]) && !status) {
+            status = -1;
+        }
+    }
+    if (status) {
+        return status;
     }
     if (output->has_final_rel_field_noise2) {
         solver->rel_field_noise2 =
@@ -7336,7 +8449,6 @@ static int solver_ab_descriptor_execute_phase(
     size_t expansion;
     size_t max_task_combinations;
     anbool assisted = FALSE;
-    anbool handled = FALSE;
     int result = 0;
 
     if (mode_out) {
@@ -7350,15 +8462,9 @@ static int solver_ab_descriptor_execute_phase(
         return 0;
     }
     available = index_shard_helper_available_workers();
-    if (!available) {
-        return 0;
-    }
     participants = MIN(
         SOLVER_AB_DESCRIPTOR_MAX_TASKS,
         available + 1U);
-    if (participants < 2U) {
-        return 0;
-    }
     expansion = solver_ab_descriptor_expansion(
         dimquads,
         solver->parity);
@@ -7399,7 +8505,7 @@ static int solver_ab_descriptor_execute_phase(
     if (!pair_count || !total_combinations ||
         total_combinations == ULLONG_MAX ||
         total_combinations <
-            2U * SOLVER_AB_DESCRIPTOR_MIN_COMBINATIONS) {
+            SOLVER_AB_DESCRIPTOR_MIN_COMBINATIONS) {
         solver_ab_descriptor_release_pairs(workspace);
         return 0;
     }
@@ -7435,10 +8541,6 @@ static int solver_ab_descriptor_execute_phase(
             wave_combinations >=
                 2U * SOLVER_AB_DESCRIPTOR_MIN_COMBINATIONS) {
             task_count = 2U;
-        }
-        if (task_count < 2U && !handled) {
-            result = 0;
-            goto cleanup;
         }
         if (!task_count) {
             result = -1;
@@ -7496,17 +8598,13 @@ static int solver_ab_descriptor_execute_phase(
             goto fail;
         }
 
-        if (task_count > 1U) {
+        if (task_count > 1U && available) {
             run_status = index_shard_helper_run(
                 &solver_ab_descriptor_helper_ops,
                 tasks,
                 task_count,
                 &run_stats);
             if (run_status == INDEX_SHARD_HELPER_UNAVAILABLE) {
-                if (!handled) {
-                    result = 0;
-                    goto cleanup;
-                }
                 run_inline = TRUE;
             } else if (run_status == INDEX_SHARD_HELPER_STOPPED) {
                 (void)solver_poll_worker_stop(solver);
@@ -7610,7 +8708,6 @@ static int solver_ab_descriptor_execute_phase(
                     reduced - reduced_before);
         }
         solver->profile.hypothesis_batches_completed++;
-        handled = TRUE;
         combination_cursor += wave_combinations;
     }
 
@@ -10768,6 +11865,7 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
     //    [x_A,y_A, x_B,y_B, x_C,y_C, ...]
     int jj, thisquadno;
     MatchObj mo;
+    size_t payload_prepared = 0U;
 
     assert(krez);
     assert(dimquads > 0);
@@ -10799,7 +11897,8 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
             dimquads,
             quads_tried,
             solver,
-            current_parity)) {
+            current_parity,
+            &payload_prepared)) {
         return;
     }
 
@@ -10815,6 +11914,15 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
 
         if (solver_poll_worker_stop(solver)) {
             return;
+        }
+
+        if ((size_t)jj >= payload_prepared &&
+            !((size_t)jj % SOLVER_PAYLOAD_CANDIDATE_BATCH)) {
+            solver_payload_prepare_candidate_rows(
+                krez,
+                (size_t)jj,
+                dimquads,
+                solver);
         }
 
         solver->nummatches++;
@@ -11024,7 +12132,6 @@ static int solver_handle_hit(solver_t* sp, MatchObj* mo, sip_t* verifysip,
         verify_wall_start = monotonic_seconds();
     }
 
-    solver_payload_advise_verification_search(sp, mo);
     verify_hit(sp->index->starkd, sp->index->cutnside,
                mo, verifysip, sp->vf, match_distance_in_pixels2,
                sp->distractor_ratio, sp->field_maxx, sp->field_maxy,
@@ -11087,7 +12194,6 @@ static int solver_handle_hit_after_verify(
                 verify_wall_start = monotonic_seconds();
             }
 
-            solver_payload_advise_verification_search(sp, mo);
             verify_hit(sp->index->starkd, sp->index->cutnside,
                        mo, mo->sip, sp->vf, match_distance_in_pixels2,
                        sp->distractor_ratio,

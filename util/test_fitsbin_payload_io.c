@@ -720,3 +720,199 @@ void test_fitsbin_payload_shared_reader_credit(CuTest* ct) {
     fitsbin_payload_io_configure_workers(1);
     payload_fixture_close(&fixture);
 }
+
+void test_fitsbin_payload_async_loader_overlap(CuTest* ct) {
+    payload_fixture_t fixture;
+    fitsbin_prefetch_range_t range;
+    fitsbin_payload_io_ticket_t* first = NULL;
+    fitsbin_payload_io_ticket_t* second = NULL;
+    fitsbin_payload_io_stats_t stats;
+    int first_submit;
+    int second_submit;
+    int wait_status;
+    int active;
+    int max_active;
+    int first_wait = -1;
+    int second_wait = -1;
+
+    CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
+    range.data = fixture.chunk->data;
+    range.size = sizeof(fixture.bytes);
+    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
+    fitsbin_payload_io_configure_workers(2);
+    CuAssertIntEquals(
+        ct, 0, fitsbin_payload_io_service_start(2));
+
+    payload_wrapper_reset(PAYLOAD_WRAPPER_BLOCK);
+    first_submit = fitsbin_prefetch_ranges_submit(
+        fixture.fitsbin,
+        &range,
+        1U,
+        SIZE_MAX,
+        &first);
+    second_submit = fitsbin_prefetch_ranges_submit(
+        fixture.fitsbin,
+        &range,
+        1U,
+        SIZE_MAX,
+        &second);
+    wait_status = payload_wrapper_wait_for_calls(2, 3);
+    pthread_mutex_lock(&payload_wrapper.mutex);
+    active = payload_wrapper.active;
+    max_active = payload_wrapper.max_active;
+    pthread_mutex_unlock(&payload_wrapper.mutex);
+    payload_wrapper_release();
+
+    if (first) {
+        first_wait = fitsbin_payload_io_ticket_wait(
+            fixture.fitsbin, first);
+        fitsbin_payload_io_ticket_destroy(first);
+    }
+    if (second) {
+        second_wait = fitsbin_payload_io_ticket_wait(
+            fixture.fitsbin, second);
+        fitsbin_payload_io_ticket_destroy(second);
+    }
+    fitsbin_payload_io_service_stop();
+    fitsbin_payload_io_configure_workers(1);
+    payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
+    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
+
+    CuAssertIntEquals(ct, 1, first_submit);
+    CuAssertIntEquals(ct, 1, second_submit);
+    CuAssertIntEquals(ct, 0, wait_status);
+    CuAssertIntEquals(ct, 2, active);
+    CuAssertIntEquals(ct, 2, max_active);
+    CuAssert(ct, "first async preparation failed", first_wait > 0);
+    CuAssert(ct, "second async preparation failed", second_wait > 0);
+    CuAssertIntEquals(ct, 2, (int)stats.warm_calls);
+    CuAssertIntEquals(ct, 0, (int)stats.failures);
+
+    payload_fixture_close(&fixture);
+}
+
+void test_fitsbin_payload_async_direct_destination(CuTest* ct) {
+    payload_fixture_t fixture;
+    fitsbin_pread_range_t ranges[2];
+    fitsbin_prefetch_range_t warm;
+    fitsbin_payload_io_ticket_t* ticket = NULL;
+    fitsbin_payload_io_stats_t stats;
+    unsigned char first[11];
+    unsigned char second[17];
+    unsigned char untouched_first[sizeof(first)];
+    unsigned char untouched_second[sizeof(second)];
+    int refused;
+    int refused_errno;
+    int submitted;
+    int configured;
+    int async_warm;
+    int sync_warm;
+    int waited = -1;
+
+    CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
+    fitsbin_payload_set_thread_full_resident();
+    configured = fitsbin_configure_index_mmap(fixture.fitsbin);
+    fitsbin_payload_clear_thread_full_resident();
+    CuAssertIntEquals(ct, 0, configured);
+    CuAssert(
+        ct,
+        "full-resident source marker was not captured",
+        fitsbin_payload_is_fully_resident(fixture.fitsbin));
+    memset(first, 0xa5, sizeof(first));
+    memset(second, 0xa5, sizeof(second));
+    memcpy(untouched_first, first, sizeof(first));
+    memcpy(untouched_second, second, sizeof(second));
+    ranges[0].data =
+        (const unsigned char*)fixture.chunk->data + 3U;
+    ranges[0].size = sizeof(first);
+    ranges[0].logical_size = 7U;
+    ranges[0].destination = first;
+    ranges[1].data =
+        (const unsigned char*)fixture.chunk->data + 31U;
+    ranges[1].size = sizeof(second);
+    ranges[1].logical_size = 13U;
+    ranges[1].destination = second;
+
+    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
+    fitsbin_payload_io_configure_workers(2);
+    CuAssertIntEquals(
+        ct, 0, fitsbin_payload_io_service_start(1));
+    payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
+
+    errno = 0;
+    refused = fitsbin_pread_mapped_ranges_submit(
+        fixture.fitsbin,
+        ranges,
+        2U,
+        sizeof(first) + sizeof(second) - 1U,
+        FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
+        &ticket);
+    refused_errno = errno;
+    CuAssertIntEquals(ct, -1, refused);
+    CuAssertIntEquals(ct, E2BIG, refused_errno);
+    CuAssertPtrEquals(ct, NULL, ticket);
+    CuAssert(
+        ct,
+        "over-budget direct preparation wrote first destination",
+        !memcmp(first, untouched_first, sizeof(first)));
+    CuAssert(
+        ct,
+        "over-budget direct preparation wrote second destination",
+        !memcmp(second, untouched_second, sizeof(second)));
+
+    submitted = fitsbin_pread_mapped_ranges_submit(
+        fixture.fitsbin,
+        ranges,
+        2U,
+        SIZE_MAX,
+        FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
+        &ticket);
+    if (ticket) {
+        waited = fitsbin_payload_io_ticket_wait(
+            fixture.fitsbin, ticket);
+        fitsbin_payload_io_ticket_destroy(ticket);
+        ticket = NULL;
+    }
+    warm.data = fixture.chunk->data;
+    warm.size = sizeof(fixture.bytes);
+    async_warm = fitsbin_prefetch_ranges_submit(
+        fixture.fitsbin,
+        &warm,
+        1U,
+        SIZE_MAX,
+        &ticket);
+    sync_warm = fitsbin_prefetch_ranges(
+        fixture.fitsbin,
+        &warm,
+        1U,
+        SIZE_MAX);
+    fitsbin_payload_io_service_stop();
+    fitsbin_payload_io_configure_workers(1);
+    payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
+    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
+
+    CuAssertIntEquals(ct, 1, submitted);
+    CuAssertIntEquals(ct, 2, waited);
+    CuAssertIntEquals(ct, 0, async_warm);
+    CuAssertIntEquals(ct, 0, sync_warm);
+    CuAssertPtrEquals(ct, NULL, ticket);
+    CuAssert(
+        ct,
+        "first async direct destination has wrong bytes",
+        !memcmp(first, fixture.bytes + 3U, sizeof(first)));
+    CuAssert(
+        ct,
+        "second async direct destination has wrong bytes",
+        !memcmp(second, fixture.bytes + 31U, sizeof(second)));
+    CuAssertIntEquals(ct, 1, (int)stats.read_batches);
+    CuAssertIntEquals(ct, 2, (int)stats.read_calls);
+    CuAssertIntEquals(
+        ct,
+        (int)(sizeof(first) + sizeof(second)),
+        (int)stats.read_bytes);
+    CuAssertIntEquals(ct, 20, (int)stats.read_logical_bytes);
+    CuAssertIntEquals(ct, 0, (int)stats.warm_calls);
+    CuAssertIntEquals(ct, 0, (int)stats.failures);
+
+    payload_fixture_close(&fixture);
+}
