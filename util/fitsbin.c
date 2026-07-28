@@ -192,10 +192,9 @@ fitsbin_mmap_policy_t fitsbin_mmap_policy_parse(
 
 fitsbin_mmap_policy_t fitsbin_get_configured_mmap_policy(void) {
     /*
-     * Parallel index shards traverse CodeKD, StarKD, and Quad payload
-     * sparsely. Suppress broad kernel read-around for those payloads while
-     * retaining NORMAL topology through per-chunk classification. Serial
-     * callers have no thread-local pass advice and retain NORMAL.
+     * Parallel shards traverse every mapped index component out of order.
+     * W2+ shard and preparation threads install RANDOM for all chunks.
+     * Serial callers have no thread-local advice and retain NORMAL.
      */
     return FITSBIN_MMAP_POLICY_FIXED_RANDOM;
 }
@@ -2324,7 +2323,7 @@ int fitsbin_prefetch_data(fitsbin_t* fb, const void* data, size_t size) {
     return 0;
 }
 
-// Apply component-aware advice after mmap and before the first table access.
+// Apply the file mapping advice before the first table access.
 static void apply_mmap_advice(fitsbin_t* fb, fitsbin_chunk_t* chunk) {
     fitsbin_mmap_advice_t advice;
     const char* filename;
@@ -2349,7 +2348,7 @@ static void apply_mmap_advice(fitsbin_t* fb, fitsbin_chunk_t* chunk) {
     if (advice == FITSBIN_MMAP_ADVICE_RANDOM) {
         if (madvise(chunk->map, chunk->mapsize, MADV_RANDOM) != 0) {
             logmsg("Warning: madvise(MADV_RANDOM) failed for %s table %s "
-                   "region %s: %s; using normal payload advice for this "
+                   "region %s: %s; using normal mmap advice for this "
                    "file.\n",
                    filename,
                    tablename,

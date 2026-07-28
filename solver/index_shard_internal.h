@@ -101,8 +101,8 @@ anbool index_shard_trace_enabled(void);
 /* True only while the calling thread is executing a shard worker task. */
 anbool index_shard_worker_context_active(void);
 
-/* Focused unit seam for the retained-index lease state machine. */
-int onefield_job_index_cache_test_release_state(void);
+/* Focused unit seam for exact prepared-index ownership transfer. */
+int onefield_job_index_cache_test_handoff_state(void);
 
 /*
  * Lock-free cooperative-stop check for hot solver boundaries.

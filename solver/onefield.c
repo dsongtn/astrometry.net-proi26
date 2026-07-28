@@ -75,14 +75,7 @@ typedef struct onefield_job_index_cache_entry {
     index_t* index;
     struct stat identity;
     uint64_t virtual_bytes;
-    anbool leased;
 } onefield_job_index_cache_entry_t;
-
-typedef enum onefield_job_index_release_status {
-    ONEFIELD_JOB_INDEX_RELEASE_ERROR = -1,
-    ONEFIELD_JOB_INDEX_NOT_RETAINED = 0,
-    ONEFIELD_JOB_INDEX_RELEASED = 1
-} onefield_job_index_release_status_t;
 
 struct onefield_job_field_cache {
     anbool valid;
@@ -113,9 +106,9 @@ struct onefield_job_field_cache {
     unsigned long long invalidations;
 
     /*
-     * Job-scoped index epochs. Retained mmaps consume virtual address space
-     * but pin no file-backed pages; the kernel may reclaim clean pages at any
-     * time. Descriptors are closed immediately after a coherent load.
+     * The job owns one optional prepared-index handoff. Demand ownership stays
+     * with its worker and ends as soon as that index task completes.
+     * Descriptors are closed immediately after a coherent prepared load.
      */
     pthread_mutex_t index_mutex;
     anbool index_mutex_ready;
@@ -124,10 +117,10 @@ struct onefield_job_field_cache {
     pthread_t index_prepare_thread;
     anbool index_prepare_thread_ready;
     anbool index_prepare_stop;
-    anbool index_prepare_capacity_exhausted;
     char* index_prepare_active_path;
+    anbool index_prepare_active_stale;
     char* index_prepare_pending_path;
-    pl* index_entries;
+    onefield_job_index_cache_entry_t* index_entry;
     size_t index_entry_budget;
     uint64_t index_virtual_budget;
     uint64_t index_virtual_bytes;
@@ -168,10 +161,6 @@ static index_t* onefield_job_index_cache_get(
 static void onefield_job_index_cache_prepare(
     onefield_t* bp,
     const char* configured_path);
-static onefield_job_index_release_status_t
-onefield_job_index_cache_release(
-    onefield_t* bp,
-    index_t* index);
 // A tag-along column for index rdls / correspondence file.
 struct tagalong {
     tfits_type type;
@@ -303,16 +292,7 @@ static char* get_index_name(onefield_t* bp, size_t i) {
 }
 static int done_with_index(onefield_t* bp, size_t i, index_t* ind) {
     if (i < sl_size(bp->indexnames)) {
-        onefield_job_index_release_status_t status =
-            onefield_job_index_cache_release(
-                bp, ind);
-
-        if (status == ONEFIELD_JOB_INDEX_NOT_RETAINED) {
-            index_free(ind);
-        } else if (
-            status == ONEFIELD_JOB_INDEX_RELEASE_ERROR) {
-            return -1;
-        }
+        index_free(ind);
     }
     return 0;
 }
@@ -345,10 +325,26 @@ void onefield_clear_indexes(onefield_t* bp) {
 static uint64_t onefield_index_cache_budget(void) {
     uint64_t budget = UINT64_MAX;
     struct rlimit address_limit;
+#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+    long page_count;
+    long page_size;
+#endif
 
     if (sizeof(void*) < 8U) {
         return 0U;
     }
+#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+    page_count = sysconf(_SC_PHYS_PAGES);
+    page_size = sysconf(_SC_PAGESIZE);
+    if (page_count <= 0 || page_size <= 0 ||
+        (uint64_t)page_count >
+            UINT64_MAX / (uint64_t)page_size) {
+        return 0U;
+    }
+    budget = (uint64_t)page_count *
+        (uint64_t)page_size;
+    budget /= 2U;
+#endif
 #if defined(RLIMIT_AS)
     if (getrlimit(RLIMIT_AS, &address_limit) == 0 &&
         address_limit.rlim_cur != RLIM_INFINITY) {
@@ -361,7 +357,9 @@ static uint64_t onefield_index_cache_budget(void) {
          */
         finite_limit = MIN(finite_limit, (uintmax_t)UINT64_MAX);
         finite_limit /= 2U;
-        budget = (uint64_t)finite_limit;
+        budget = MIN(
+            budget,
+            (uint64_t)finite_limit);
     }
 #else
     (void)address_limit;
@@ -374,7 +372,9 @@ static void onefield_job_index_cache_entry_free(
     if (!entry) {
         return;
     }
-    index_free(entry->index);
+    if (entry->index) {
+        index_free(entry->index);
+    }
     free(entry->configured_path);
     free(entry);
 }
@@ -477,25 +477,12 @@ static index_t* onefield_job_index_load_coherent(
 static anbool onefield_job_index_cache_contains_path(
     const onefield_job_field_cache_t* cache,
     const char* configured_path) {
-    size_t entry_index;
+    const onefield_job_index_cache_entry_t* entry =
+        cache ? cache->index_entry : NULL;
 
-    if (!cache || !cache->index_entries ||
-        !configured_path) {
-        return FALSE;
-    }
-    for (entry_index = 0U;
-         entry_index < pl_size(cache->index_entries);
-         entry_index++) {
-        const onefield_job_index_cache_entry_t* entry =
-            pl_get(cache->index_entries, entry_index);
-
-        if (entry && entry->configured_path &&
-            !strcmp(entry->configured_path,
-                    configured_path)) {
-            return TRUE;
-        }
-    }
-    return FALSE;
+    return configured_path && entry &&
+        entry->configured_path &&
+        !strcmp(entry->configured_path, configured_path);
 }
 
 /* index_mutex must be held. */
@@ -504,10 +491,8 @@ static anbool onefield_job_index_prepare_capacity_full(
     uint64_t additional_bytes) {
     uint64_t available;
 
-    if (!cache || !cache->index_entries ||
-        !cache->index_entry_budget ||
-        pl_size(cache->index_entries) >=
-            cache->index_entry_budget ||
+    if (!cache || !cache->index_entry_budget ||
+        cache->index_entry ||
         cache->index_virtual_bytes >=
             cache->index_virtual_budget) {
         return TRUE;
@@ -525,21 +510,12 @@ static anbool onefield_job_index_prepare_capacity_full(
 }
 
 /* index_mutex must be held. */
-static void onefield_job_index_prepare_disable_capacity(
+static void onefield_job_index_prepare_record_capacity_refusal(
     onefield_job_field_cache_t* cache) {
-    if (!cache || cache->index_prepare_capacity_exhausted) {
+    if (!cache) {
         return;
     }
-    cache->index_prepare_capacity_exhausted = TRUE;
     cache->index_prepare_capacity_refusals++;
-    if (cache->index_prepare_pending_path) {
-        free(cache->index_prepare_pending_path);
-        cache->index_prepare_pending_path = NULL;
-        cache->index_prepare_dropped++;
-    }
-    if (cache->index_prepare_cond_ready) {
-        pthread_cond_broadcast(&cache->index_prepare_cond);
-    }
 }
 
 /* index_mutex must be held. */
@@ -571,8 +547,9 @@ static int onefield_job_index_prepare_defer(
 
 /*
  * One optional preparation lane maps exactly one near-future index at a time.
- * The mappings remain lazy: this path does not touch sparse payload pages,
- * open payload descriptors, claim solver ownership, or change index order.
+ * The mapping remains lazy: this path does not touch sparse payload pages,
+ * claim solver ownership, or change index order. Descriptors are open only
+ * while the mapping is built and are closed before the handoff is published.
  */
 static void* onefield_job_index_prepare_main(void* opaque) {
     onefield_job_field_cache_t* cache = opaque;
@@ -589,14 +566,13 @@ static void* onefield_job_index_prepare_main(void* opaque) {
         struct stat identity;
         anbool descriptors_closed = FALSE;
         anbool admitted = FALSE;
-        anbool duplicate = FALSE;
         uint64_t retained_snapshot = 0U;
 
         pthread_mutex_lock(&cache->index_mutex);
         while (!cache->index_prepare_stop &&
-               !cache->index_prepare_capacity_exhausted &&
                (!cache->index_prepare_pending_path ||
-                fitsbin_payload_io_demand_busy())) {
+                fitsbin_payload_io_demand_busy() ||
+                cache->index_entry)) {
             int wait_status;
 
             if (cache->index_prepare_pending_path) {
@@ -625,8 +601,7 @@ static void* onefield_job_index_prepare_main(void* opaque) {
                 cache->index_prepare_stop = TRUE;
             }
         }
-        if (cache->index_prepare_stop ||
-            cache->index_prepare_capacity_exhausted) {
+        if (cache->index_prepare_stop) {
             pthread_mutex_unlock(&cache->index_mutex);
             break;
         }
@@ -635,14 +610,15 @@ static void* onefield_job_index_prepare_main(void* opaque) {
         cache->index_prepare_pending_path = NULL;
         cache->index_prepare_active_path =
             configured_path;
+        cache->index_prepare_active_stale = FALSE;
         cache->index_prepare_started++;
         demand_deferrals = 0U;
         pthread_mutex_unlock(&cache->index_mutex);
 
         /*
-         * This thread exists only for parallel index preparation. Map sparse
-         * payload with the production shard policy so ownership acquisition
-         * does not have to repair a freshly prepared mapping.
+         * This thread exists only for parallel index preparation. Map every
+         * index chunk with the production shard policy so ownership does not
+         * have to repair a freshly prepared mapping.
          */
         fitsbin_mmap_set_thread_advice(
             fitsbin_mmap_advice_state_begin_pass(NULL));
@@ -660,12 +636,10 @@ static void* onefield_job_index_prepare_main(void* opaque) {
         }
 
         pthread_mutex_lock(&cache->index_mutex);
-        duplicate =
-            onefield_job_index_cache_contains_path(
-                cache, configured_path);
         if (!cache->index_prepare_stop &&
-            !cache->index_prepare_capacity_exhausted &&
-            !duplicate && entry && retained_path &&
+            !cache->index_prepare_active_stale &&
+            !cache->index_entry &&
+            entry && retained_path &&
             index && identity.st_size > 0 &&
             descriptors_closed) {
             uint64_t virtual_bytes =
@@ -675,10 +649,12 @@ static void* onefield_job_index_prepare_main(void* opaque) {
             entry->index = index;
             entry->identity = identity;
             entry->virtual_bytes = virtual_bytes;
-            entry->leased = FALSE;
             if (!onefield_job_index_prepare_capacity_full(
                     cache, virtual_bytes)) {
-                pl_append(cache->index_entries, entry);
+                cache->index_entry = entry;
+                entry = NULL;
+                retained_path = NULL;
+                index = NULL;
                 cache->index_virtual_bytes +=
                     virtual_bytes;
                 cache->index_virtual_peak = MAX(
@@ -692,17 +668,18 @@ static void* onefield_job_index_prepare_main(void* opaque) {
             } else {
                 cache->index_refused++;
                 cache->index_prepare_dropped++;
-                onefield_job_index_prepare_disable_capacity(
+                onefield_job_index_prepare_record_capacity_refusal(
                     cache);
             }
-        } else if (duplicate ||
-                   cache->index_prepare_stop ||
-                   cache->index_prepare_capacity_exhausted) {
+        } else if (cache->index_prepare_stop ||
+                   cache->index_prepare_active_stale ||
+                   cache->index_entry) {
             cache->index_prepare_dropped++;
         } else {
             cache->index_prepare_failures++;
         }
         cache->index_prepare_active_path = NULL;
+        cache->index_prepare_active_stale = FALSE;
         pthread_cond_broadcast(&cache->index_prepare_cond);
         pthread_mutex_unlock(&cache->index_mutex);
 
@@ -721,7 +698,9 @@ static void* onefield_job_index_prepare_main(void* opaque) {
                 onefield_job_index_cache_entry_free(entry);
             } else {
                 free(retained_path);
-                index_free(index);
+                if (index) {
+                    index_free(index);
+                }
             }
         }
         free(configured_path);
@@ -742,7 +721,7 @@ static void onefield_job_index_cache_prepare(
     if (!cache || !cache->index_mutex_ready ||
         !cache->index_prepare_cond_ready ||
         !cache->index_prepare_thread_ready ||
-        !cache->index_entries || bp->index_options != 0) {
+        bp->index_options != 0) {
         return;
     }
     pending_path = strdup(configured_path);
@@ -750,17 +729,17 @@ static void onefield_job_index_cache_prepare(
     cache->index_prepare_requests++;
     if (!pending_path) {
         cache->index_prepare_failures++;
-    } else if (cache->index_prepare_stop ||
-               cache->index_prepare_capacity_exhausted) {
+    } else if (cache->index_prepare_stop) {
         cache->index_prepare_dropped++;
     } else if (onefield_job_index_prepare_capacity_full(
                    cache, 0U)) {
         cache->index_prepare_dropped++;
-        onefield_job_index_prepare_disable_capacity(
+        onefield_job_index_prepare_record_capacity_refusal(
             cache);
     } else if (onefield_job_index_cache_contains_path(
                    cache, configured_path) ||
                (cache->index_prepare_active_path &&
+                !cache->index_prepare_active_stale &&
                 !strcmp(cache->index_prepare_active_path,
                         configured_path)) ||
                (cache->index_prepare_pending_path &&
@@ -778,21 +757,66 @@ static void onefield_job_index_cache_prepare(
     free(pending_path);
 }
 
+static void onefield_job_index_cache_flush(onefield_t* bp) {
+    onefield_job_field_cache_t* cache;
+    onefield_job_index_cache_entry_t* entry = NULL;
+
+    if (!bp) {
+        return;
+    }
+    cache = bp->job_field_cache;
+    if (!cache || !cache->index_mutex_ready) {
+        return;
+    }
+    pthread_mutex_lock(&cache->index_mutex);
+    if (cache->index_prepare_pending_path) {
+        free(cache->index_prepare_pending_path);
+        cache->index_prepare_pending_path = NULL;
+        cache->index_prepare_dropped++;
+    }
+    if (cache->index_prepare_active_path) {
+        cache->index_prepare_active_stale = TRUE;
+    }
+    if (cache->index_entry) {
+        entry = cache->index_entry;
+        cache->index_entry = NULL;
+        cache->index_virtual_bytes -= MIN(
+            cache->index_virtual_bytes,
+            entry->virtual_bytes);
+        cache->index_prepare_dropped++;
+    }
+    if (cache->index_prepare_cond_ready) {
+        pthread_cond_broadcast(
+            &cache->index_prepare_cond);
+    }
+    pthread_mutex_unlock(&cache->index_mutex);
+    onefield_job_index_cache_entry_free(entry);
+}
+
+static index_t* onefield_job_index_cache_take_entry(
+    onefield_job_index_cache_entry_t* entry) {
+    index_t* index;
+
+    if (!entry) {
+        return NULL;
+    }
+    index = entry->index;
+    entry->index = NULL;
+    return index;
+}
 static index_t* onefield_job_index_cache_get(
     onefield_t* bp,
     const char* configured_path) {
     onefield_job_field_cache_t* cache;
+    onefield_job_index_cache_entry_t* entry;
     index_t* index;
-    struct stat identity;
-    anbool descriptors_closed = FALSE;
-    size_t entry_index;
+    anbool waited = FALSE;
 
     if (!bp || !configured_path) {
         return NULL;
     }
     cache = bp->job_field_cache;
     if (!cache || !cache->index_mutex_ready ||
-        !cache->index_entries ||
         cache->index_virtual_budget == 0U ||
         bp->index_options != 0) {
         return index_load(
@@ -803,24 +827,17 @@ static index_t* onefield_job_index_cache_get(
 
 retry_lookup:
     pthread_mutex_lock(&cache->index_mutex);
-    for (entry_index = 0U;
-         entry_index < pl_size(cache->index_entries);
-         entry_index++) {
-        onefield_job_index_cache_entry_t* entry =
-            pl_get(cache->index_entries, entry_index);
-
-        if (!entry || entry->leased ||
-            strcmp(entry->configured_path,
-                   configured_path)) {
-            continue;
-        }
+    entry = cache->index_entry;
+    if (entry && entry->configured_path &&
+        !strcmp(entry->configured_path,
+                configured_path)) {
         if (!onefield_job_index_path_matches(entry)) {
             cache->index_invalidated++;
-            cache->index_virtual_bytes -=
-                entry->virtual_bytes;
-            bl_remove_index(
-                cache->index_entries,
-                entry_index);
+            cache->index_virtual_bytes -= MIN(
+                cache->index_virtual_bytes,
+                entry->virtual_bytes);
+            cache->index_entry = NULL;
+            pthread_cond_broadcast(&cache->index_prepare_cond);
             pthread_mutex_unlock(
                 &cache->index_mutex);
             logverb(
@@ -830,13 +847,20 @@ retry_lookup:
             onefield_job_index_cache_entry_free(entry);
             goto retry_lookup;
         }
-        entry->leased = TRUE;
+        cache->index_entry = NULL;
+        cache->index_virtual_bytes -= MIN(
+            cache->index_virtual_bytes,
+            entry->virtual_bytes);
         cache->index_hits++;
-        index = entry->index;
+        index = onefield_job_index_cache_take_entry(
+            entry);
+        entry->virtual_bytes = 0U;
         {
             unsigned long long hit_count =
                 cache->index_hits;
 
+            pthread_cond_broadcast(
+                &cache->index_prepare_cond);
             pthread_mutex_unlock(
                 &cache->index_mutex);
             logverb(
@@ -845,26 +869,34 @@ retry_lookup:
                 configured_path,
                 hit_count);
         }
+        free(entry->configured_path);
+        free(entry);
         return index;
     }
     if (cache->index_prepare_active_path &&
         cache->index_prepare_cond_ready &&
+        !cache->index_prepare_active_stale &&
         !strcmp(cache->index_prepare_active_path,
-                configured_path)) {
+                configured_path) &&
+        !waited) {
         int wait_status;
 
         cache->index_prepare_waits++;
         wait_status =
             onefield_job_index_prepare_timedwait(cache);
-        if (!wait_status) {
-            pthread_mutex_unlock(&cache->index_mutex);
-            goto retry_lookup;
-        }
+        waited = TRUE;
         if (wait_status == ETIMEDOUT) {
             cache->index_prepare_wait_timeouts++;
-        } else {
+        } else if (wait_status) {
             cache->index_prepare_failures++;
         }
+        pthread_mutex_unlock(&cache->index_mutex);
+        goto retry_lookup;
+    }
+    if (cache->index_prepare_active_path &&
+        !strcmp(cache->index_prepare_active_path,
+                configured_path)) {
+        cache->index_prepare_active_stale = TRUE;
     }
     if (cache->index_prepare_pending_path &&
         !strcmp(cache->index_prepare_pending_path,
@@ -877,184 +909,29 @@ retry_lookup:
     cache->index_misses++;
     pthread_mutex_unlock(&cache->index_mutex);
 
-    index = onefield_job_index_load_coherent(
-        cache,
+    return index_load(
         configured_path,
         bp->index_options,
-        &identity,
-        &descriptors_closed);
-    if (!index) {
-        return NULL;
-    }
-
-    /*
-     * Non-default index options or a failed descriptor close retain the
-     * original per-task lifecycle.
-     */
-    if (identity.st_size <= 0 ||
-        !descriptors_closed) {
-        pthread_mutex_lock(&cache->index_mutex);
-        cache->index_refused++;
-        pthread_mutex_unlock(&cache->index_mutex);
-        return index;
-    }
-
-    {
-        onefield_job_index_cache_entry_t* entry =
-            calloc(1, sizeof(*entry));
-        uint64_t virtual_bytes =
-            (uint64_t)identity.st_size;
-        char* retained_path =
-            strdup(configured_path);
-        anbool admitted = FALSE;
-        anbool duplicate = FALSE;
-        uint64_t retained_snapshot = 0U;
-
-        if (entry && retained_path) {
-            entry->configured_path = retained_path;
-            entry->index = index;
-            entry->identity = identity;
-            entry->virtual_bytes = virtual_bytes;
-            entry->leased = TRUE;
-            pthread_mutex_lock(&cache->index_mutex);
-            duplicate =
-                onefield_job_index_cache_contains_path(
-                    cache, configured_path);
-            if (duplicate) {
-                cache->index_refused++;
-            } else if (!onefield_job_index_prepare_capacity_full(
-                    cache, virtual_bytes)) {
-                pl_append(cache->index_entries, entry);
-                cache->index_virtual_bytes +=
-                    virtual_bytes;
-                cache->index_virtual_peak = MAX(
-                    cache->index_virtual_peak,
-                    cache->index_virtual_bytes);
-                cache->index_admitted++;
-                retained_snapshot =
-                    cache->index_virtual_bytes;
-                admitted = TRUE;
-            } else {
-                cache->index_refused++;
-                onefield_job_index_prepare_disable_capacity(
-                    cache);
-            }
-            pthread_mutex_unlock(&cache->index_mutex);
-        } else {
-            pthread_mutex_lock(&cache->index_mutex);
-            cache->index_refused++;
-            pthread_mutex_unlock(&cache->index_mutex);
-        }
-        if (!admitted) {
-            free(retained_path);
-            free(entry);
-            logverb(
-                "[index-shard] job-index-cache state=refuse "
-                "path=%s reason=%s\n",
-                configured_path,
-                duplicate ? "duplicate" : "budget");
-        } else {
-            logverb(
-                "[index-shard] job-index-cache state=fill "
-                "path=%s retained=%llu budget=%llu\n",
-                configured_path,
-                (unsigned long long)
-                    retained_snapshot,
-                (unsigned long long)
-                    cache->index_virtual_budget);
-        }
-    }
-    return index;
+        NULL);
 }
 
-static onefield_job_index_release_status_t
-onefield_job_index_cache_release_entry(
-    onefield_job_index_cache_entry_t* entry,
-    index_t* index) {
-    if (!entry || entry->index != index) {
-        return ONEFIELD_JOB_INDEX_NOT_RETAINED;
-    }
-    if (!entry->leased) {
-        return ONEFIELD_JOB_INDEX_RELEASE_ERROR;
-    }
-    entry->leased = FALSE;
-    return ONEFIELD_JOB_INDEX_RELEASED;
-}
-
-int onefield_job_index_cache_test_release_state(void) {
+int onefield_job_index_cache_test_handoff_state(void) {
     onefield_job_index_cache_entry_t entry;
     index_t retained;
-    index_t unrelated;
 
     memset(&entry, 0, sizeof(entry));
     memset(&retained, 0, sizeof(retained));
-    memset(&unrelated, 0, sizeof(unrelated));
     entry.index = &retained;
-    entry.leased = TRUE;
 
-    if (onefield_job_index_cache_release_entry(
-            &entry, &unrelated) !=
-        ONEFIELD_JOB_INDEX_NOT_RETAINED) {
+    if (onefield_job_index_cache_take_entry(
+            &entry) != &retained ||
+        entry.index) {
         return -1;
     }
-    if (onefield_job_index_cache_release_entry(
-            &entry, &retained) !=
-        ONEFIELD_JOB_INDEX_RELEASED ||
-        entry.leased) {
-        return -1;
-    }
-    if (onefield_job_index_cache_release_entry(
-            &entry, &retained) !=
-        ONEFIELD_JOB_INDEX_RELEASE_ERROR ||
-        entry.index != &retained) {
+    if (onefield_job_index_cache_take_entry(&entry)) {
         return -1;
     }
     return 0;
-}
-
-static onefield_job_index_release_status_t
-onefield_job_index_cache_release(
-    onefield_t* bp,
-    index_t* index) {
-    onefield_job_field_cache_t* cache;
-    size_t entry_index;
-
-    if (!bp || !index) {
-        return ONEFIELD_JOB_INDEX_NOT_RETAINED;
-    }
-    cache = bp->job_field_cache;
-    if (!cache || !cache->index_mutex_ready ||
-        !cache->index_entries) {
-        return ONEFIELD_JOB_INDEX_NOT_RETAINED;
-    }
-    pthread_mutex_lock(&cache->index_mutex);
-    for (entry_index = 0U;
-         entry_index < pl_size(cache->index_entries);
-         entry_index++) {
-        onefield_job_index_cache_entry_t* entry =
-            pl_get(cache->index_entries, entry_index);
-
-        if (!entry || entry->index != index) {
-            continue;
-        }
-        {
-            onefield_job_index_release_status_t status =
-                onefield_job_index_cache_release_entry(
-                    entry, index);
-
-            if (status ==
-                ONEFIELD_JOB_INDEX_RELEASE_ERROR) {
-                logerr(
-                    "[index-shard] duplicate job-index-cache "
-                    "release path=%s\n",
-                    entry->configured_path);
-            }
-            pthread_mutex_unlock(&cache->index_mutex);
-            return status;
-        }
-    }
-    pthread_mutex_unlock(&cache->index_mutex);
-    return ONEFIELD_JOB_INDEX_NOT_RETAINED;
 }
 
 static void onefield_field_cache_clear_key(
@@ -1091,23 +968,24 @@ int onefield_job_field_cache_begin(onefield_t* bp) {
     }
     cache = bp->job_field_cache;
     /*
-     * Retain every coherent index epoch used by this job. Engine passes
-     * materialize different subsets after this cache starts, so a budget
-     * captured from the current pass would discard affinity mappings. The
-     * address-space budget below remains the safety boundary.
+     * Active index ownership belongs to the outer scheduler. This slot is an
+     * exact one-entry handoff for optional next-index preparation only.
+     * Demand misses retain the original load, solve, and free lifecycle.
      */
-    cache->index_entry_budget = SIZE_MAX;
+    cache->index_entry_budget =
+        bp->index_shard_workers > 1
+            ? 1U
+            : 0U;
     cache->index_virtual_budget =
-        onefield_index_cache_budget();
-    cache->index_entries = pl_new(32);
-    if (cache->index_entries &&
-        pthread_mutex_init(
+        cache->index_entry_budget
+            ? onefield_index_cache_budget()
+            : 0U;
+    if (pthread_mutex_init(
             &cache->index_mutex,
             NULL) == 0) {
         cache->index_mutex_ready = TRUE;
     } else {
-        pl_free(cache->index_entries);
-        cache->index_entries = NULL;
+        cache->index_entry_budget = 0U;
         cache->index_virtual_budget = 0U;
     }
     if (cache->index_mutex_ready &&
@@ -1130,6 +1008,10 @@ int onefield_job_field_cache_begin(onefield_t* bp) {
                 &cache->index_prepare_cond);
             cache->index_prepare_cond_ready = FALSE;
         }
+    }
+    if (!cache->index_prepare_thread_ready) {
+        cache->index_entry_budget = 0U;
+        cache->index_virtual_budget = 0U;
     }
     logverb("[index-shard] job-field-cache state=begin "
             "index_virtual_budget=%llu index_entry_budget=%zu "
@@ -1164,7 +1046,7 @@ void onefield_job_field_cache_invalidate(onefield_t* bp) {
 
 void onefield_job_field_cache_end(onefield_t* bp) {
     onefield_job_field_cache_t* cache;
-    size_t entry_index;
+    onefield_job_index_cache_entry_t* entry = NULL;
 
     if (!bp || !bp->job_field_cache) {
         return;
@@ -1212,8 +1094,7 @@ void onefield_job_field_cache_end(onefield_t* bp) {
         "prepare_dropped=%llu prepare_failures=%llu "
         "prepare_waits=%llu prepare_wait_timeouts=%llu "
         "prepare_deferrals=%llu "
-        "prepare_capacity_refusals=%llu "
-        "prepare_disabled=%s\n",
+        "prepare_capacity_refusals=%llu\n",
         cache->index_hits,
         cache->index_misses,
         cache->index_admitted,
@@ -1227,9 +1108,7 @@ void onefield_job_field_cache_end(onefield_t* bp) {
             cache->index_virtual_peak,
         (unsigned long long)
             cache->index_virtual_budget,
-        cache->index_entries
-            ? pl_size(cache->index_entries)
-            : 0U,
+        cache->index_entry ? (size_t)1U : (size_t)0U,
         cache->index_entry_budget,
         cache->index_prepare_requests,
         cache->index_prepare_started,
@@ -1239,9 +1118,7 @@ void onefield_job_field_cache_end(onefield_t* bp) {
         cache->index_prepare_waits,
         cache->index_prepare_wait_timeouts,
         cache->index_prepare_deferrals,
-        cache->index_prepare_capacity_refusals,
-        cache->index_prepare_capacity_exhausted
-            ? "yes" : "no");
+        cache->index_prepare_capacity_refusals);
     if (cache->index_prepare_cond_ready) {
         pthread_cond_destroy(
             &cache->index_prepare_cond);
@@ -1249,32 +1126,17 @@ void onefield_job_field_cache_end(onefield_t* bp) {
     }
     if (cache->index_mutex_ready) {
         pthread_mutex_lock(&cache->index_mutex);
-        for (entry_index = 0U;
-             entry_index <
-                 pl_size(cache->index_entries);
-             entry_index++) {
-            onefield_job_index_cache_entry_t* entry =
-                pl_get(
-                    cache->index_entries,
-                    entry_index);
-
-            if (entry && entry->leased) {
-                logerr(
-                    "[index-shard] releasing leased "
-                    "job-index-cache epoch path=%s\n",
-                    entry->configured_path);
-            }
-            onefield_job_index_cache_entry_free(entry);
-        }
-        pl_free(cache->index_entries);
-        cache->index_entries = NULL;
+        entry = cache->index_entry;
+        cache->index_entry = NULL;
         cache->index_virtual_bytes = 0U;
         pthread_mutex_unlock(&cache->index_mutex);
+        onefield_job_index_cache_entry_free(entry);
         pthread_mutex_destroy(&cache->index_mutex);
         cache->index_mutex_ready = FALSE;
     } else {
-        pl_free(cache->index_entries);
-        cache->index_entries = NULL;
+        onefield_job_index_cache_entry_free(
+            cache->index_entry);
+        cache->index_entry = NULL;
     }
     free(cache);
     bp->job_field_cache = NULL;
@@ -1904,11 +1766,9 @@ static index_t *onefield_index_shard_get_index(onefield_t *bp,
     }
 
     /*
-     * A worker normally consumes one lane of the initial canonical wave.
-     * Preparing one worker-width ahead overlaps the next mapping setup with
-     * the current solve without reserving or claiming that future index.
-     * Affinity passes still use the same shared cache if another owner reaches
-     * the prepared index first.
+     * Preparing one worker-width ahead overlaps mapping setup without claiming
+     * that future index. The single prepared handoff transfers to the first
+     * exact claimant and is freed when that worker finishes the index task.
      */
     if (index_order <= SIZE_MAX - worker_stride) {
       size_t prepare_order =
@@ -2775,6 +2635,7 @@ void onefield_run(onefield_t* bp) {
               &onefield_index_shard_hooks);
       profile_solver_seconds +=
           monotonic_seconds() - shard_wall_start;
+      onefield_job_index_cache_flush(bp);
 
       switch (shard_status) {
       case INDEX_SHARD_SOLVE_HANDLED:

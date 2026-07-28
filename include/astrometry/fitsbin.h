@@ -87,11 +87,10 @@ typedef enum fitsbin_mmap_advice {
 } fitsbin_mmap_advice_t;
 
 /*
- * Index mappings have two materially different access patterns.
- *
- * Payload is the default so zero-initialized third-party chunks preserve the
- * pass-level policy. Parallel index payload uses RANDOM while traversal
- * topology and serial callers retain NORMAL.
+ * Region metadata distinguishes topology and payload for page planning and
+ * telemetry. Payload remains the default so zero-initialized third-party
+ * chunks preserve compatibility. The mapping pass policy applies to every
+ * chunk; region metadata does not override NORMAL or RANDOM advice.
  */
 typedef enum fitsbin_mmap_region {
     FITSBIN_MMAP_REGION_PAYLOAD = 0,
@@ -258,10 +257,10 @@ int fitsbin_close_fd(fitsbin_t* fb);
 /**
  Configures the mmap policy for solver index data.
 
- A shard worker supplies the parallel payload policy before mapping. Traversal
- topology always remains NORMAL, while a caller without shard-local policy
- retains the original serial NORMAL behavior. Bounded exact page population is
- advisory and does not change either policy.
+ A W2+ shard worker supplies RANDOM before mapping every index chunk. A caller
+ without shard-local policy retains the original serial NORMAL behavior.
+ Bounded exact page population is advisory and does not change either mapping
+ policy.
  */
 int fitsbin_configure_index_mmap(fitsbin_t* fb);
 
@@ -312,8 +311,9 @@ void fitsbin_payload_io_configure_workers(int worker_count);
 int fitsbin_payload_io_demand_busy(void);
 
 /*
- * Optional compatibility callback used only while a buffered demand reader
- * has no payload credit. Production mmap reads do not install this callback.
+ * Optional worker callback used only while a buffered demand reader has no
+ * payload credit. It may execute one bounded, index-free helper package; a
+ * nonzero return requests one immediate credit/helper retry.
  */
 typedef int (*fitsbin_payload_io_wait_helper_fn)(void* opaque);
 
@@ -323,15 +323,15 @@ int fitsbin_payload_io_set_thread_wait_helper(
 void fitsbin_payload_io_clear_thread_wait_helper(void);
 
 /*
- * Compatibility bridge for buffered-read tests. Only payload-credit waiters
- * with a worker-local callback are counted.
+ * Count payload-credit waiters with a worker-local callback and wake them
+ * after bounded helper work is published.
  */
 size_t fitsbin_payload_io_wait_helper_count(void);
 void fitsbin_payload_io_notify_wait_helpers(void);
 
 /*
- * Delimit a compatibility helper window. Nested windows share one reserved
- * buffered-reader slot.
+ * Delimit a production helper window. Nested windows share one reserved
+ * reader slot so demand stays bounded while helper work is runnable.
  */
 void fitsbin_payload_io_begin_helper_window(void);
 void fitsbin_payload_io_end_helper_window(void);
@@ -402,7 +402,7 @@ int fitsbin_prefetch_ranges(
  * aligned plan is preflighted against byte_budget and the process-wide byte
  * ceiling before any page is touched. This operation never changes the base
  * mapping advice. Refusal or failure therefore leaves the caller's NORMAL or
- * RANDOM payload policy intact.
+ * RANDOM mapping policy intact.
  *
  * Return the number of fully populated spans, zero when the complete plan is
  * not applicable, or -1 on invalid input or kernel failure.
@@ -544,10 +544,10 @@ int fitsbin_write_chunk_to(fitsbin_t* fb, fitsbin_chunk_t* chunk, FILE* fid);
 /*
  * Index mmap policy.
  *
- * Fixed policies preserve one base payload advice for the complete field.
- * Parallel production uses FIXED_RANDOM for sparse payload, while topology
- * and serial callers remain NORMAL. Bounded exact page population is additive
- * and policy-neutral.
+ * Fixed policies preserve one base mapping advice for the complete field.
+ * Parallel production uses FIXED_RANDOM for every mapped index chunk, while
+ * serial callers remain NORMAL. Bounded exact page population is additive and
+ * policy-neutral.
  */
 typedef enum fitsbin_mmap_policy {
     FITSBIN_MMAP_POLICY_FIXED_NORMAL = 0,
@@ -592,7 +592,8 @@ fitsbin_mmap_advice_t fitsbin_get_mmap_advice(
     const fitsbin_t* fb);
 
 /*
- * Topology is always NORMAL; payload follows the pass-level advice.
+ * Every mapped chunk follows file/pass advice; region metadata does not
+ * override it.
  */
 fitsbin_mmap_advice_t fitsbin_get_chunk_mmap_advice(
     const fitsbin_t* fb,

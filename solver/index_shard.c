@@ -2453,8 +2453,8 @@ static int index_shard_apply_index_mmap_advice(
     }
 
     /*
-     * Apply the pass policy to payload chunks of retained or newly prepared
-     * index components. fitsbin keeps topology chunks under NORMAL.
+     * Apply the pass policy to every chunk of a retained or newly prepared
+     * index component.
      */
     if (index->codekd &&
         index->codekd->tree &&
@@ -2565,30 +2565,42 @@ static anbool index_shard_helper_outer_claimable_locked(
 /* queue_mutex must be held. */
 static size_t index_shard_helper_idle_workers_locked(
     const index_shard_thread_state_t *shared) {
-  size_t available;
+  size_t available = 0U;
+  size_t wait_helpers;
   size_t limit;
   size_t spare = 0U;
+  anbool outer_claimable;
 
-  if (!shared || shared->worker_count < 2 ||
-      index_shard_helper_outer_claimable_locked(shared)) {
+  if (!shared || shared->worker_count < 2) {
     return 0U;
   }
   limit = (size_t)shared->worker_count - 1U;
-  if ((size_t)shared->worker_count >
-      shared->outer_running) {
-    spare = (size_t)shared->worker_count -
-        shared->outer_running;
+  outer_claimable =
+      index_shard_helper_outer_claimable_locked(shared);
+  wait_helpers =
+      fitsbin_payload_io_wait_helper_count();
+  if (!outer_claimable) {
+    if ((size_t)shared->worker_count >
+        shared->outer_running) {
+      spare = (size_t)shared->worker_count -
+          shared->outer_running;
+    }
+    available = shared->queue_waiters;
+    if (!shared->helper_groups_active &&
+        spare > available) {
+      available = spare;
+    }
   }
-  available = shared->queue_waiters;
-  if (!shared->helper_groups_active &&
-      spare > available) {
-    available = spare;
-  }
+  available = MIN(available, limit);
+  wait_helpers = MIN(
+      wait_helpers,
+      limit - available);
+  available += wait_helpers;
   if (shared->helper_foreign_reservations >= available) {
     return 0U;
   }
   available -= shared->helper_foreign_reservations;
-  return available < limit ? available : limit;
+  return available;
 }
 
 /* queue_mutex must be held. */
@@ -2907,6 +2919,43 @@ static int index_shard_helper_execute_claim(
   return rc;
 }
 
+static int index_shard_payload_wait_help(void *opaque) {
+  index_shard_worker_context_t *ctx = opaque;
+  index_shard_thread_state_t *shared;
+  index_shard_helper_claim_t claim;
+  int selection;
+
+  if (!ctx || !ctx->pool ||
+      !ctx->current_outer_active) {
+    return 0;
+  }
+  shared = &ctx->pool->shared;
+  memset(&claim, 0, sizeof(claim));
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  if (ctx->generation_seen != ctx->pool->generation) {
+    pthread_mutex_unlock(&shared->queue_mutex);
+    return 0;
+  }
+  selection = index_shard_helper_select_locked(
+      ctx, shared, &claim);
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  if (selection < 0) {
+    index_shard_request_fatal_stop(shared);
+    return 0;
+  }
+  if (selection > 0) {
+    return 0;
+  }
+  if (index_shard_helper_execute_claim(
+          shared, &claim)) {
+    index_shard_request_fatal_stop(shared);
+    return 0;
+  }
+  return 1;
+}
+
 /* queue_mutex must be held. */
 static int index_shard_helper_cancel_for_pool_locked(
     index_shard_thread_state_t *shared,
@@ -3094,7 +3143,6 @@ index_shard_helper_run(
   int wait_broken = FALSE;
   int fatal_requested = FALSE;
   int prepublish_fatal = FALSE;
-  int outer_claimable;
   int preparation_permit = FALSE;
 
   if (stats) {
@@ -3147,13 +3195,10 @@ index_shard_helper_run(
           ctx->generation_seen &&
       ctx->helper_preparation_index_order ==
           ctx->current_index_order;
-  outer_claimable =
-      index_shard_helper_outer_claimable_locked(shared);
   if (ctx->generation_seen != ctx->pool->generation ||
       ctx->published_helper_group ||
       (!preparation_permit &&
        shared->helper_preparations_active) ||
-      outer_claimable ||
       (shared->have_solved_order &&
        group.owner_index_order >=
            shared->solved_index_order)) {
@@ -3245,6 +3290,7 @@ index_shard_helper_run(
   pthread_mutex_unlock(&shared->state_mutex);
   pthread_cond_broadcast(&shared->queue_cv);
   pthread_mutex_unlock(&shared->queue_mutex);
+  fitsbin_payload_io_notify_wait_helpers();
 
   while (1) {
     if (have_claim) {
@@ -3955,7 +4001,12 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
   // Worker-lifetime TLS lets onefield callbacks publish this exact order.
   ctx->current_index_order = index_order;
   ctx->current_outer_active = TRUE;
+  fitsbin_payload_io_clear_thread_wait_helper();
+  (void)fitsbin_payload_io_set_thread_wait_helper(
+      index_shard_payload_wait_help,
+      ctx);
   rc = shared->hooks->solve_one_index(&ctx->local_bp, index);
+  fitsbin_payload_io_clear_thread_wait_helper();
   ctx->current_outer_active = FALSE;
 
   result->wall_seconds = monotonic_seconds() - wall_start;
@@ -5120,9 +5171,8 @@ static int index_shard_pool_submit(
   shared->reducer_work_wall_seconds = 0.0;
 
   /*
-   * Payload mappings follow the parallel pass policy while topology remains
-   * NORMAL. Bounded exact page population is additive and never changes that
-   * base policy.
+   * Every mapping follows the parallel pass policy. Bounded exact page
+   * population is additive and never changes that base policy.
    */
   shared->mmap_advice =
       fitsbin_mmap_advice_state_begin_pass(
@@ -5153,9 +5203,9 @@ static int index_shard_pool_submit(
           "startobj=%i endobj=%i scheduler=affinity-first chunk=1 "
           "inner_scheduler=owner-helper-groups "
           "mmap_pass=%u mmap_advice=%s "
-          "mmap_policy=payload-random-topology-normal "
+          "mmap_policy=parallel-random-serial-normal "
           "page_delivery=bounded-populate "
-          "payload_io=mmap-zero-copy credits=%i "
+          "payload_io=batched-pread-mmap-fallback credits=%i "
           "outer_admission=full-owner-affinity\n",
           worker_count,
           pool->worker_count,

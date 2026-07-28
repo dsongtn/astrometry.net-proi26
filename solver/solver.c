@@ -1446,10 +1446,13 @@ static const index_shard_helper_ops_t solver_codekd_helper_ops = {
 };
 
 static size_t solver_codekd_helper_available(void* opaque) {
-    if (!opaque || !index_shard_worker_context_active()) {
-        return 0U;
-    }
-    return index_shard_helper_available_workers();
+    /*
+     * The leaf wave is too fine-grained for foreign scheduling. Keep the
+     * direct reader and its batched page delivery, but reduce CodeKD leaves
+     * on their owner until a coarse, index-free package replaces this seam.
+     */
+    (void)opaque;
+    return 0U;
 }
 
 static int solver_codekd_helper_run(
@@ -1607,10 +1610,10 @@ static kdtree_qres_t* solver_codekd_rangesearch(
     anbool direct_owned = result == NULL;
     int direct_errno;
 
-    if (tree && tree->io && tree->io_is_fitsbin) {
+    if (!index_shard_worker_context_active()) {
         /*
-         * Keep the original zero-copy shared mapping as the normal path.
-         * Advice failure does not invalidate that authoritative mapping.
+         * Serial and W1 solving retain the original mapped traversal.
+         * Parallel shard workers use bounded delivery below when supported.
          */
         return kdtree_rangesearch_options_reuse(
             tree,
@@ -1666,7 +1669,8 @@ static kdtree_qres_t* solver_codekd_rangesearch(
         &executor);
     direct_errno = errno;
     solver_codekd_reader_unbind(reader);
-    if (reader->helper_hard_failure || direct_errno == EPROTO) {
+    if (reader->helper_hard_failure ||
+        (!direct && direct_errno == EPROTO)) {
         if (direct_owned) {
             if (direct) {
                 kdtree_free_query(direct);
@@ -1674,7 +1678,7 @@ static kdtree_qres_t* solver_codekd_rangesearch(
         } else {
             kdtree_free_query(result);
         }
-        logerr("[solver-codekd-helper] hard leaf-wave failure "
+        logerr("[solver-codekd-io] hard direct-range failure "
                "index=%s\n",
                tree->name ? tree->name : "(unnamed)");
         errno = EPROTO;
@@ -2188,8 +2192,8 @@ void solver_set_field(solver_t* s, starxy_t* field) {
 
     /*
      * Reset the compatibility policy counters at the field boundary.
-     * Shards keep topology and CodeKD at NORMAL while sparse Star and Quad
-     * payloads use RANDOM. Serial solving retains original NORMAL mappings.
+     * Shard workers apply RANDOM to every mapped index chunk. Serial solving
+     * retains original NORMAL mappings.
      */
     fitsbin_mmap_advice_state_reset(
         &s->index_mmap_policy);
@@ -6585,8 +6589,7 @@ static int solver_ab_try_verification_wave(
     int dimquads,
     int quads_tried,
     solver_t* solver,
-    anbool current_parity,
-    const solver_candidate_payload_workspace_t* payload_workspace) {
+    anbool current_parity) {
     solver_ab_packet_t packet;
     solver_ab_snapshot_t snapshot;
     solver_verification_candidate_runtime_t* runtime = NULL;
@@ -6611,7 +6614,9 @@ static int solver_ab_try_verification_wave(
     int handled = 0;
 
     if (!result || !field_xy || !fieldstars || !solver ||
-        result->nres < 2 || verify_datalog_enabled() ||
+        result->nres < 2 ||
+        result->nres > (int)INDEX_SHARD_HELPER_MAX_TASKS ||
+        verify_datalog_enabled() ||
         !index_shard_worker_context_active()) {
         return 0;
     }
@@ -6669,15 +6674,6 @@ static int solver_ab_try_verification_wave(
          candidate_index++) {
         solver_ab_candidate_t* candidate =
             &packet.candidates[candidate_index];
-        const unsigned int* prepared_stars = NULL;
-
-        if (payload_workspace) {
-            if (!payload_workspace->valid[candidate_index]) {
-                goto cleanup;
-            }
-            prepared_stars = payload_workspace->stars +
-                (size_t)candidate_index * (size_t)DQMAX;
-        }
         if (solver_ab_candidate_prepare(
                 candidate,
                 result,
@@ -6686,8 +6682,7 @@ static int solver_ab_try_verification_wave(
                 fieldstars,
                 dimquads,
                 &snapshot,
-                current_parity,
-                prepared_stars)) {
+                current_parity)) {
             goto cleanup;
         }
         packet.candidate_count++;
@@ -10773,50 +10768,10 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
     //    [x_A,y_A, x_B,y_B, x_C,y_C, ...]
     int jj, thisquadno;
     MatchObj mo;
-    solver_candidate_payload_workspace_t* payload_workspace = NULL;
 
     assert(krez);
     assert(dimquads > 0);
     assert(dimquads <= DQMAX);
-
-    if (krez->nres > 0) {
-        (void)quadfile_advise_rows(
-            solver->index->quads,
-            krez->inds,
-            krez->nres);
-        payload_workspace =
-            solver_candidate_payload_workspace_get(
-                (size_t)krez->nres);
-        if (payload_workspace) {
-            size_t advice_count = 0U;
-
-            for (jj = 0; jj < krez->nres; jj++) {
-                unsigned int* prepared_stars =
-                    payload_workspace->stars +
-                    (size_t)jj * (size_t)DQMAX;
-
-                payload_workspace->valid[jj] =
-                    quadfile_get_stars(
-                        solver->index->quads,
-                        krez->inds[jj],
-                        prepared_stars) == 0;
-                if (!payload_workspace->valid[jj]) {
-                    continue;
-                }
-                memcpy(
-                    payload_workspace->advice_starids + advice_count,
-                    prepared_stars,
-                    (size_t)dimquads * sizeof(*prepared_stars));
-                advice_count += (size_t)dimquads;
-            }
-            if (advice_count && advice_count <= (size_t)INT_MAX) {
-                (void)startree_advise_rows(
-                    solver->index->starkd,
-                    payload_workspace->advice_starids,
-                    (int)advice_count);
-            }
-        }
-    }
 
     if (krez->nres && solver->ab_executor) {
         int starkd_status =
@@ -10844,14 +10799,12 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
             dimquads,
             quads_tried,
             solver,
-            current_parity,
-            payload_workspace)) {
+            current_parity)) {
         return;
     }
 
     for (jj = 0; jj < krez->nres; jj++) {
-        unsigned int star_storage[DQMAX];
-        const unsigned int* star;
+        unsigned int star[DQMAX];
         double starxyz[DQMAX*3];
         double scale;
         double arcsecperpix;
@@ -10867,19 +10820,10 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
         solver->nummatches++;
         thisquadno = krez->inds[jj];
 
-        if (payload_workspace) {
-            star = payload_workspace->stars +
-                (size_t)jj * (size_t)DQMAX;
-        } else {
-            star = star_storage;
-        }
-        if ((payload_workspace &&
-             !payload_workspace->valid[jj]) ||
-            (!payload_workspace &&
-             quadfile_get_stars(
-                 solver->index->quads,
-                 thisquadno,
-                 star_storage))) {
+        if (quadfile_get_stars(
+                solver->index->quads,
+                thisquadno,
+                star)) {
             solver_index_payload_failure(
                 solver, "QuadFile");
             return;

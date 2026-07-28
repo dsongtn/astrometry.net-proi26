@@ -264,8 +264,8 @@ void test_production_mmap_component_classification(CuTest* ct) {
     CuAssertIntEquals(ct, 0, kdtree_fits_write(kd, fn, NULL));
 
     /*
-     * Use a controlled RANDOM payload policy so the test proves that chunks
-     * created by the real kdtree reader receive different effective advice.
+     * Use a controlled RANDOM mapping policy. The reader still assigns
+     * distinct region classes, but every chunk receives the same advice.
      */
     fitsbin_mmap_set_thread_advice(FITSBIN_MMAP_ADVICE_RANDOM);
     io = kdtree_fits_open(fn);
@@ -306,7 +306,7 @@ void test_production_mmap_component_classification(CuTest* ct) {
                 chunk->mmap_region);
             CuAssertIntEquals(
                 ct,
-                FITSBIN_MMAP_ADVICE_NORMAL,
+                FITSBIN_MMAP_ADVICE_RANDOM,
                 fitsbin_get_chunk_mmap_advice(fb, chunk));
         }
     }

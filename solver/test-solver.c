@@ -492,7 +492,7 @@ int main(int argc, char** args) {
     test_geometry_cache_deep_admission();
     test_ab_counter_boundaries();
     assert(!solver_test_codekd_cache_churn());
-    assert(!onefield_job_index_cache_test_release_state());
+    assert(!onefield_job_index_cache_test_handoff_state());
     test_zero_initialized_payload_fd_is_unowned();
     test_index_close_fds_failure_state();
     return 0;
