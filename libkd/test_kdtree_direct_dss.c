@@ -34,6 +34,17 @@ typedef struct direct_plan_capture {
     size_t releases;
 } direct_plan_capture_t;
 
+typedef struct direct_lookahead_capture {
+    direct_plan_capture_t planned;
+    direct_plan_capture_t* delivered;
+    size_t submitted;
+    size_t finished;
+    size_t cancelled;
+    int submit_unavailable;
+    int finish_unavailable;
+    int finish_errno;
+} direct_lookahead_capture_t;
+
 static int direct_plan_capture_ranges(
     void* opaque,
     const kdtree_direct_range_request_t* requests,
@@ -104,6 +115,72 @@ static void direct_leased_capture_release(
 
     if (capture && lease == capture) {
         capture->releases++;
+    }
+}
+
+static int direct_lookahead_capture_submit(
+    void* opaque,
+    const kdtree_direct_range_request_t* requests,
+    size_t nrequests,
+    void** handle) {
+    direct_lookahead_capture_t* capture = opaque;
+    void* allocated;
+
+    if (!capture || !handle ||
+        direct_plan_capture_ranges(
+            &capture->planned, requests, nrequests)) {
+        return -1;
+    }
+    if (capture->submit_unavailable) {
+        return 0;
+    }
+    allocated = malloc(1U);
+    if (!allocated) {
+        return 0;
+    }
+    capture->submitted++;
+    *handle = allocated;
+    return 1;
+}
+
+static int direct_lookahead_capture_finish(
+    void* opaque,
+    void* handle,
+    const kdtree_direct_range_request_t* requests,
+    size_t nrequests,
+    kdtree_direct_range_t* ranges) {
+    direct_lookahead_capture_t* capture = opaque;
+    int status;
+
+    if (!capture || !capture->delivered || !handle) {
+        free(handle);
+        return -1;
+    }
+    capture->finished++;
+    free(handle);
+    if (capture->finish_errno) {
+        errno = capture->finish_errno;
+        return -1;
+    }
+    if (capture->finish_unavailable) {
+        return 0;
+    }
+    status = direct_leased_capture_read(
+        capture->delivered, requests, nrequests, ranges);
+    if (status) {
+        return -1;
+    }
+    return 1;
+}
+
+static void direct_lookahead_capture_cancel(
+    void* opaque,
+    void* handle) {
+    direct_lookahead_capture_t* capture = opaque;
+
+    free(handle);
+    if (capture) {
+        capture->cancelled++;
     }
 }
 
@@ -411,6 +488,8 @@ void test_kdtree_direct_dss_plan_matches_leased_requests(
     const double query[4] = {0.50, 0.50, 0.50, 0.50};
     direct_plan_capture_t planned;
     direct_plan_capture_t leased;
+    direct_lookahead_capture_t prepared;
+    kdtree_direct_dss_lookahead_t lookahead;
     double* data;
     kdtree_t* kd;
     kdtree_qres_t* result;
@@ -455,6 +534,13 @@ void test_kdtree_direct_dss_plan_matches_leased_requests(
 
     memset(&leased, 0, sizeof(leased));
     leased.kd = kd;
+    memset(&prepared, 0, sizeof(prepared));
+    prepared.planned.kd = kd;
+    prepared.delivered = &leased;
+    lookahead.opaque = &prepared;
+    lookahead.submit = direct_lookahead_capture_submit;
+    lookahead.finish = direct_lookahead_capture_finish;
+    lookahead.cancel = direct_lookahead_capture_cancel;
     result = kdtree_rangesearch_direct_dss_leased(
         kd,
         NULL,
@@ -466,7 +552,8 @@ void test_kdtree_direct_dss_plan_matches_leased_requests(
         direct_leased_capture_read,
         direct_leased_capture_release,
         &leased,
-        NULL);
+        NULL,
+        &lookahead);
     CuAssertPtrNotNull(ct, result);
     CuAssertIntEquals(
         ct, (int)planned.nbatches, (int)leased.nbatches);
@@ -486,8 +573,112 @@ void test_kdtree_direct_dss_plan_matches_leased_requests(
         !memcmp(planned.requests,
                 leased.requests,
                 planned.nrequests * sizeof(planned.requests[0])));
-
+    CuAssertIntEquals(
+        ct, (int)planned.nbatches, (int)prepared.planned.nbatches);
+    CuAssertIntEquals(
+        ct, (int)planned.nrequests, (int)prepared.planned.nrequests);
+    CuAssert(
+        ct,
+        "lookahead must preserve canonical batch boundaries",
+        !memcmp(planned.batch_counts,
+                prepared.planned.batch_counts,
+                planned.nbatches * sizeof(planned.batch_counts[0])));
+    CuAssert(
+        ct,
+        "lookahead must preserve canonical request order",
+        !memcmp(planned.requests,
+                prepared.planned.requests,
+                planned.nrequests * sizeof(planned.requests[0])));
+    CuAssertIntEquals(
+        ct, (int)prepared.submitted, (int)prepared.finished);
+    CuAssertIntEquals(ct, 0, (int)prepared.cancelled);
     kdtree_free_query(result);
+
+    memset(&leased, 0, sizeof(leased));
+    leased.kd = kd;
+    memset(&prepared, 0, sizeof(prepared));
+    prepared.planned.kd = kd;
+    prepared.delivered = &leased;
+    prepared.submit_unavailable = 1;
+    result = kdtree_rangesearch_direct_dss_leased(
+        kd,
+        NULL,
+        query,
+        4.0,
+        options,
+        7U,
+        3U,
+        direct_leased_capture_read,
+        direct_leased_capture_release,
+        &leased,
+        NULL,
+        &lookahead);
+    CuAssertPtrNotNull(ct, result);
+    CuAssertIntEquals(
+        ct, (int)planned.nbatches, (int)leased.nbatches);
+    CuAssertIntEquals(
+        ct, (int)planned.nrequests, (int)leased.releases);
+    CuAssertIntEquals(ct, 0, (int)prepared.submitted);
+    CuAssertIntEquals(ct, 0, (int)prepared.finished);
+    CuAssertIntEquals(ct, 0, (int)prepared.cancelled);
+    kdtree_free_query(result);
+
+    memset(&leased, 0, sizeof(leased));
+    leased.kd = kd;
+    memset(&prepared, 0, sizeof(prepared));
+    prepared.planned.kd = kd;
+    prepared.delivered = &leased;
+    prepared.finish_unavailable = 1;
+    result = kdtree_rangesearch_direct_dss_leased(
+        kd,
+        NULL,
+        query,
+        4.0,
+        options,
+        7U,
+        3U,
+        direct_leased_capture_read,
+        direct_leased_capture_release,
+        &leased,
+        NULL,
+        &lookahead);
+    CuAssertPtrNotNull(ct, result);
+    CuAssertIntEquals(
+        ct, (int)planned.nbatches, (int)leased.nbatches);
+    CuAssertIntEquals(
+        ct, (int)planned.nrequests, (int)leased.releases);
+    CuAssertIntEquals(
+        ct, (int)prepared.submitted, (int)prepared.finished);
+    CuAssertIntEquals(ct, 0, (int)prepared.cancelled);
+    kdtree_free_query(result);
+
+    memset(&leased, 0, sizeof(leased));
+    leased.kd = kd;
+    memset(&prepared, 0, sizeof(prepared));
+    prepared.planned.kd = kd;
+    prepared.delivered = &leased;
+    prepared.finish_errno = ECANCELED;
+    errno = 0;
+    result = kdtree_rangesearch_direct_dss_leased(
+        kd,
+        NULL,
+        query,
+        4.0,
+        options,
+        7U,
+        3U,
+        direct_leased_capture_read,
+        direct_leased_capture_release,
+        &leased,
+        NULL,
+        &lookahead);
+    CuAssertPtrEquals(ct, NULL, result);
+    CuAssertIntEquals(ct, ECANCELED, errno);
+    CuAssertIntEquals(ct, 0, (int)leased.nbatches);
+    CuAssertIntEquals(ct, 1, (int)prepared.submitted);
+    CuAssertIntEquals(ct, 1, (int)prepared.finished);
+    CuAssertIntEquals(ct, 0, (int)prepared.cancelled);
+
     kdtree_free(kd);
 }
 

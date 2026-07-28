@@ -63,6 +63,31 @@ typedef void (*kdtree_direct_release_range_fn)(
     void* opaque,
     void* lease);
 
+/*
+ * Optional final-buffer delivery for one future canonical wave. Recoverable
+ * unavailability returns zero and leaves the demand reader authoritative.
+ * finish consumes its handle on every return. A successful finish returns
+ * normal leased ranges; libkd releases those leases through release_range()
+ * after reduction.
+ */
+typedef struct kdtree_direct_dss_lookahead {
+    void* opaque;
+    int (*submit)(
+        void* opaque,
+        const kdtree_direct_range_request_t* requests,
+        size_t nrequests,
+        void** handle);
+    int (*finish)(
+        void* opaque,
+        void* handle,
+        const kdtree_direct_range_request_t* requests,
+        size_t nrequests,
+        kdtree_direct_range_t* ranges);
+    void (*cancel)(
+        void* opaque,
+        void* handle);
+} kdtree_direct_dss_lookahead_t;
+
 typedef struct kdtree_direct_dss_task_input {
     const u16* data;
     double query[4];
@@ -149,6 +174,7 @@ kdtree_qres_t* kdtree_rangesearch_direct_dss_leased(
     kdtree_direct_read_leased_ranges_fn read_ranges,
     kdtree_direct_release_range_fn release_range,
     void* read_opaque,
-    const kdtree_direct_dss_executor_t* executor);
+    const kdtree_direct_dss_executor_t* executor,
+    const kdtree_direct_dss_lookahead_t* lookahead);
 
 #endif

@@ -970,14 +970,12 @@ int onefield_job_field_cache_begin(onefield_t* bp) {
     }
     cache = bp->job_field_cache;
     /*
-     * Active index ownership belongs to the outer scheduler. This slot is an
-     * exact one-entry handoff for optional next-index preparation only.
-     * Demand misses retain the original load, solve, and free lifecycle.
+     * Dynamic index claims cannot be predicted by the old one-entry handoff.
+     * Preparing a guessed path can duplicate the owner's demand load and
+     * compete with current-index payload delivery. Keep this lane dormant;
+     * bounded preparation must be driven by an actual reserved claim.
      */
-    cache->index_entry_budget =
-        bp->index_shard_workers > 1
-            ? 1U
-            : 0U;
+    cache->index_entry_budget = 0U;
     cache->index_virtual_budget =
         cache->index_entry_budget
             ? onefield_index_cache_budget()

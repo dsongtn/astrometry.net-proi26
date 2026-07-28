@@ -206,11 +206,17 @@ qfits_header* startree_header(const startree_t* s);
 
 int startree_get(startree_t* s, int starid, double *p_xyz);
 
-// Synchronously warms bounded coordinate ranges through the separate payload
-// fd. The subsequent mapped lookup remains authoritative.
+// Compatibility advisory wrapper. Returns zero unless validation or delivery
+// fails. The subsequent mapped lookup remains authoritative.
 int startree_prefetch_stars(startree_t* s,
                             const unsigned int* starids,
                             int nstars);
+
+// Strict internal preparation contract: positive means every requested row is
+// ready, zero means inapplicable, and -1 means complete preparation failed.
+int startree_prepare_stars(startree_t* s,
+                           const unsigned int* starids,
+                           int nstars);
 
 /*
  * Submit a complete bounded set of StarKD coordinate rows to the payload

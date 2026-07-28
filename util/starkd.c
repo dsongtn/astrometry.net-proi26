@@ -3,6 +3,7 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -476,9 +477,8 @@ void startree_compute_inverse_perm(startree_t* s) {
 
     /*
      * kdtree_inverse_permutation() is a compulsory sequential sweep over
-     * PERM. The production compute VMA is NORMAL. This range-local guard is
-     * retained for compatibility with controlled alternate-policy tests;
-     * DATA and every unrelated FITS chunk retain their current policy.
+     * PERM. Apply NORMAL only to this range for the duration of the sweep;
+     * DATA and every unrelated FITS chunk retain the current index policy.
      */
     if (s->tree->perm && s->tree->io) {
         fb = (fitsbin_t*)s->tree->io;
@@ -698,13 +698,15 @@ static int startree_data_index(startree_t* s, int starid) {
     return starid;
 }
 
-int startree_prefetch_stars(startree_t* s,
+int startree_prepare_stars(startree_t* s,
                             const unsigned int* starids,
                             int nstars) {
     fitsbin_prefetch_range_t ranges[160];
     fitsbin_t* fb;
     size_t row_size;
-    int accepted;
+    size_t byte_budget;
+    size_t per_range_budget;
+    long detected_page_size;
     int i;
 
     if (!s || !s->tree || !starids || nstars <= 0 ||
@@ -712,40 +714,58 @@ int startree_prefetch_stars(startree_t* s,
         !s->tree->data.any || Ndata(s) <= 0) {
         return 0;
     }
-
+    if ((size_t)nstars > sizeof(ranges) / sizeof(ranges[0])) {
+        errno = E2BIG;
+        return -1;
+    }
+    detected_page_size = sysconf(_SC_PAGESIZE);
+    if (detected_page_size <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
     fb = s->tree->io;
     row_size = kdtree_sizeof_data(s->tree) / (size_t)Ndata(s);
-    if (!row_size) {
-        return 0;
+    if (!row_size || (size_t)detected_page_size >
+        (SIZE_MAX - row_size) / 2U) {
+        errno = EOVERFLOW;
+        return -1;
     }
-    accepted = MIN(
-        nstars,
-        (int)(sizeof(ranges) / sizeof(ranges[0])));
+    per_range_budget = row_size +
+        2U * (size_t)detected_page_size;
+    if ((size_t)nstars > SIZE_MAX / per_range_budget) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    byte_budget = (size_t)nstars * per_range_budget;
 
-    for (i = 0; i < accepted; i++) {
+    for (i = 0; i < nstars; i++) {
         int data_index;
-        void* row;
 
         if (starids[i] >= (unsigned int)Ndata(s)) {
+            errno = EINVAL;
             return -1;
         }
-
         data_index = startree_data_index(s, (int)starids[i]);
         if (data_index < 0) {
             return -1;
         }
-
-        row = kdtree_get_data(s->tree, data_index);
-        ranges[i].data = row;
+        ranges[i].data = kdtree_get_data(s->tree, data_index);
         ranges[i].size = row_size;
     }
-
-    (void)fitsbin_prefetch_ranges(
+    return fitsbin_prefetch_ranges(
         fb,
         ranges,
-        (size_t)accepted,
-        512U * 1024U);
-    return 0;
+        (size_t)nstars,
+        byte_budget);
+}
+
+int startree_prefetch_stars(startree_t* s,
+                            const unsigned int* starids,
+                            int nstars) {
+    int status = startree_prepare_stars(
+        s, starids, nstars);
+
+    return status < 0 ? -1 : 0;
 }
 
 int startree_prefetch_stars_submit(
@@ -759,10 +779,10 @@ int startree_prefetch_stars_submit(
     size_t byte_budget;
     size_t per_range_budget;
     long detected_page_size;
-    int accepted;
     int i;
 
     if (!ticket) {
+        errno = EINVAL;
         return -1;
     }
     *ticket = NULL;
@@ -771,35 +791,40 @@ int startree_prefetch_stars_submit(
         !s->tree->data.any || Ndata(s) <= 0) {
         return 0;
     }
+    if ((size_t)nstars > sizeof(ranges) / sizeof(ranges[0])) {
+        errno = E2BIG;
+        return -1;
+    }
     detected_page_size = sysconf(_SC_PAGESIZE);
     if (detected_page_size <= 0) {
-        return 0;
+        errno = EINVAL;
+        return -1;
     }
     row_size = kdtree_sizeof_data(s->tree) / (size_t)Ndata(s);
     if (!row_size || (size_t)detected_page_size >
         (SIZE_MAX - row_size) / 2U) {
-        return 0;
+        errno = EOVERFLOW;
+        return -1;
     }
-    accepted = MIN(
-        nstars,
-        (int)(sizeof(ranges) / sizeof(ranges[0])));
     per_range_budget = row_size +
         2U * (size_t)detected_page_size;
-    if ((size_t)accepted > SIZE_MAX / per_range_budget) {
-        return 0;
+    if ((size_t)nstars > SIZE_MAX / per_range_budget) {
+        errno = EOVERFLOW;
+        return -1;
     }
-    byte_budget = (size_t)accepted * per_range_budget;
+    byte_budget = (size_t)nstars * per_range_budget;
     fb = s->tree->io;
 
-    for (i = 0; i < accepted; i++) {
+    for (i = 0; i < nstars; i++) {
         int data_index;
 
         if (starids[i] >= (unsigned int)Ndata(s)) {
-            return 0;
+            errno = EINVAL;
+            return -1;
         }
         data_index = startree_data_index(s, (int)starids[i]);
         if (data_index < 0) {
-            return 0;
+            return -1;
         }
         ranges[i].data = kdtree_get_data(s->tree, data_index);
         ranges[i].size = row_size;
@@ -807,7 +832,7 @@ int startree_prefetch_stars_submit(
     return fitsbin_prefetch_ranges_submit(
         fb,
         ranges,
-        (size_t)accepted,
+        (size_t)nstars,
         byte_budget,
         ticket);
 }

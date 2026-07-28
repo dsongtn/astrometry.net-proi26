@@ -194,10 +194,8 @@ fitsbin_mmap_policy_t fitsbin_mmap_policy_parse(
 
 fitsbin_mmap_policy_t fitsbin_get_configured_mmap_policy(void) {
     /*
-     * W2+ shard and preparation threads install RANDOM as the sparse payload
-     * policy. Compact traversal topology remains NORMAL through the chunk
-     * classification below. Serial callers have no thread-local advice and
-     * retain NORMAL for every component.
+     * W2+ shard and preparation threads install RANDOM for every mapped index
+     * chunk. Serial callers have no thread-local advice and retain NORMAL.
      */
     return FITSBIN_MMAP_POLICY_FIXED_RANDOM;
 }
@@ -261,13 +259,10 @@ fitsbin_mmap_advice_t fitsbin_get_chunk_mmap_advice(
     }
 
     /*
-     * Tree topology is repeatedly traversed in address-correlated order.
-     * Applying the sparse payload policy here disables useful kernel
-     * readahead and turns topology descent into synchronous one-page faults.
+     * Region metadata is descriptive only. Every chunk follows the selected
+     * index policy so production RANDOM behavior is complete and predictable.
+     * Genuine full-range operations apply and restore their own local advice.
      */
-    if (chunk->mmap_region == FITSBIN_MMAP_REGION_TOPOLOGY) {
-        return FITSBIN_MMAP_ADVICE_NORMAL;
-    }
     return fitsbin_get_mmap_advice(fb);
 }
 
@@ -479,6 +474,62 @@ typedef struct fitsbin_prepared_pread_range {
     void* destination;
 } fitsbin_prepared_pread_range_t;
 
+static int fitsbin_compare_prepared_pread_range(
+    const void* left,
+    const void* right) {
+    const fitsbin_prepared_pread_range_t* lhs = left;
+    const fitsbin_prepared_pread_range_t* rhs = right;
+
+    if (lhs->offset < rhs->offset) {
+        return -1;
+    }
+    if (lhs->offset > rhs->offset) {
+        return 1;
+    }
+    if (lhs->size < rhs->size) {
+        return -1;
+    }
+    if (lhs->size > rhs->size) {
+        return 1;
+    }
+    return 0;
+}
+
+static anbool fitsbin_prepared_pread_destinations_disjoint(
+    const fitsbin_prepared_pread_range_t* ranges,
+    size_t range_count) {
+    size_t i;
+
+    if (!ranges) {
+        return FALSE;
+    }
+    for (i = 0U; i < range_count; i++) {
+        uintptr_t begin = (uintptr_t)ranges[i].destination;
+        uintptr_t end;
+        size_t j;
+
+        if (ranges[i].size > UINTPTR_MAX - begin) {
+            return FALSE;
+        }
+        end = begin + ranges[i].size;
+        for (j = 0U; j < i; j++) {
+            uintptr_t other_begin =
+                (uintptr_t)ranges[j].destination;
+            uintptr_t other_end;
+
+            if (ranges[j].size >
+                UINTPTR_MAX - other_begin) {
+                return FALSE;
+            }
+            other_end = other_begin + ranges[j].size;
+            if (begin < other_end && other_begin < end) {
+                return FALSE;
+            }
+        }
+    }
+    return TRUE;
+}
+
 typedef enum fitsbin_payload_io_ticket_kind {
     FITSBIN_PAYLOAD_IO_TICKET_PREFETCH = 0,
     FITSBIN_PAYLOAD_IO_TICKET_DIRECT
@@ -525,6 +576,7 @@ static int fitsbin_payload_io_limit = 1;
 static int fitsbin_payload_io_active = 0;
 static size_t fitsbin_payload_io_waiters = 0U;
 static size_t fitsbin_payload_io_wait_helpers = 0U;
+static size_t fitsbin_payload_io_wait_helpers_active = 0U;
 static unsigned int fitsbin_payload_io_helper_windows = 0U;
 static unsigned long long fitsbin_payload_io_work_epoch = 0ULL;
 static pthread_t
@@ -672,9 +724,14 @@ void fitsbin_payload_io_clear_thread_wait_helper(void) {
 }
 
 size_t fitsbin_payload_io_wait_helper_count(void) {
-    return __atomic_load_n(
+    size_t waiters = __atomic_load_n(
         &fitsbin_payload_io_wait_helpers,
         __ATOMIC_ACQUIRE);
+    size_t active = __atomic_load_n(
+        &fitsbin_payload_io_wait_helpers_active,
+        __ATOMIC_ACQUIRE);
+
+    return waiters > active ? waiters - active : 0U;
 }
 
 void fitsbin_payload_io_notify_wait_helpers(void) {
@@ -783,7 +840,15 @@ static unsigned long long fitsbin_payload_io_acquire(void) {
                     &fitsbin_payload_io_work_epoch,
                     __ATOMIC_ACQUIRE);
             fitsbin_payload_io_thread_wait_active = TRUE;
+            __atomic_add_fetch(
+                &fitsbin_payload_io_wait_helpers_active,
+                1U,
+                __ATOMIC_ACQ_REL);
             helped = helper(opaque);
+            __atomic_sub_fetch(
+                &fitsbin_payload_io_wait_helpers_active,
+                1U,
+                __ATOMIC_ACQ_REL);
             fitsbin_payload_io_thread_wait_active = FALSE;
             retry_helper = helped != 0;
             if (retry_helper) {
@@ -1286,6 +1351,15 @@ int fitsbin_pread_mapped_ranges(
         }
         page_count += page_span + 1ULL;
     }
+    if (range_count > 1U &&
+        fitsbin_prepared_pread_destinations_disjoint(
+            prepared, range_count)) {
+        qsort(
+            prepared,
+            range_count,
+            sizeof(prepared[0]),
+            fitsbin_compare_prepared_pread_range);
+    }
     fd = fitsbin_payload_fd_get(fb);
     if (fd < 0) {
         return -1;
@@ -1480,6 +1554,15 @@ static int fitsbin_prepare_direct_ranges(
     *physical_bytes_out = physical_bytes;
     *logical_bytes_out = logical_bytes;
     *page_count_out = page_count;
+    if (range_count > 1U &&
+        fitsbin_prepared_pread_destinations_disjoint(
+            prepared, range_count)) {
+        qsort(
+            prepared,
+            range_count,
+            sizeof(prepared[0]),
+            fitsbin_compare_prepared_pread_range);
+    }
     return 0;
 }
 
@@ -1525,17 +1608,23 @@ static int fitsbin_prepare_prefetch_spans(
     }
     *span_count = 0U;
     *byte_count = 0U;
-    if (!fb || !ranges || !range_count || !byte_budget || !spans) {
+    if (!range_count) {
         return 0;
     }
+    if (!fb || !ranges || !byte_budget || !spans) {
+        errno = EINVAL;
+        return -1;
+    }
     if (range_count > FITSBIN_PREFETCH_RANGE_LIMIT) {
-        range_count = FITSBIN_PREFETCH_RANGE_LIMIT;
+        errno = E2BIG;
+        return -1;
     }
     page_size = fb->mmap_page_size;
     if (!page_size) {
         long detected = sysconf(_SC_PAGESIZE);
 
         if (detected <= 0) {
+            errno = EINVAL;
             return -1;
         }
         page_size = (size_t)detected;
@@ -1553,18 +1642,23 @@ static int fitsbin_prepare_prefetch_spans(
         off_t aligned_end;
 
         if (!ranges[i].data || !ranges[i].size) {
-            continue;
+            errno = EINVAL;
+            return -1;
         }
         chunk = fitsbin_find_data_chunk(
             fb,
             ranges[i].data,
             ranges[i].size,
             &chunk_offset);
-        if (!chunk ||
-            chunk_offset > (size_t)LLONG_MAX ||
+        if (!chunk) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (chunk_offset > (size_t)LLONG_MAX ||
             chunk->data_file_offset >
                 (off_t)LLONG_MAX - (off_t)chunk_offset) {
-            continue;
+            errno = EOVERFLOW;
+            return -1;
         }
         begin = chunk->data_file_offset +
             (off_t)chunk_offset;
@@ -1572,7 +1666,8 @@ static int fitsbin_prepare_prefetch_spans(
             begin >
                 (off_t)LLONG_MAX -
                     (off_t)ranges[i].size) {
-            continue;
+            errno = EOVERFLOW;
+            return -1;
         }
         end = begin + (off_t)ranges[i].size;
         aligned_begin =
@@ -1593,15 +1688,14 @@ static int fitsbin_prepare_prefetch_spans(
             aligned_end = source.st_size;
         }
         if (aligned_end <= aligned_begin) {
-            continue;
+            errno = EINVAL;
+            return -1;
         }
         spans[accepted].begin = aligned_begin;
         spans[accepted].end = aligned_end;
         accepted++;
     }
-    if (!accepted) {
-        return 0;
-    }
+
     qsort(
         spans,
         accepted,
@@ -1618,18 +1712,18 @@ static int fitsbin_prepare_prefetch_spans(
         }
         spans[merged++] = spans[i];
     }
-    accepted = 0U;
     for (i = 0U; i < merged; i++) {
         size_t span_bytes =
             (size_t)(spans[i].end - spans[i].begin);
 
-        if (span_bytes > byte_budget - actual_bytes) {
-            break;
+        if (actual_bytes > byte_budget ||
+            span_bytes > byte_budget - actual_bytes) {
+            errno = E2BIG;
+            return -1;
         }
-        spans[accepted++] = spans[i];
         actual_bytes += span_bytes;
     }
-    *span_count = accepted;
+    *span_count = merged;
     *byte_count = actual_bytes;
     return 0;
 }
@@ -2211,6 +2305,14 @@ int fitsbin_prefetch_ranges_submit(
         return -1;
     }
     *ticket_out = NULL;
+    if (!fb || !ranges || !range_count || !byte_budget) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (range_count > FITSBIN_PREFETCH_RANGE_LIMIT) {
+        errno = E2BIG;
+        return -1;
+    }
     if (fitsbin_payload_is_fully_resident(fb)) {
         return 0;
     }
@@ -2229,7 +2331,7 @@ int fitsbin_prefetch_ranges_submit(
     ticket->fd = -1;
     ticket->state = FITSBIN_PAYLOAD_IO_PLANNED;
     ticket->kind = FITSBIN_PAYLOAD_IO_TICKET_PREFETCH;
-    ticket->priority = FITSBIN_PAYLOAD_IO_PRIORITY_SPECULATIVE;
+    ticket->priority = FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT;
     if (fitsbin_prepare_prefetch_spans(
             fb,
             ranges,
@@ -2337,9 +2439,17 @@ static int fitsbin_payload_io_ticket_wait_internal(
                     &fitsbin_payload_io_work_epoch,
                     __ATOMIC_ACQUIRE);
             fitsbin_payload_io_thread_wait_active = TRUE;
+            __atomic_add_fetch(
+                &fitsbin_payload_io_wait_helpers_active,
+                1U,
+                __ATOMIC_ACQ_REL);
             pthread_mutex_unlock(&fitsbin_payload_io_mutex);
             helped = helper(helper_opaque);
             pthread_mutex_lock(&fitsbin_payload_io_mutex);
+            __atomic_sub_fetch(
+                &fitsbin_payload_io_wait_helpers_active,
+                1U,
+                __ATOMIC_ACQ_REL);
             fitsbin_payload_io_thread_wait_active = FALSE;
             retry_helper = helped != 0;
             if (retry_helper) {
@@ -2499,6 +2609,14 @@ int fitsbin_prefetch_ranges(
     int fd;
     int rc = 0;
 
+    if (!fb || !ranges || !range_count || !byte_budget) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (range_count > FITSBIN_PREFETCH_RANGE_LIMIT) {
+        errno = E2BIG;
+        return -1;
+    }
     if (fitsbin_payload_is_fully_resident(fb)) {
         return 0;
     }
@@ -3269,7 +3387,7 @@ int fitsbin_set_mmap_advice(
     }
 
     /*
-     * Reapply the payload transition without changing traversal topology.
+     * Reapply the selected index policy to every existing mapped chunk.
      * Use the same chunk traversal expression used by fitsbin_close().
      */
     for (i = 0; i < bl_size(fb->chunks); i++) {

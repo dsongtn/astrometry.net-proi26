@@ -3,6 +3,7 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
@@ -368,44 +369,70 @@ int quadfile_get_stars(const quadfile_t* qf, unsigned int quadid, unsigned int* 
     return 0;
 }
 
-int quadfile_prefetch_stars(const quadfile_t* qf,
+int quadfile_prepare_stars(const quadfile_t* qf,
                             const unsigned int* quadids,
                             int nquads) {
     fitsbin_prefetch_range_t ranges[32];
     size_t row_size;
-    int accepted;
+    size_t byte_budget;
+    size_t per_range_budget;
+    long detected_page_size;
     int i;
 
-    if (!qf || !quadids || nquads <= 0 || !qf->quadarray) {
+    if (!qf || !quadids || nquads <= 0 || !qf->fb ||
+        !qf->quadarray || qf->dimquads <= 0 ||
+        (size_t)qf->dimquads > SIZE_MAX / sizeof(uint32_t)) {
         return 0;
     }
-
+    if ((size_t)nquads > sizeof(ranges) / sizeof(ranges[0])) {
+        errno = E2BIG;
+        return -1;
+    }
+    detected_page_size = sysconf(_SC_PAGESIZE);
+    if (detected_page_size <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
     row_size = (size_t)qf->dimquads * sizeof(uint32_t);
-    accepted = MIN(nquads, (int)(sizeof(ranges) / sizeof(ranges[0])));
+    if ((size_t)detected_page_size >
+        (SIZE_MAX - row_size) / 2U) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    per_range_budget = row_size +
+        2U * (size_t)detected_page_size;
+    if ((size_t)nquads > SIZE_MAX / per_range_budget) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    byte_budget = (size_t)nquads * per_range_budget;
 
-    for (i = 0; i < accepted; i++) {
+    for (i = 0; i < nquads; i++) {
         const uint32_t* row;
 
         if (quadids[i] >= qf->numquads) {
+            errno = EINVAL;
             return -1;
         }
-
         row = qf->quadarray +
             (size_t)quadids[i] * (size_t)qf->dimquads;
         ranges[i].data = row;
         ranges[i].size = row_size;
     }
-
-    /*
-     * Exact acquisition is advisory.  A refused/unsupported reader leaves the
-     * normal mmap path authoritative for scientific behavior.
-     */
-    (void)fitsbin_prefetch_ranges(
+    return fitsbin_prefetch_ranges(
         qf->fb,
         ranges,
-        (size_t)accepted,
-        256U * 1024U);
-    return 0;
+        (size_t)nquads,
+        byte_budget);
+}
+
+int quadfile_prefetch_stars(const quadfile_t* qf,
+                            const unsigned int* quadids,
+                            int nquads) {
+    int status = quadfile_prepare_stars(
+        qf, quadids, nquads);
+
+    return status < 0 ? -1 : 0;
 }
 
 int quadfile_prefetch_stars_submit(
@@ -418,10 +445,10 @@ int quadfile_prefetch_stars_submit(
     size_t byte_budget;
     size_t per_range_budget;
     long detected_page_size;
-    int accepted;
     int i;
 
     if (!ticket) {
+        errno = EINVAL;
         return -1;
     }
     *ticket = NULL;
@@ -430,30 +457,35 @@ int quadfile_prefetch_stars_submit(
         (size_t)qf->dimquads > SIZE_MAX / sizeof(uint32_t)) {
         return 0;
     }
+    if ((size_t)nquads > sizeof(ranges) / sizeof(ranges[0])) {
+        errno = E2BIG;
+        return -1;
+    }
     detected_page_size = sysconf(_SC_PAGESIZE);
     if (detected_page_size <= 0) {
-        return 0;
+        errno = EINVAL;
+        return -1;
     }
     row_size = (size_t)qf->dimquads * sizeof(uint32_t);
     if ((size_t)detected_page_size >
         (SIZE_MAX - row_size) / 2U) {
-        return 0;
+        errno = EOVERFLOW;
+        return -1;
     }
-    accepted = MIN(
-        nquads,
-        (int)(sizeof(ranges) / sizeof(ranges[0])));
     per_range_budget = row_size +
         2U * (size_t)detected_page_size;
-    if ((size_t)accepted > SIZE_MAX / per_range_budget) {
-        return 0;
+    if ((size_t)nquads > SIZE_MAX / per_range_budget) {
+        errno = EOVERFLOW;
+        return -1;
     }
-    byte_budget = (size_t)accepted * per_range_budget;
+    byte_budget = (size_t)nquads * per_range_budget;
 
-    for (i = 0; i < accepted; i++) {
+    for (i = 0; i < nquads; i++) {
         const uint32_t* row;
 
         if (quadids[i] >= qf->numquads) {
-            return 0;
+            errno = EINVAL;
+            return -1;
         }
         row = qf->quadarray +
             (size_t)quadids[i] * (size_t)qf->dimquads;
@@ -463,7 +495,7 @@ int quadfile_prefetch_stars_submit(
     return fitsbin_prefetch_ranges_submit(
         qf->fb,
         ranges,
-        (size_t)accepted,
+        (size_t)nquads,
         byte_budget,
         ticket);
 }

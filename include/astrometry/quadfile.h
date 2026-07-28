@@ -58,11 +58,17 @@ int quadfile_check(const quadfile_t* qf);
 int quadfile_get_stars(const quadfile_t* qf, unsigned int quadid,
                        unsigned int* stars);
 
-// Synchronously warms bounded row ranges through the separate payload fd.
-// The subsequent mapped lookup remains authoritative.
+// Compatibility advisory wrapper. Returns zero unless validation or delivery
+// fails. The subsequent mapped lookup remains authoritative.
 int quadfile_prefetch_stars(const quadfile_t* qf,
                             const unsigned int* quadids,
                             int nquads);
+
+// Strict internal preparation contract: positive means every requested row is
+// ready, zero means inapplicable, and -1 means complete preparation failed.
+int quadfile_prepare_stars(const quadfile_t* qf,
+                           const unsigned int* quadids,
+                           int nquads);
 
 /*
  * Submit a complete bounded set of Quad rows to the payload loader. The

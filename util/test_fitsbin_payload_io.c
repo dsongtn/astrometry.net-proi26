@@ -24,6 +24,7 @@
 
 typedef enum payload_wrapper_mode {
     PAYLOAD_WRAPPER_PASS,
+    PAYLOAD_WRAPPER_RECORD,
     PAYLOAD_WRAPPER_SHORT,
     PAYLOAD_WRAPPER_EOF,
     PAYLOAD_WRAPPER_BLOCK
@@ -152,6 +153,9 @@ ssize_t __wrap_pread64(
     }
     pthread_mutex_unlock(&payload_wrapper.mutex);
 
+    if (mode == PAYLOAD_WRAPPER_RECORD) {
+        return __real_pread64(fd, destination, size, offset);
+    }
     if (mode == PAYLOAD_WRAPPER_SHORT) {
         if (call == 0) {
             errno = EINTR;
@@ -791,6 +795,80 @@ void test_fitsbin_payload_async_loader_overlap(CuTest* ct) {
     payload_fixture_close(&fixture);
 }
 
+void test_fitsbin_payload_exact_range_order(CuTest* ct) {
+    payload_fixture_t fixture;
+    fitsbin_pread_range_t ranges[2];
+    unsigned char first[11];
+    unsigned char second[17];
+    unsigned char overlap[8];
+    off_t offsets[2];
+    int calls;
+    int rc;
+
+    CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
+    ranges[0].data =
+        (const unsigned char*)fixture.chunk->data + 31U;
+    ranges[0].size = sizeof(first);
+    ranges[0].logical_size = sizeof(first);
+    ranges[0].destination = first;
+    ranges[1].data =
+        (const unsigned char*)fixture.chunk->data + 3U;
+    ranges[1].size = sizeof(second);
+    ranges[1].logical_size = sizeof(second);
+    ranges[1].destination = second;
+
+    payload_wrapper_reset(PAYLOAD_WRAPPER_RECORD);
+    rc = fitsbin_pread_mapped_ranges(
+        fixture.fitsbin, ranges, 2U);
+    pthread_mutex_lock(&payload_wrapper.mutex);
+    calls = payload_wrapper.calls;
+    offsets[0] = payload_wrapper.offsets[0];
+    offsets[1] = payload_wrapper.offsets[1];
+    pthread_mutex_unlock(&payload_wrapper.mutex);
+    payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
+
+    CuAssertIntEquals(ct, 0, rc);
+    CuAssertIntEquals(ct, 2, calls);
+    CuAssert(ct, "exact ranges were not ordered by file offset",
+        offsets[0] == fixture.chunk->data_file_offset + 3 &&
+        offsets[1] == fixture.chunk->data_file_offset + 31);
+    CuAssert(ct, "first ordered destination has wrong bytes",
+        !memcmp(first, fixture.bytes + 31U, sizeof(first)));
+    CuAssert(ct, "second ordered destination has wrong bytes",
+        !memcmp(second, fixture.bytes + 3U, sizeof(second)));
+
+    ranges[0].data =
+        (const unsigned char*)fixture.chunk->data + 31U;
+    ranges[0].size = sizeof(overlap);
+    ranges[0].logical_size = sizeof(overlap);
+    ranges[0].destination = overlap;
+    ranges[1].data =
+        (const unsigned char*)fixture.chunk->data + 3U;
+    ranges[1].size = sizeof(overlap);
+    ranges[1].logical_size = sizeof(overlap);
+    ranges[1].destination = overlap;
+
+    payload_wrapper_reset(PAYLOAD_WRAPPER_RECORD);
+    rc = fitsbin_pread_mapped_ranges(
+        fixture.fitsbin, ranges, 2U);
+    pthread_mutex_lock(&payload_wrapper.mutex);
+    calls = payload_wrapper.calls;
+    offsets[0] = payload_wrapper.offsets[0];
+    offsets[1] = payload_wrapper.offsets[1];
+    pthread_mutex_unlock(&payload_wrapper.mutex);
+    payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
+
+    CuAssertIntEquals(ct, 0, rc);
+    CuAssertIntEquals(ct, 2, calls);
+    CuAssert(ct, "overlapping destinations changed caller order",
+        offsets[0] == fixture.chunk->data_file_offset + 31 &&
+        offsets[1] == fixture.chunk->data_file_offset + 3);
+    CuAssert(ct, "overlapping destination changed final bytes",
+        !memcmp(overlap, fixture.bytes + 3U, sizeof(overlap)));
+
+    payload_fixture_close(&fixture);
+}
+
 void test_fitsbin_payload_async_direct_destination(CuTest* ct) {
     payload_fixture_t fixture;
     fitsbin_pread_range_t ranges[2];
@@ -808,6 +886,8 @@ void test_fitsbin_payload_async_direct_destination(CuTest* ct) {
     int async_warm;
     int sync_warm;
     int waited = -1;
+    int calls;
+    off_t offsets[2];
 
     CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
     fitsbin_payload_set_thread_full_resident();
@@ -823,12 +903,12 @@ void test_fitsbin_payload_async_direct_destination(CuTest* ct) {
     memcpy(untouched_first, first, sizeof(first));
     memcpy(untouched_second, second, sizeof(second));
     ranges[0].data =
-        (const unsigned char*)fixture.chunk->data + 3U;
+        (const unsigned char*)fixture.chunk->data + 31U;
     ranges[0].size = sizeof(first);
     ranges[0].logical_size = 7U;
     ranges[0].destination = first;
     ranges[1].data =
-        (const unsigned char*)fixture.chunk->data + 31U;
+        (const unsigned char*)fixture.chunk->data + 3U;
     ranges[1].size = sizeof(second);
     ranges[1].logical_size = 13U;
     ranges[1].destination = second;
@@ -860,6 +940,7 @@ void test_fitsbin_payload_async_direct_destination(CuTest* ct) {
         "over-budget direct preparation wrote second destination",
         !memcmp(second, untouched_second, sizeof(second)));
 
+    payload_wrapper_reset(PAYLOAD_WRAPPER_RECORD);
     submitted = fitsbin_pread_mapped_ranges_submit(
         fixture.fitsbin,
         ranges,
@@ -873,6 +954,12 @@ void test_fitsbin_payload_async_direct_destination(CuTest* ct) {
         fitsbin_payload_io_ticket_destroy(ticket);
         ticket = NULL;
     }
+    pthread_mutex_lock(&payload_wrapper.mutex);
+    calls = payload_wrapper.calls;
+    offsets[0] = payload_wrapper.offsets[0];
+    offsets[1] = payload_wrapper.offsets[1];
+    pthread_mutex_unlock(&payload_wrapper.mutex);
+    payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
     warm.data = fixture.chunk->data;
     warm.size = sizeof(fixture.bytes);
     async_warm = fitsbin_prefetch_ranges_submit(
@@ -896,14 +983,18 @@ void test_fitsbin_payload_async_direct_destination(CuTest* ct) {
     CuAssertIntEquals(ct, 0, async_warm);
     CuAssertIntEquals(ct, 0, sync_warm);
     CuAssertPtrEquals(ct, NULL, ticket);
+    CuAssertIntEquals(ct, 2, calls);
+    CuAssert(ct, "async exact ranges were not ordered by file offset",
+        offsets[0] == fixture.chunk->data_file_offset + 3 &&
+        offsets[1] == fixture.chunk->data_file_offset + 31);
     CuAssert(
         ct,
         "first async direct destination has wrong bytes",
-        !memcmp(first, fixture.bytes + 3U, sizeof(first)));
+        !memcmp(first, fixture.bytes + 31U, sizeof(first)));
     CuAssert(
         ct,
         "second async direct destination has wrong bytes",
-        !memcmp(second, fixture.bytes + 31U, sizeof(second)));
+        !memcmp(second, fixture.bytes + 3U, sizeof(second)));
     CuAssertIntEquals(ct, 1, (int)stats.read_batches);
     CuAssertIntEquals(ct, 2, (int)stats.read_calls);
     CuAssertIntEquals(

@@ -1090,10 +1090,15 @@ static void engine_limit_memory_by_address_space(
             ? limit_bytes - current_bytes : 0U);
 }
 
+static anbool engine_job_local_residency_enabled(void) {
+    return FALSE;
+}
+
 static index_residency_t* engine_index_residency_begin(
     engine_t* engine,
     const onefield_t* bp) {
     index_residency_t* service = NULL;
+    index_residency_stats_t residency_stats;
     size_t cohort_bytes;
     size_t cohort_files;
     size_t available_bytes;
@@ -1108,8 +1113,24 @@ static index_residency_t* engine_index_residency_begin(
     long page_size;
     int i;
 
-    if (!engine || !bp || bp->index_shard_workers <= 1 ||
-        engine_index_cohort_measure(
+    if (!engine || !bp || bp->index_shard_workers <= 1) {
+        return NULL;
+    }
+
+    /*
+     * The current service copies the complete cohort inside the solve wall
+     * clock, blocks without solver-limit polling, and marks reclaimable memfd
+     * pages as permanently resident. Keep exact demand delivery authoritative
+     * until residency has a persistent pre-job lifecycle and recoverable page
+     * state.
+     */
+    if (!engine_job_local_residency_enabled()) {
+        logverb("[index-residency] mode=exact-demand "
+                "reason=job-local-residency-quarantined\n");
+        return NULL;
+    }
+
+    if (engine_index_cohort_measure(
             engine, &cohort_bytes, &cohort_files) ||
         !cohort_files || !cohort_bytes ||
         engine_available_memory(&available_bytes)) {
@@ -1193,7 +1214,7 @@ static index_residency_t* engine_index_residency_begin(
         prepare_status = index_residency_prepare(
             service,
             index->indexfn,
-            INDEX_RESIDENCY_PRIORITY_SPECULATIVE);
+            INDEX_RESIDENCY_PRIORITY_LOOKAHEAD);
         if (prepare_status != INDEX_RESIDENCY_ACCEPTED) {
             (void)index_residency_stop(service);
             logverb(
@@ -1201,6 +1222,21 @@ static index_residency_t* engine_index_residency_begin(
                 "reason=prepare-fallback\n");
             return NULL;
         }
+    }
+    if (index_residency_drain(service) ||
+        index_residency_get_stats(
+            service, &residency_stats) ||
+        residency_stats.ready_entries != cohort_files ||
+        residency_stats.ready_bytes != cohort_bytes ||
+        residency_stats.resident_bytes != cohort_bytes ||
+        residency_stats.loading_entries ||
+        residency_stats.loading_bytes ||
+        residency_stats.failed_entries) {
+        (void)index_residency_stop(service);
+        logverb(
+            "[index-residency] mode=exact-demand "
+            "reason=full-cohort-not-ready\n");
+        return NULL;
     }
     if (index_bind_residency_service(service)) {
         (void)index_residency_stop(service);

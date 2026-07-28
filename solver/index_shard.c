@@ -496,6 +496,12 @@ static size_t index_shard_affinity_get_entry(
   return i;
 }
 
+static anbool index_shard_affinity_has_retained_epochs(
+    const index_shard_pool_t* pool) {
+  (void)pool;
+  return FALSE;
+}
+
 static index_shard_affinity_domain_t*
 index_shard_affinity_prepare_pass(
     index_shard_pool_t* pool,
@@ -523,6 +529,17 @@ index_shard_affinity_prepare_pass(
     preferred_head[i] = SIZE_MAX;
     preferred_tail[i] = SIZE_MAX;
   }
+
+  /*
+   * Index epochs are task-local: done_with_index() unmaps every source-backed
+   * index after the current band. Worker identity therefore retains no private
+   * mapping, page table, or payload cache for the next band. Prefer canonical
+   * ready work until a future scheduler owns a real retained index epoch.
+   */
+  if (!index_shard_affinity_has_retained_epochs(pool)) {
+    return NULL;
+  }
+
   if (!bp || !hooks ||
       !hooks->get_index_identity) {
     return NULL;
@@ -626,12 +643,15 @@ static pthread_once_t index_shard_tls_once = PTHREAD_ONCE_INIT;
 static int index_shard_tls_key_status = EAGAIN;
 
 static size_t index_shard_inverse_cache_budget(void) {
-  const size_t ceiling = 128U * 1024U * 1024U;
+  struct rlimit address_limit;
   long available_pages;
   long page_size;
   size_t available_bytes;
   size_t budget;
 
+  if (sizeof(void*) < 8U) {
+    return 0U;
+  }
 #if defined(_SC_AVPHYS_PAGES)
   available_pages = sysconf(_SC_AVPHYS_PAGES);
 #else
@@ -645,8 +665,31 @@ static size_t index_shard_inverse_cache_budget(void) {
   }
   available_bytes =
       (size_t)available_pages * (size_t)page_size;
-  budget = available_bytes / 64U;
-  return MIN(budget, ceiling);
+
+  /*
+   * Inverse permutations replace compulsory full PERM sweeps in deeper bands,
+   * but remain recomputable heap state. Use a bounded share of current memory
+   * rather than the old fixed 128 MiB ceiling, which rejected useful entries
+   * independently of host size and configured cohort.
+   */
+  budget = available_bytes / 8U;
+#if defined(RLIMIT_AS)
+  if (getrlimit(RLIMIT_AS, &address_limit) == 0 &&
+      address_limit.rlim_cur != RLIM_INFINITY) {
+    uintmax_t finite_limit =
+        (uintmax_t)address_limit.rlim_cur;
+
+    finite_limit = MIN(
+        finite_limit,
+        (uintmax_t)SIZE_MAX);
+    budget = MIN(
+        budget,
+        (size_t)finite_limit / 8U);
+  }
+#else
+  (void)address_limit;
+#endif
+  return budget;
 }
 
 static int index_shard_inverse_source(
@@ -3559,11 +3602,10 @@ static int index_shard_claim_outer_locked(
 /*
  * Select one whole-index owner task from the current band.
  *
- * A worker first consumes its canonical-order list of exact indexes retained
- * from the previous depth at this scale. If none remains claimable, it steals
- * the canonical-lowest unstarted index. The preference is never a reservation:
- * a free worker starts useful outer work immediately. The explicit state map
- * permits affinity claims out of order while the reducer remains canonical.
+ * A worker claims the canonical-lowest unstarted index in the current band.
+ * Cross-band worker affinity is disabled while index epochs remain task-local;
+ * process-wide page cache and retained immutable state do not depend on worker
+ * identity. The explicit state map and reducer remain canonical.
  *
  * The old cross-owner AB executor is deliberately absent here. A worker with
  * no claimable outer index may claim a fixed, index-free package published by
@@ -5236,13 +5278,13 @@ static int index_shard_pool_submit(
 
   logverb("[index-shard] pthread-pool submit workers=%i pool_workers=%i "
           "candidates=%zu engine_pass=%zu depth_index=%zu scale_index=%zu "
-          "startobj=%i endobj=%i scheduler=affinity-first chunk=1 "
+          "startobj=%i endobj=%i scheduler=canonical-ready chunk=1 "
           "inner_scheduler=owner-helper-groups "
-          "mmap_pass=%u mmap_advice=%s mmap_topology=normal "
+          "mmap_pass=%u mmap_advice=%s mmap_scope=all-chunks "
           "mmap_policy=parallel-random-serial-normal "
           "page_delivery=bounded-pread-broker loader_lanes=%i "
           "payload_io=batched-pread-mmap-fallback credits=%i "
-          "outer_admission=full-owner-affinity\n",
+          "outer_admission=full-owner-canonical\n",
           worker_count,
           pool->worker_count,
           nindexes,
@@ -5510,7 +5552,7 @@ index_shard_solve_impl(onefield_t *bp,
     logerr("[index-shard] affinity ownership not committed "
            "after helper quiescence failure\n");
   }
-  logverb("[index-shard] affinity-pass generation=%lu "
+  logverb("[index-shard] ownership-pass generation=%lu "
           "scale_index=%zu familiar=%llu fallback=%llu "
           "reassigned=%llu unclaimed=%zu committed=%i\n",
           pool->generation,
@@ -5802,7 +5844,7 @@ index_shard_solve_impl(onefield_t *bp,
           state.master_committed);
 
   logverb("[index-shard] mmap-policy "
-         "policy=%s effective=%s topology=normal pass=%u "
+         "policy=%s effective=%s scope=all-chunks pass=%u "
          "clean_unsolved_passes=%u transitions=%u "
          "transitioned=%i completed=%i exhaustive=%i "
          "solved=%i cancelled=%i advice_failures=%llu\n",

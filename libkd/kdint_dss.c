@@ -380,8 +380,13 @@ typedef struct kdtree_direct_leased_state {
     kdtree_direct_release_range_fn release_range;
     void* read_opaque;
     const kdtree_direct_dss_executor_t* executor;
+    const kdtree_direct_dss_lookahead_t* lookahead;
     kdtree_direct_leased_group_t groups[KDTREE_DIRECT_DSS_WAVE_TASKS];
     size_t ngroups;
+    kdtree_direct_leased_group_t
+        pending_groups[KDTREE_DIRECT_DSS_WAVE_TASKS];
+    size_t npending_groups;
+    void* pending_handle;
 } kdtree_direct_leased_state_t;
 
 static void kdtree_direct_release_leased_range(
@@ -393,22 +398,21 @@ static void kdtree_direct_release_leased_range(
     memset(range, 0, sizeof(*range));
 }
 
-static int kdtree_direct_read_leased_groups(
-    kdtree_direct_leased_state_t* state,
-    kdtree_direct_range_t* ranges) {
-    kdtree_direct_range_request_t
-        requests[KDTREE_DIRECT_DSS_WAVE_TASKS];
+static int kdtree_direct_build_group_requests(
+    const kdtree_direct_leased_state_t* state,
+    const kdtree_direct_leased_group_t* groups,
+    size_t ngroups,
+    kdtree_direct_range_request_t* requests) {
     size_t group_index;
-    int saved_errno;
 
-    memset(ranges,
-           0,
-           KDTREE_DIRECT_DSS_WAVE_TASKS * sizeof(*ranges));
-    for (group_index = 0U;
-         group_index < state->ngroups;
-         group_index++) {
+    if (!state || !state->kd || !groups || !requests ||
+        !ngroups || ngroups > KDTREE_DIRECT_DSS_WAVE_TASKS) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (group_index = 0U; group_index < ngroups; group_index++) {
         const kdtree_direct_leased_group_t* group =
-            &state->groups[group_index];
+            &groups[group_index];
         int count = group->last - group->first + 1;
 
         if (group->first < 0 || group->last < group->first ||
@@ -419,15 +423,40 @@ static int kdtree_direct_read_leased_groups(
         requests[group_index].first = group->first;
         requests[group_index].count = count;
     }
+    return 0;
+}
+
+static int kdtree_direct_read_leased_groups(
+    kdtree_direct_leased_state_t* state,
+    const kdtree_direct_leased_group_t* groups,
+    size_t ngroups,
+    kdtree_direct_range_t* ranges) {
+    kdtree_direct_range_request_t
+        requests[KDTREE_DIRECT_DSS_WAVE_TASKS];
+    size_t group_index;
+    int saved_errno;
+
+    memset(ranges,
+           0,
+           KDTREE_DIRECT_DSS_WAVE_TASKS * sizeof(*ranges));
+    if (!groups || !ngroups ||
+        ngroups > KDTREE_DIRECT_DSS_WAVE_TASKS) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (kdtree_direct_build_group_requests(
+            state, groups, ngroups, requests)) {
+        return -1;
+    }
     if (state->read_ranges(state->read_opaque,
                            requests,
-                           state->ngroups,
+                           ngroups,
                            ranges)) {
         saved_errno = errno ? errno : EIO;
         goto fail;
     }
     for (group_index = 0U;
-         group_index < state->ngroups;
+         group_index < ngroups;
          group_index++) {
         kdtree_direct_range_t* range = &ranges[group_index];
 
@@ -444,7 +473,7 @@ static int kdtree_direct_read_leased_groups(
 
 fail:
     for (group_index = 0U;
-         group_index < state->ngroups;
+         group_index < ngroups;
          group_index++) {
         kdtree_direct_release_leased_range(
             state, &ranges[group_index]);
@@ -606,7 +635,10 @@ static int kdtree_direct_reduce_task_output(
 }
 
 static int kdtree_direct_process_leased_wave(
-    kdtree_direct_leased_state_t* state) {
+    kdtree_direct_leased_state_t* state,
+    const kdtree_direct_leased_group_t* groups,
+    size_t ngroups,
+    kdtree_direct_range_t* prepared_ranges) {
     kdtree_direct_range_t ranges[KDTREE_DIRECT_DSS_WAVE_TASKS];
     kdtree_direct_dss_task_input_t inputs[KDTREE_DIRECT_DSS_WAVE_TASKS];
     const kdtree_direct_dss_task_output_t* outputs = NULL;
@@ -617,15 +649,27 @@ static int kdtree_direct_process_leased_wave(
     anbool use_executor;
     int status = 0;
 
-    if (!state->ngroups) {
+    if (!ngroups) {
         return 0;
     }
+    if (!groups || ngroups > KDTREE_DIRECT_DSS_WAVE_TASKS) {
+        errno = EINVAL;
+        return -1;
+    }
     memset(ranges, 0, sizeof(ranges));
+    if (prepared_ranges) {
+        memcpy(ranges,
+               prepared_ranges,
+               ngroups * sizeof(ranges[0]));
+        memset(prepared_ranges,
+               0,
+               ngroups * sizeof(prepared_ranges[0]));
+    }
     for (group_index = 0U;
-         group_index < state->ngroups;
+         group_index < ngroups;
          group_index++) {
         const kdtree_direct_leased_group_t* group =
-            &state->groups[group_index];
+            &groups[group_index];
         size_t cover_points =
             (size_t)(group->last - group->first) + 1U;
 
@@ -636,23 +680,25 @@ static int kdtree_direct_process_leased_wave(
         }
     }
     use_executor = task_eligible && state->kd->ndim == 4 &&
-        state->ngroups >= KDTREE_DIRECT_DSS_WAVE_MIN_TASKS &&
+        ngroups >= KDTREE_DIRECT_DSS_WAVE_MIN_TASKS &&
         selected_points >= KDTREE_DIRECT_DSS_WAVE_MIN_POINTS &&
         state->executor && state->executor->available &&
         state->executor->run &&
         state->executor->available(state->executor->opaque) > 0U;
 
-    if (kdtree_direct_read_leased_groups(state, ranges)) {
+    if (!prepared_ranges &&
+        kdtree_direct_read_leased_groups(
+            state, groups, ngroups, ranges)) {
         status = -1;
         goto cleanup;
     }
-    loaded = state->ngroups;
+    loaded = ngroups;
     for (group_index = 0U;
-         group_index < state->ngroups;
+         group_index < ngroups;
          group_index++) {
         if (use_executor && kdtree_direct_prepare_task_input(
                 state,
-                &state->groups[group_index],
+                &groups[group_index],
                 &ranges[group_index],
                 &inputs[group_index])) {
             use_executor = FALSE;
@@ -660,11 +706,11 @@ static int kdtree_direct_process_leased_wave(
     }
     if (!use_executor) {
         for (group_index = 0U;
-             group_index < state->ngroups;
+             group_index < ngroups;
              group_index++) {
             if (kdtree_direct_reduce_inline_group(
                     state,
-                    &state->groups[group_index],
+                    &groups[group_index],
                     &ranges[group_index])) {
                 status = -1;
                 goto cleanup;
@@ -678,16 +724,16 @@ static int kdtree_direct_process_leased_wave(
     status = state->executor->run(
         state->executor->opaque,
         inputs,
-        state->ngroups,
+        ngroups,
         &outputs);
     if (status > 0) {
         status = 0;
         for (group_index = 0U;
-             group_index < state->ngroups;
+             group_index < ngroups;
              group_index++) {
             if (kdtree_direct_reduce_inline_group(
                     state,
-                    &state->groups[group_index],
+                    &groups[group_index],
                     &ranges[group_index])) {
                 status = -1;
                 goto cleanup;
@@ -703,11 +749,11 @@ static int kdtree_direct_process_leased_wave(
         goto cleanup;
     }
     for (group_index = 0U;
-         group_index < state->ngroups;
+         group_index < ngroups;
          group_index++) {
         if (kdtree_direct_reduce_task_output(
                 state,
-                &state->groups[group_index],
+                &groups[group_index],
                 &ranges[group_index],
                 &inputs[group_index],
                 &outputs[group_index])) {
@@ -721,8 +767,258 @@ cleanup:
         kdtree_direct_release_leased_range(
             state, &ranges[group_index]);
     }
-    state->ngroups = 0U;
     return status;
+}
+
+static int kdtree_direct_submit_leased_lookahead(
+    kdtree_direct_leased_state_t* state,
+    const kdtree_direct_leased_group_t* groups,
+    size_t ngroups,
+    void** handle) {
+    kdtree_direct_range_request_t
+        requests[KDTREE_DIRECT_DSS_WAVE_TASKS];
+    int saved_errno = errno;
+    int status;
+
+    if (!handle) {
+        errno = EINVAL;
+        return -1;
+    }
+    *handle = NULL;
+    if (!state->lookahead) {
+        return 0;
+    }
+    if (!state->lookahead->submit ||
+        !state->lookahead->finish ||
+        !state->lookahead->cancel) {
+        errno = EPROTO;
+        return -1;
+    }
+    if (kdtree_direct_build_group_requests(
+            state, groups, ngroups, requests)) {
+        return -1;
+    }
+    status = state->lookahead->submit(
+        state->lookahead->opaque,
+        requests,
+        ngroups,
+        handle);
+    if (status > 0 && *handle) {
+        return 1;
+    }
+    if (*handle) {
+        state->lookahead->cancel(
+            state->lookahead->opaque, *handle);
+        *handle = NULL;
+    }
+    if (status > 0) {
+        errno = EPROTO;
+        return -1;
+    }
+    if (!status) {
+        errno = saved_errno;
+    }
+    return status;
+}
+
+static int kdtree_direct_finish_leased_lookahead(
+    kdtree_direct_leased_state_t* state,
+    void** handle,
+    const kdtree_direct_leased_group_t* groups,
+    size_t ngroups,
+    kdtree_direct_range_t* ranges) {
+    kdtree_direct_range_request_t
+        requests[KDTREE_DIRECT_DSS_WAVE_TASKS];
+    void* pending;
+    size_t range_index;
+    int status;
+
+    memset(ranges,
+           0,
+           KDTREE_DIRECT_DSS_WAVE_TASKS * sizeof(*ranges));
+    if (!handle || !*handle) {
+        return 0;
+    }
+    pending = *handle;
+    *handle = NULL;
+    if (kdtree_direct_build_group_requests(
+            state, groups, ngroups, requests)) {
+        state->lookahead->cancel(
+            state->lookahead->opaque, pending);
+        return -1;
+    }
+    status = state->lookahead->finish(
+        state->lookahead->opaque,
+        pending,
+        requests,
+        ngroups,
+        ranges);
+    if (status > 0) {
+        for (range_index = 0U;
+             range_index < ngroups;
+             range_index++) {
+            if (!ranges[range_index].lease ||
+                !ranges[range_index].data ||
+                (state->kd->perm &&
+                 !ranges[range_index].perm)) {
+                errno = EPROTO;
+                status = -1;
+                break;
+            }
+        }
+    }
+    if (status <= 0) {
+        for (range_index = 0U;
+             range_index < ngroups;
+             range_index++) {
+            kdtree_direct_release_leased_range(
+                state, &ranges[range_index]);
+        }
+    }
+    return status;
+}
+
+/*
+ * Publish the previous canonical wave, submit the next one, then reduce the
+ * previous wave while its successor is loading. Publishing first lets the
+ * successor share overlapping cache entries instead of issuing duplicate I/O.
+ */
+static int kdtree_direct_advance_leased_pipeline(
+    kdtree_direct_leased_state_t* state) {
+    kdtree_direct_range_t
+        pending_ranges[KDTREE_DIRECT_DSS_WAVE_TASKS];
+    void* next_handle = NULL;
+    int next_status;
+    int pending_status = 0;
+
+    if (!state->ngroups) {
+        return 0;
+    }
+    if (state->npending_groups) {
+        pending_status = kdtree_direct_finish_leased_lookahead(
+            state,
+            &state->pending_handle,
+            state->pending_groups,
+            state->npending_groups,
+            pending_ranges);
+        if (pending_status < 0) {
+            state->npending_groups = 0U;
+            state->ngroups = 0U;
+            return -1;
+        }
+    }
+    next_status = kdtree_direct_submit_leased_lookahead(
+        state,
+        state->groups,
+        state->ngroups,
+        &next_handle);
+    if (next_status < 0) {
+        if (pending_status > 0) {
+            size_t range_index;
+
+            for (range_index = 0U;
+                 range_index < state->npending_groups;
+                 range_index++) {
+                kdtree_direct_release_leased_range(
+                    state, &pending_ranges[range_index]);
+            }
+        }
+        state->npending_groups = 0U;
+        state->ngroups = 0U;
+        return -1;
+    }
+    if (state->npending_groups) {
+        if (kdtree_direct_process_leased_wave(
+                state,
+                state->pending_groups,
+                state->npending_groups,
+                pending_status > 0 ? pending_ranges : NULL)) {
+            if (next_handle) {
+                state->lookahead->cancel(
+                    state->lookahead->opaque, next_handle);
+            }
+            state->npending_groups = 0U;
+            state->ngroups = 0U;
+            return -1;
+        }
+        state->npending_groups = 0U;
+    }
+    if (next_status > 0) {
+        memcpy(state->pending_groups,
+               state->groups,
+               state->ngroups * sizeof(state->groups[0]));
+        state->npending_groups = state->ngroups;
+        state->pending_handle = next_handle;
+    } else if (kdtree_direct_process_leased_wave(
+                   state,
+                   state->groups,
+                   state->ngroups,
+                   NULL)) {
+        state->ngroups = 0U;
+        return -1;
+    }
+    state->ngroups = 0U;
+    return 0;
+}
+
+static int kdtree_direct_finish_leased_pipeline(
+    kdtree_direct_leased_state_t* state) {
+    kdtree_direct_range_t
+        pending_ranges[KDTREE_DIRECT_DSS_WAVE_TASKS];
+    int pending_status;
+
+    if (state->npending_groups) {
+        if (state->ngroups &&
+            kdtree_direct_advance_leased_pipeline(state)) {
+            return -1;
+        }
+        if (!state->npending_groups) {
+            return 0;
+        }
+        pending_status = kdtree_direct_finish_leased_lookahead(
+            state,
+            &state->pending_handle,
+            state->pending_groups,
+            state->npending_groups,
+            pending_ranges);
+        if (pending_status < 0) {
+            state->npending_groups = 0U;
+            return -1;
+        }
+        if (kdtree_direct_process_leased_wave(
+                state,
+                state->pending_groups,
+                state->npending_groups,
+                pending_status > 0 ? pending_ranges : NULL)) {
+            state->npending_groups = 0U;
+            return -1;
+        }
+        state->npending_groups = 0U;
+        return 0;
+    }
+    if (state->ngroups) {
+        int status = kdtree_direct_process_leased_wave(
+            state,
+            state->groups,
+            state->ngroups,
+            NULL);
+
+        state->ngroups = 0U;
+        return status;
+    }
+    return 0;
+}
+
+static void kdtree_direct_abort_leased_pipeline(
+    kdtree_direct_leased_state_t* state) {
+    if (state->pending_handle && state->lookahead) {
+        state->lookahead->cancel(
+            state->lookahead->opaque,
+            state->pending_handle);
+    }
+    state->pending_handle = NULL;
+    state->npending_groups = 0U;
+    state->ngroups = 0U;
 }
 
 static int kdtree_direct_enqueue_leased_group(
@@ -767,7 +1063,7 @@ static int kdtree_direct_enqueue_leased_group(
     }
     state->ngroups++;
     if (state->ngroups == KDTREE_DIRECT_DSS_WAVE_TASKS) {
-        return kdtree_direct_process_leased_wave(state);
+        return kdtree_direct_advance_leased_pipeline(state);
     }
     return 0;
 }
@@ -795,7 +1091,7 @@ static int kdtree_direct_flush_leased_wave(
         return -1;
     }
     if (final) {
-        return kdtree_direct_process_leased_wave(state);
+        return kdtree_direct_finish_leased_pipeline(state);
     }
     return 0;
 }
@@ -1166,8 +1462,10 @@ kdtree_qres_t* kdtree_rangesearch_direct_dss_leased(
     kdtree_direct_read_leased_ranges_fn read_ranges,
     kdtree_direct_release_range_fn release_range,
     void* read_opaque,
-    const kdtree_direct_dss_executor_t* executor) {
+    const kdtree_direct_dss_executor_t* executor,
+    const kdtree_direct_dss_lookahead_t* lookahead) {
     kdtree_direct_leased_state_t state;
+    kdtree_qres_t* searched;
 
     if (!read_ranges || !release_range) {
         errno = ENOTSUP;
@@ -1178,7 +1476,8 @@ kdtree_qres_t* kdtree_rangesearch_direct_dss_leased(
     state.release_range = release_range;
     state.read_opaque = read_opaque;
     state.executor = executor;
-    return kdtree_rangesearch_direct_dss_core(
+    state.lookahead = lookahead;
+    searched = kdtree_rangesearch_direct_dss_core(
         kd,
         result,
         query,
@@ -1190,6 +1489,8 @@ kdtree_qres_t* kdtree_rangesearch_direct_dss_leased(
         &state,
         TRUE,
         NULL);
+    kdtree_direct_abort_leased_pipeline(&state);
+    return searched;
 }
 
 #undef KDTREE_DIRECT_SPAN_CAPACITY

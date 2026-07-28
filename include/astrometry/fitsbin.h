@@ -399,6 +399,8 @@ int fitsbin_mapped_range_page_cover(
  * Read one through FITSBIN_PREAD_RANGE_LIMIT fully validated mapped ranges
  * under one demand-I/O credit. All ranges are resolved before I/O begins. A
  * failure invalidates the whole batch from the caller's perspective.
+ * Disjoint destinations may be read in file-offset order. Any overlapping
+ * destinations retain caller order.
  */
 int fitsbin_pread_mapped_ranges(
     fitsbin_t* fb,
@@ -415,8 +417,10 @@ int fitsbin_pread_mapped_ranges(
  * destination must remain allocated and inaccessible to the caller until
  * ticket_wait() or ticket_cancel_and_wait() returns. Only a positive wait
  * result permits publication; failure or cancellation invalidates the whole
- * batch even when some destination bytes were written. The source fitsbin
- * must remain live through the wait so operation counters can be applied.
+ * batch even when some destination bytes were written. Disjoint destinations
+ * may be read in file-offset order; overlapping destinations retain caller
+ * order. The source fitsbin must remain live through the wait so operation
+ * counters can be applied.
  */
 int fitsbin_pread_mapped_ranges_submit(
     fitsbin_t* fb,
@@ -440,11 +444,12 @@ int fitsbin_pread_mapped_range(
     void* destination);
 
 /*
- * Warm a bounded group of upcoming mapped ranges through exact buffered
- * reads.  Input order selects the lead window; accepted ranges are then page
- * aligned, sorted, deduplicated, and merged only when overlapping/adjacent.
- * Correctness never depends on this advisory operation. A fully resident source
- * returns zero without issuing I/O or changing warm counters.
+ * Prepare a complete bounded group of mapped ranges through exact buffered
+ * reads. Ranges are page aligned, sorted, deduplicated, and merged only when
+ * overlapping or adjacent. Oversized, unresolvable, or over-budget groups
+ * fail as a unit; callers must split larger plans explicitly. Correctness
+ * never depends on this operation. A fully resident source returns zero
+ * without issuing I/O or changing warm counters.
  */
 int fitsbin_prefetch_ranges(
     fitsbin_t* fb,
@@ -453,9 +458,9 @@ int fitsbin_prefetch_ranges(
     size_t byte_budget);
 
 /*
- * Submit one completed-read page-cache preparation to the bounded loader.
- * The mapped ranges are resolved to immutable file offsets before return;
- * loader threads retain neither mapped pointers nor fitsbin state.
+ * Submit one complete current-index page-cache preparation to the bounded
+ * loader. The mapped ranges are resolved to immutable file offsets before
+ * return; loader threads retain neither mapped pointers nor fitsbin state.
  *
  * Return 1 when queued, zero when the optional service or bounded capacity is
  * unavailable, and -1 for an invalid or failed preparation. The caller must
