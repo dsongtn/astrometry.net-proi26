@@ -286,6 +286,7 @@ struct kdtree {
     char* name;
 
     void* io;
+    int io_is_fitsbin;
 
     struct kdtree_funcs fun;
 };
@@ -633,4 +634,3 @@ kdtree_qres_t* KDFUNC(kdtree_rangesearch_options_reuse)(const kdtree_t *kd, kdtr
 #endif
 
 #endif
-

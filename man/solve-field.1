@@ -16,7 +16,7 @@ You can specify http:// or ftp:// URLs instead of filenames.  The "wget" or
 The astrometry engine will take any image and return the astrometry world
 coordinate system (WCS), ie a standards-based description of the (usually
 nonlinear) transformation between image coordinates and sky coordinates with
-absolutely no “false positives” (but maybe some “no answers”). It will do its
+absolutely no "false positives" (but maybe some "no answers"). It will do its
 best, even when the input image has no or totally incorrect meta data.
 .SH OPTIONS
 .TP
@@ -183,6 +183,12 @@ Cut the source list to have this many items (after sorting, if applicable).
 .TP
 \fB\-l\fR, \fB\-\-cpulimit\fR \fIseconds\fR
 Give up solving after the specified number of seconds of CPU time
+.TP
+\fB\-\-p\-workers\fR \fIauto|count\fR
+Set the number of parallel solver workers.  \fBauto\fR uses up to four CPUs
+available through process affinity.  A count of 1 uses the native
+serial solver.  Zero, negative counts, and counts larger than the available
+CPU count are errors.
 .TP
 \fB\-r\fR, \fB\-\-resort\fR
 Sort the star brightnesses by background\-subtracted flux; the default is to

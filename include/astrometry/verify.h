@@ -6,6 +6,8 @@
 #ifndef VERIFY_H
 #define VERIFY_H
 
+#include <stddef.h>
+
 #include "astrometry/kdtree.h"
 #include "astrometry/matchobj.h"
 #include "astrometry/bl.h"
@@ -104,6 +106,80 @@ void verify_hit(const startree_t* skdt,
                 double logratio_tostoplooking,
                 anbool distance_from_quad_bonus,
                 anbool fake_match);
+
+/*
+ * Prepared verification separates index-backed input collection from the
+ * index-free scoring kernel and the ordered MatchObj update.
+ *
+ * verify_prepare_hit() must run on the index owner. It performs every StarKD
+ * lookup and field preparation step and retains no index, solver, callback,
+ * or FITS mapping pointer. The resulting context is immutable until
+ * verify_finish_prepared_hit() and may be scored by a foreign helper.
+ *
+ * verify_score_prepared_hit() calls the original serial verification
+ * mathematics on prepared immutable data. The verify_field_t supplied during
+ * preparation must outlive the prepared context. Independent contexts may be
+ * scored concurrently only when verify_datalog_enabled() is false. Callers
+ * must zero-initialize each verify_prepared_score_t before its first score.
+ *
+ * verify_finish_prepared_hit() must run on the owner in canonical candidate
+ * order. It transfers accepted correspondence arrays to MatchObj exactly
+ * once and consumes the score. Destroy functions accept partially consumed
+ * objects and are always safe after a successful finish.
+ */
+typedef struct verify_prepared_hit verify_prepared_hit_t;
+
+typedef struct verify_prepared_score {
+    double logodds;
+    double worstlogodds;
+    int besti;
+    int ibailed;
+    int istopped;
+    double* allodds;
+    int* theta;
+    anbool complete;
+} verify_prepared_score_t;
+
+int verify_prepare_hit(const startree_t* skdt,
+                       int index_cutnside,
+                       const MatchObj* mo,
+                       const sip_t* sip,
+                       const verify_field_t* vf,
+                       double verify_pix2,
+                       double distractors,
+                       double fieldW,
+                       double fieldH,
+                       double logratio_tobail,
+                       double logratio_toaccept,
+                       double logratio_tostoplooking,
+                       anbool distance_from_quad_bonus,
+                       anbool fake_match,
+                       verify_prepared_hit_t** prepared);
+
+int verify_score_prepared_hit(const verify_prepared_hit_t* prepared,
+                              verify_prepared_score_t* score);
+
+int verify_finish_prepared_hit(verify_prepared_hit_t* prepared,
+                               verify_prepared_score_t* score,
+                               MatchObj* mo);
+
+size_t verify_prepared_hit_bytes(const verify_prepared_hit_t* prepared);
+
+size_t verify_prepared_hit_peak_bytes(
+    const verify_prepared_hit_t* prepared);
+
+unsigned long long
+verify_prepared_hit_work_units(const verify_prepared_hit_t* prepared);
+
+void verify_destroy_prepared_score(verify_prepared_score_t* score);
+void verify_destroy_prepared_hit(verify_prepared_hit_t* prepared);
+
+/*
+ * Verification datalog records are process-global and ordered.  Callers that
+ * would otherwise verify independent MatchObj instances concurrently must
+ * retain serial execution while this stream is enabled.
+ */
+anbool verify_datalog_enabled(void);
 
 // Distractor
 #define THETA_DISTRACTOR -1

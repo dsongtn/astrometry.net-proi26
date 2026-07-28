@@ -131,21 +131,26 @@ void startree_search_for(const startree_t* s, const double* xyzcenter, double ra
     int i, N;
 
     opts = KD_OPTIONS_SMALL_RADIUS;
-    if (xyzresults || radecresults)
+    if (xyzresults || radecresults) {
         opts |= KD_OPTIONS_RETURN_POINTS;
+    }
 
     res = kdtree_rangesearch_options(s->tree, xyzcenter, radius2, opts);
 
     if (!res || !res->nres) {
-        if (xyzresults)
+        if (xyzresults) {
             *xyzresults = NULL;
-        if (radecresults)
+        }
+        if (radecresults) {
             *radecresults = NULL;
-        if (starinds)
+        }
+        if (starinds) {
             *starinds = NULL;
+        }
         *nresults = 0;
-        if (res)
+        if (res) {
             kdtree_free_query(res);
+        }
         return;
     }
 
@@ -155,8 +160,9 @@ void startree_search_for(const startree_t* s, const double* xyzcenter, double ra
 
     if (radecresults) {
         *radecresults = malloc(N * 2 * sizeof(double));
-        for (i=0; i<N; i++)
+        for (i=0; i<N; i++) {
             xyzarr2radecdegarr(xyz + i*3, (*radecresults) + i*2);
+        }
     }
     if (xyzresults) {
         // Steal the results array.
@@ -165,8 +171,9 @@ void startree_search_for(const startree_t* s, const double* xyzcenter, double ra
     }
     if (starinds) {
         *starinds = malloc(res->nres * sizeof(int));
-        for (i=0; i<N; i++)
+        for (i=0; i<N; i++) {
             (*starinds)[i] = res->inds[i];
+        }
     }
     kdtree_free_query(res);
 }
@@ -214,7 +221,8 @@ static bl* get_chunks(startree_t* s, il* wordsizes) {
     return chunks;
 }
 
-static startree_t* my_open(const char* fn, anqfits_t* fits) {
+static startree_t* my_open(const char* fn, anqfits_t* fits,
+                           anbool metadata_only) {
     struct timeval tv1, tv2;
     startree_t* s;
     bl* chunks;
@@ -252,7 +260,11 @@ static startree_t* my_open(const char* fn, anqfits_t* fits) {
     debug("kdtree_fits_contains_tree() took %g ms\n", millis_between(&tv1, &tv2));
 
     gettimeofday(&tv1, NULL);
-    s->tree = kdtree_fits_read_tree(io, treename, &s->header);
+    if (metadata_only) {
+        s->tree = kdtree_fits_read_tree_header(io, treename, &s->header);
+    } else {
+        s->tree = kdtree_fits_read_tree(io, treename, &s->header);
+    }
     gettimeofday(&tv2, NULL);
     debug("kdtree_fits_read_tree() took %g ms\n", millis_between(&tv1, &tv2));
     if (!s->tree) {
@@ -266,20 +278,23 @@ static startree_t* my_open(const char* fn, anqfits_t* fits) {
         logverb("File %s contains a kd-tree with dim %i (not 3), named %s\n",
                 thefn, s->tree->ndim, treename);
         s->tree->io = NULL;
+        s->tree->io_is_fitsbin = FALSE;
         goto bailout;
     }
 
-    gettimeofday(&tv1, NULL);
-    chunks = get_chunks(s, NULL);
-    for (i=0; i<bl_size(chunks); i++) {
-        fitsbin_chunk_t* chunk = bl_access(chunks, i);
-        void** dest = chunk->userdata;
-        kdtree_fits_read_chunk(io, chunk);
-        *dest = chunk->data;
+    if (!metadata_only) {
+        gettimeofday(&tv1, NULL);
+        chunks = get_chunks(s, NULL);
+        for (i=0; i<bl_size(chunks); i++) {
+            fitsbin_chunk_t* chunk = bl_access(chunks, i);
+            void** dest = chunk->userdata;
+            kdtree_fits_read_chunk(io, chunk);
+            *dest = chunk->data;
+        }
+        bl_free(chunks);
+        gettimeofday(&tv2, NULL);
+        debug("reading chunks took %g ms\n", millis_between(&tv1, &tv2));
     }
-    bl_free(chunks);
-    gettimeofday(&tv2, NULL);
-    debug("reading chunks took %g ms\n", millis_between(&tv1, &tv2));
 
     // kdtree_fits_t is a typedef of fitsbin_t
     fitsbin_close_fd(io);
@@ -293,11 +308,15 @@ static startree_t* my_open(const char* fn, anqfits_t* fits) {
 }
 
 startree_t* startree_open_fits(anqfits_t* fits) {
-    return my_open(NULL, fits);
+    return my_open(NULL, fits, FALSE);
+}
+
+startree_t* startree_open_fits_metadata(anqfits_t* fits) {
+    return my_open(NULL, fits, TRUE);
 }
 
 startree_t* startree_open(const char* fn) {
-    return my_open(fn, NULL);
+    return my_open(fn, NULL, FALSE);
 }
 
 /*
@@ -308,23 +327,28 @@ startree_t* startree_open(const char* fn) {
  }
  */
 int startree_close(startree_t* s) {
-    if (!s) return 0;
-    if (s->inverse_perm)
+    if (!s) {
+        return 0;
+    }
+    if (s->inverse_perm && s->inverse_perm_owned) {
         free(s->inverse_perm);
-    if (s->header)
+    }
+    if (s->header) {
         qfits_header_destroy(s->header);
+    }
     if (s->tree) {
         if (s->writing) {
             free(s->tree->data.any);
             s->tree->data.any = NULL;
             kdtree_free(s->tree);
             free(s->sweep);
-        }
-        else
+        } else {
             kdtree_fits_close(s->tree);
+        }
     }
-    if (s->tagalong)
+    if (s->tagalong) {
         fitstable_close(s->tagalong);
+    }
     free(s);
     return 0;
 }
@@ -411,29 +435,197 @@ int startree_check_inverse_perm(startree_t* s) {
 }
 
 void startree_compute_inverse_perm(startree_t* s) {
-    if (s->inverse_perm)
+    int* inverse_perm = NULL;
+    fitsbin_t* fb = NULL;
+    fitsbin_mmap_advice_t restore_advice =
+        FITSBIN_MMAP_ADVICE_NORMAL;
+    size_t inverse_bytes;
+    size_t permutation_bytes;
+    int range_advice_status = 0;
+    anbool callback_prepared = FALSE;
+    anbool restore_range = FALSE;
+
+    if (!s || s->inverse_perm) {
         return;
+    }
+    if (!s->tree || Ndata(s) <= 0) {
+        return;
+    }
+    if ((size_t)Ndata(s) >
+            SIZE_MAX / sizeof(*s->tree->perm) ||
+        (size_t)Ndata(s) >
+            SIZE_MAX / sizeof(*inverse_perm)) {
+        fprintf(stderr, "Star kdtree inverse permutation is too large.\n");
+        return;
+    }
+    permutation_bytes =
+        (size_t)Ndata(s) * sizeof(*s->tree->perm);
+    inverse_bytes =
+        (size_t)Ndata(s) * sizeof(*inverse_perm);
+
+    if (s->inverse_prepare_callback) {
+        callback_prepared = TRUE;
+        s->inverse_prepare_callback(
+            s->inverse_callback_opaque,
+            inverse_bytes);
+        if (s->inverse_perm) {
+            goto cleanup;
+        }
+    }
+
+    /*
+     * kdtree_inverse_permutation() is a compulsory sequential sweep over
+     * PERM. The production compute VMA is NORMAL. This range-local guard is
+     * retained for compatibility with controlled alternate-policy tests;
+     * DATA and every unrelated FITS chunk retain their current policy.
+     */
+    if (s->tree->perm && s->tree->io) {
+        fb = (fitsbin_t*)s->tree->io;
+        restore_advice = fitsbin_get_mmap_advice(fb);
+        if (restore_advice != FITSBIN_MMAP_ADVICE_NORMAL) {
+            range_advice_status = fitsbin_set_mmap_range_advice(
+                fb,
+                s->tree->perm,
+                permutation_bytes,
+                FITSBIN_MMAP_ADVICE_NORMAL);
+            if (range_advice_status > 0) {
+                restore_range = TRUE;
+            } else if (range_advice_status < 0) {
+                SYSERROR("Failed to apply sequential StarKD PERM "
+                         "mmap advice");
+            }
+        }
+    }
+
     // compute inverse permutation vector.
-    s->inverse_perm = malloc(Ndata(s) * sizeof(int));
-    if (!s->inverse_perm) {
+    inverse_perm = malloc(inverse_bytes);
+    if (!inverse_perm) {
         fprintf(stderr, "Failed to allocate star kdtree inverse permutation vector.\n");
-        return;
+        goto cleanup;
     }
 #ifndef NDEBUG
     {
         int i;
         for (i=0; i<Ndata(s); i++)
-            s->inverse_perm[i] = -1;
+            inverse_perm[i] = -1;
     }
 #endif
-    kdtree_inverse_permutation(s->tree, s->inverse_perm);
+    kdtree_inverse_permutation(s->tree, inverse_perm);
 #ifndef NDEBUG
     {
         int i;
         for (i=0; i<Ndata(s); i++)
-            assert(s->inverse_perm[i] != -1);
+            assert(inverse_perm[i] != -1);
     }
 #endif
+    /*
+     * Publish only the complete vector. Callers serialize construction for a
+     * shared live index; ordinary single-owner paths need no extra lock.
+     */
+    s->inverse_perm = inverse_perm;
+    s->inverse_perm_owned = TRUE;
+    inverse_perm = NULL;
+
+cleanup:
+    free(inverse_perm);
+    if (callback_prepared &&
+        s->inverse_complete_callback) {
+        s->inverse_complete_callback(
+            s->inverse_callback_opaque,
+            inverse_bytes,
+            s->inverse_perm != NULL);
+    }
+    if (restore_range) {
+        if (fitsbin_set_mmap_range_advice(
+                fb,
+                s->tree->perm,
+                permutation_bytes,
+                restore_advice) <= 0) {
+            SYSERROR("Failed to restore StarKD PERM mmap advice");
+            /*
+             * The owning fitsbin still records the payload policy. Reapply it
+             * to all existing chunks as a conservative recovery path.
+             */
+            if (fitsbin_set_mmap_advice(
+                    fb,
+                    FITSBIN_MMAP_ADVICE_NORMAL,
+                    FALSE) ||
+                fitsbin_set_mmap_advice(
+                    fb,
+                    restore_advice,
+                    TRUE)) {
+                SYSERROR("Failed to restore StarKD mmap policy");
+            }
+        }
+    }
+}
+
+int* startree_take_inverse_perm(startree_t* s) {
+    int* inverse_perm;
+
+    if (!s || !s->inverse_perm || !s->inverse_perm_owned) {
+        return NULL;
+    }
+    inverse_perm = s->inverse_perm;
+    s->inverse_perm = NULL;
+    s->inverse_perm_owned = FALSE;
+    return inverse_perm;
+}
+
+int startree_borrow_inverse_perm(startree_t* s,
+                                 int* inverse_perm,
+                                 int count) {
+    if (!s || !s->tree || !inverse_perm ||
+        count != Ndata(s) || s->inverse_perm) {
+        return -1;
+    }
+    s->inverse_perm = inverse_perm;
+    s->inverse_perm_owned = FALSE;
+    return 0;
+}
+
+int* startree_release_borrowed_inverse_perm(startree_t* s) {
+    int* inverse_perm;
+
+    if (!s || !s->inverse_perm || s->inverse_perm_owned) {
+        return NULL;
+    }
+    inverse_perm = s->inverse_perm;
+    s->inverse_perm = NULL;
+    return inverse_perm;
+}
+
+int startree_set_inverse_perm_callbacks(
+    startree_t* s,
+    void (*prepare_callback)(void* opaque, size_t bytes),
+    void (*complete_callback)(void* opaque,
+                              size_t bytes,
+                              anbool allocated),
+    void* opaque) {
+    if (!s || !prepare_callback || !complete_callback ||
+        s->inverse_perm ||
+        s->inverse_prepare_callback ||
+        s->inverse_complete_callback ||
+        s->inverse_callback_opaque) {
+        return -1;
+    }
+    s->inverse_prepare_callback = prepare_callback;
+    s->inverse_complete_callback = complete_callback;
+    s->inverse_callback_opaque = opaque;
+    return 0;
+}
+
+int startree_clear_inverse_perm_callbacks(
+    startree_t* s,
+    void* opaque) {
+    if (!s ||
+        s->inverse_callback_opaque != opaque) {
+        return -1;
+    }
+    s->inverse_prepare_callback = NULL;
+    s->inverse_complete_callback = NULL;
+    s->inverse_callback_opaque = NULL;
+    return 0;
 }
 
 int startree_get_cut_nside(const startree_t* s) {
@@ -508,19 +700,28 @@ static int startree_data_index(startree_t* s, int starid) {
 int startree_prefetch_stars(startree_t* s,
                             const unsigned int* starids,
                             int nstars) {
+    fitsbin_prefetch_range_t ranges[160];
     fitsbin_t* fb;
     size_t row_size;
+    int accepted;
     int i;
 
     if (!s || !s->tree || !starids || nstars <= 0 ||
-        !s->tree->io || Ndata(s) <= 0) {
+        !s->tree->io || !s->tree->io_is_fitsbin ||
+        !s->tree->data.any || Ndata(s) <= 0) {
         return 0;
     }
 
     fb = s->tree->io;
     row_size = kdtree_sizeof_data(s->tree) / (size_t)Ndata(s);
+    if (!row_size) {
+        return 0;
+    }
+    accepted = MIN(
+        nstars,
+        (int)(sizeof(ranges) / sizeof(ranges[0])));
 
-    for (i = 0; i < nstars; i++) {
+    for (i = 0; i < accepted; i++) {
         int data_index;
         void* row;
 
@@ -534,10 +735,102 @@ int startree_prefetch_stars(startree_t* s,
         }
 
         row = kdtree_get_data(s->tree, data_index);
-        fitsbin_prefetch_data(fb, row, row_size);
+        ranges[i].data = row;
+        ranges[i].size = row_size;
     }
 
+    (void)fitsbin_prefetch_ranges(
+        fb,
+        ranges,
+        (size_t)accepted,
+        512U * 1024U);
     return 0;
+}
+
+#define STARTREE_MAPPED_ADVICE_RANGE_LIMIT 256U
+
+int startree_advise_rows(startree_t* s,
+                         const unsigned int* starids,
+                         int nstars) {
+    fitsbin_prefetch_range_t
+        ranges[STARTREE_MAPPED_ADVICE_RANGE_LIMIT];
+    fitsbin_t* fb;
+    size_t accepted;
+    size_t byte_budget;
+    size_t per_range_budget;
+    size_t row_size;
+    long detected_page_size;
+    int advised;
+    int ndata;
+    size_t i;
+
+    if (!s || !s->tree || !starids || nstars <= 0 ||
+        !s->tree->io || !s->tree->io_is_fitsbin ||
+        !s->tree->data.any) {
+        return 0;
+    }
+    ndata = Ndata(s);
+    if (ndata <= 0) {
+        return 0;
+    }
+
+    /*
+     * Advice must not turn into a compulsory full PERM sweep. The normal
+     * data lookup remains responsible for constructing the inverse mapping
+     * when it is genuinely needed.
+     */
+    if (s->tree->perm && !s->inverse_perm) {
+        return 0;
+    }
+    row_size =
+        kdtree_sizeof_data(s->tree) / (size_t)ndata;
+    if (!row_size) {
+        return 0;
+    }
+    accepted = MIN(
+        (size_t)nstars,
+        (size_t)STARTREE_MAPPED_ADVICE_RANGE_LIMIT);
+    detected_page_size = sysconf(_SC_PAGESIZE);
+    if (detected_page_size <= 0 ||
+        (size_t)detected_page_size >
+            (SIZE_MAX - row_size) / 2U) {
+        return 0;
+    }
+    per_range_budget = row_size +
+        2U * (size_t)detected_page_size;
+    if (accepted > SIZE_MAX / per_range_budget) {
+        return 0;
+    }
+    byte_budget = accepted * per_range_budget;
+    fb = s->tree->io;
+
+    /*
+     * Populate only a fixed canonical lookahead. Later rows stay under
+     * NORMAL advice and are consumed by the original loop on demand.
+     */
+    for (i = 0U; i < accepted; i++) {
+        unsigned int starid = starids[i];
+        int data_index;
+
+        if (starid >= (unsigned int)ndata) {
+            return -1;
+        }
+        data_index = s->inverse_perm
+            ? s->inverse_perm[starid]
+            : (int)starid;
+        if (data_index < 0 || data_index >= ndata) {
+            return -1;
+        }
+        ranges[i].data =
+            kdtree_get_data(s->tree, data_index);
+        ranges[i].size = row_size;
+    }
+    advised = fitsbin_advise_mapped_ranges(
+        fb,
+        ranges,
+        accepted,
+        byte_budget);
+    return advised;
 }
 
 int startree_get(startree_t* s, int starid, double* posn) {
@@ -650,4 +943,3 @@ int startree_write_to_file_flipped(startree_t* s, const char* fn) {
 int startree_append_to(startree_t* s, FILE* fid) {
     return write_to_file(s, NULL, FALSE, fid);
 }
-

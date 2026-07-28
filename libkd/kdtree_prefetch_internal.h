@@ -60,9 +60,9 @@ typedef struct kdtree_prefetch_sink {
 } kdtree_prefetch_sink_t;
 
 /*
- * Perform a bounded shallow traversal and emit array-specific hints for the
- * predicted frontier. No query result is produced and no direct I/O advice is
- * issued by libkd.
+ * Mirror the scalar topology traversal and emit array-specific hints for the
+ * selected leaf DATA/PERM ranges and traversal metadata. No query result is
+ * produced, payload is not dereferenced, and libkd issues no I/O advice.
  *
  * Return:
  *   0  normal completion or prefetch not applicable

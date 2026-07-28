@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "label": "mobile-production-case-01",
+  "measurement_mode": "timing",
+  "solve_field": "/absolute/path/to/install/bin/solve-field",
+  "wcsinfo": "/absolute/path/to/install/bin/wcsinfo",
+  "input": "/absolute/path/to/mobile-image.jpg",
+  "index_manifest": "/absolute/path/to/indexes.txt",
+  "pipeline_files": [
+    "/absolute/path/to/install/bin/astrometry-engine",
+    "/absolute/path/to/install/bin/image2pnm",
+    "/absolute/path/to/install/bin/an-pnmtofits",
+    "/absolute/path/to/install/bin/removelines",
+    "/absolute/path/to/install/bin/uniformize",
+    "/usr/bin/pnmfile",
+    "/usr/bin/ppmtopgm",
+    "/usr/bin/jpegtopnm"
+  ],
+  "output_root": "/absolute/path/to/results/mobile-case-01-timing",
+  "field_object_ranges": [
+    {
+      "id": "objects-1-10",
+      "objects": "1-10"
+    },
+    {
+      "id": "objects-11-50",
+      "objects": "11-50"
+    }
+  ],
+  "common_args": [
+    "--no-verify",
+    "--scale-units=arcsecperpix",
+    "--scale-low=1.0",
+    "--scale-high=4.0",
+    "--cpulimit=300",
+    "--new-fits=none"
+  ],
+  "repetitions": 7,
+  "random_seed": 20260721,
+  "rotation_stride": 5,
+  "bootstrap_samples": 20000,
+  "bootstrap_seed": 20260721,
+  "cpu_list": "2-5",
+  "timeout_seconds": 360,
+  "taskset_binary": "/usr/bin/taskset",
+  "launcher_probe_binary": "/usr/bin/true",
+  "cache_control": {
+    "method": "command",
+    "command": [
+      "sudo",
+      "-n",
+      "/usr/bin/tee",
+      "/proc/sys/vm/drop_caches"
+    ],
+    "stdin": "3\n"
+  }
+}

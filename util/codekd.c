@@ -45,7 +45,8 @@ int codetree_get_permuted(codetree_t* s, int index) {
     else return index;
 }
 
-static codetree_t* my_open(const char* fn, anqfits_t* fits) {
+static codetree_t* my_open(const char* fn, anqfits_t* fits,
+                           anbool metadata_only) {
     codetree_t* s;
     kdtree_fits_t* io;
     char* treename = CODETREE_NAME;
@@ -63,15 +64,19 @@ static codetree_t* my_open(const char* fn, anqfits_t* fits) {
         ERROR("Failed to open FITS file \"%s\"", fn);
         goto bailout;
     }
+
     if (!kdtree_fits_contains_tree(io, treename))
         treename = NULL;
-    s->tree = kdtree_fits_read_tree(io, treename, &s->header);
+    if (metadata_only) {
+        s->tree = kdtree_fits_read_tree_header(io, treename, &s->header);
+    } else {
+        s->tree = kdtree_fits_read_tree(io, treename, &s->header);
+    }
     if (!s->tree) {
         ERROR("Failed to read code kdtree from file %s\n", fn);
         goto bailout;
     }
 
-    // kdtree_fits_t is a typedef of fitsbin_t
     fitsbin_close_fd(io);
 
     return s;
@@ -81,21 +86,30 @@ static codetree_t* my_open(const char* fn, anqfits_t* fits) {
 }
 
 codetree_t* codetree_open_fits(anqfits_t* fits) {
-    return my_open(NULL, fits);
+    return my_open(NULL, fits, FALSE);
+}
+
+codetree_t* codetree_open_fits_metadata(anqfits_t* fits) {
+    return my_open(NULL, fits, TRUE);
 }
 
 codetree_t* codetree_open(const char* fn) {
-    return my_open(fn, NULL);
+    return my_open(fn, NULL, FALSE);
 }
 
 int codetree_close(codetree_t* s) {
-    if (!s) return 0;
-    if (s->inverse_perm)
+    if (!s) {
+        return 0;
+    }
+    if (s->inverse_perm) {
         free(s->inverse_perm);
-    if (s->header)
+    }
+    if (s->header) {
         qfits_header_destroy(s->header);
-    if (s->tree)
+    }
+    if (s->tree) {
         kdtree_fits_close(s->tree);
+    }
     free(s);
     return 0;
 }

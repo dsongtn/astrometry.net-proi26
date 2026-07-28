@@ -38,11 +38,32 @@ typedef struct {
     // reading: tagged-along data (a FITS BINTABLE with one row per star,
     // in the same order); access this via startree_get_tagalong() ONLY!
     fitstable_t* tagalong;
+
+    /* Appended ownership metadata; borrowed cache vectors are never freed. */
+    anbool inverse_perm_owned;
+
+    /*
+     * Optional owner callbacks around the lazy inverse-permutation
+     * allocation. They let a job-scoped cache account actual live bytes and
+     * make retention room at the first real StarKD hit, rather than
+     * speculatively evicting useful state when an index is merely opened.
+     */
+    void (*inverse_prepare_callback)(void* opaque, size_t bytes);
+    void (*inverse_complete_callback)(void* opaque,
+                                      size_t bytes,
+                                      anbool allocated);
+    void* inverse_callback_opaque;
 } startree_t;
 
 startree_t* startree_open(const char* fn);
 
 startree_t* startree_open_fits(anqfits_t* fits);
+
+/*
+ * Opens only the StarKD header.  Payload arrays, including sweep, remain
+ * unloaded.
+ */
+startree_t* startree_open_fits_metadata(anqfits_t* fits);
 
 /**
  Searches for stars within a radius of a point.
@@ -185,10 +206,22 @@ qfits_header* startree_header(const startree_t* s);
 
 int startree_get(startree_t* s, int starid, double *p_xyz);
 
-// Schedules the mapped coordinate rows for the next group of star lookups.
+// Synchronously warms bounded coordinate ranges through the separate payload
+// fd. The subsequent mapped lookup remains authoritative.
 int startree_prefetch_stars(startree_t* s,
                             const unsigned int* starids,
                             int nstars);
+
+/*
+ * Advise mapped coordinate rows for selected canonical star IDs. If a tree
+ * needs an inverse permutation that has not already been built, this
+ * advisory operation declines the request rather than constructing it. It
+ * returns the number of advised spans, zero when inapplicable, or -1 on
+ * invalid input or advice failure.
+ */
+int startree_advise_rows(startree_t* s,
+                         const unsigned int* starids,
+                         int nstars);
 
 int startree_get_radec(startree_t* s, int starid, double *p_ra, double *p_dec);
 
@@ -197,6 +230,31 @@ int startree_close(startree_t* s);
 void startree_compute_inverse_perm(startree_t* s);
 
 int startree_check_inverse_perm(startree_t* s);
+
+/*
+ * Transfer or borrow the immutable lazy inverse permutation. These are used
+ * by the job-scoped shard cache; a borrowed vector is never freed by the
+ * startree and must be detached before its cache lease is released.
+ */
+int* startree_take_inverse_perm(startree_t* s);
+
+int startree_borrow_inverse_perm(startree_t* s,
+                                 int* inverse_perm,
+                                 int count);
+
+int* startree_release_borrowed_inverse_perm(startree_t* s);
+
+int startree_set_inverse_perm_callbacks(
+    startree_t* s,
+    void (*prepare_callback)(void* opaque, size_t bytes),
+    void (*complete_callback)(void* opaque,
+                              size_t bytes,
+                              anbool allocated),
+    void* opaque);
+
+int startree_clear_inverse_perm_callbacks(
+    startree_t* s,
+    void* opaque);
 
 // for writing
 startree_t* startree_new(void);

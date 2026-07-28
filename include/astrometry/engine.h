@@ -17,9 +17,8 @@ struct engine {
     // search paths (directories)
     sl* index_paths;
 
-    // contains "index_t" objects.
-    // if "inparallel" is not set, they will be "metadata-only" until
-    // they need to be loaded.
+    // Contains metadata-only ordinary indexes. Multiindex components retain
+    // their separately owned shared StarKD handle.
     pl* indexes;
 
     // indexes that need to be freed
@@ -36,6 +35,12 @@ struct engine {
     double minwidth;
     double maxwidth;
     float cpulimit;
+    /*
+     * Site-level worker request. Zero is the internal representation of
+     * textual "auto"; positive values are explicit counts.
+     */
+    int index_shard_workers_config;
+    anbool index_shard_workers_config_set;
     char* cancelfn;
     char* solvedfn;
 };
@@ -49,6 +54,9 @@ struct job_t {
     double dec_center;
     double search_radius;
     anbool use_radec_center;
+    int index_shard_workers_override;
+    anbool index_shard_workers_override_set;
+    anbool index_shard_workers_controlled;
     onefield_t bp;
 };
 typedef struct job_t job_t;

@@ -16,7 +16,7 @@
 
 anbool index_overlaps_scale_range(index_t* meta,
                                   double quadlo, double quadhi) {
-    anbool rtn = 
+    anbool rtn =
         !((quadlo > meta->index_scale_upper) ||
           (quadhi < meta->index_scale_lower));
     debug("index_overlaps_scale_range: index %s has quads [%g, %g] arcsec; image has quads [%g, %g] arcsec.  In range? %s\n",
@@ -254,6 +254,51 @@ static void set_meta(index_t* index) {
     index->meanx_less_than_half = qfits_header_getboolean(index->codekd->header, "CXDXLT1", FALSE);
 }
 
+static int index_reload_internal(index_t* index, anbool metadata_only) {
+    // Read .skdt file...
+    if (!index->starkd) {
+        if (metadata_only) {
+            index->starkd = startree_open_fits_metadata(index->fits);
+        } else {
+            index->starkd = startree_open_fits(index->fits);
+        }
+        if (!index->starkd) {
+            ERROR("Failed to read star kdtree from file %s", index->indexfn);
+            goto bailout;
+        }
+    }
+
+    // Read .quad file...
+    if (!index->quads) {
+        if (metadata_only) {
+            index->quads = quadfile_open_fits_metadata(index->fits);
+        } else {
+            index->quads = quadfile_open_fits(index->fits);
+        }
+        if (!index->quads) {
+            ERROR("Failed to read quads from %s", index->indexfn);
+            goto bailout;
+        }
+    }
+
+    // Read .ckdt file...
+    if (!index->codekd) {
+        if (metadata_only) {
+            index->codekd = codetree_open_fits_metadata(index->fits);
+        } else {
+            index->codekd = codetree_open_fits(index->fits);
+        }
+        if (!index->codekd) {
+            ERROR("Failed to read code kdtree from file %s", index->indexfn);
+            goto bailout;
+        }
+    }
+    return 0;
+
+ bailout:
+    return -1;
+}
+
 int index_dimquads(index_t* indx) {
     return indx->dimquads;
 }
@@ -290,8 +335,9 @@ index_t* index_load(const char* indexname, int flags, index_t* dest) {
         ERROR("Failed to open FITS file %s", dest->indexfn);
         goto bailout;
     }
-    if (index_reload(dest))
+    if (index_reload_internal(dest, flags & INDEX_ONLY_LOAD_METADATA)) {
         goto bailout;
+    }
 
     free(dest->indexname);
     dest->indexname = strdup(quadfile_get_filename(dest->quads));
@@ -322,36 +368,7 @@ index_t* index_load(const char* indexname, int flags, index_t* dest) {
 }
 
 int index_reload(index_t* index) {
-    // Read .skdt file...
-    if (!index->starkd) {
-        index->starkd = startree_open_fits(index->fits);
-        if (!index->starkd) {
-            ERROR("Failed to read star kdtree from file %s", index->indexfn);
-            goto bailout;
-        }
-    }
-
-    // Read .quad file...
-    if (!index->quads) {
-        index->quads = quadfile_open_fits(index->fits);
-        if (!index->quads) {
-            ERROR("Failed to read quads from %s", index->indexfn);
-            goto bailout;
-        }
-    }
-
-    // Read .ckdt file...
-    if (!index->codekd) {
-        index->codekd = codetree_open_fits(index->fits);
-        if (!index->codekd) {
-            ERROR("Failed to read code kdtree from file %s", index->indexfn);
-            goto bailout;
-        }
-    }
-    return 0;
-
- bailout:
-    return -1;
+    return index_reload_internal(index, FALSE);
 }
 
 void index_unload(index_t* index) {
@@ -371,30 +388,113 @@ void index_unload(index_t* index) {
 
 int index_close_fds(index_t* ind) {
     kdtree_fits_t* io;
-    if (ind->quads->fb->fid) {
-        if (fclose(ind->quads->fb->fid)) {
-            SYSERROR("Failed to fclose() an astrometry_net_data quadfile");
-            return -1;
-        }
-        ind->quads->fb->fid = NULL;
+    int rc = 0;
+
+    if (!ind || !ind->quads || !ind->quads->fb ||
+        !ind->codekd || !ind->codekd->tree ||
+        !ind->codekd->tree->io ||
+        !ind->starkd || !ind->starkd->tree ||
+        !ind->starkd->tree->io) {
+        ERROR("Cannot close descriptors for an incomplete index");
+        return -1;
+    }
+    if (fitsbin_close_fd(ind->quads->fb)) {
+        ERROR("Failed to close an astrometry_net_data quadfile");
+        rc = -1;
     }
     io = ind->codekd->tree->io;
-    if (io->fid) {
-        if (fclose(io->fid)) {
-            SYSERROR("Failed to fclose() an astrometry_net_data code kdtree");
-            return -1;
-        }
-        io->fid = NULL;
+    if (fitsbin_close_fd(io)) {
+        ERROR("Failed to close an astrometry_net_data code kdtree");
+        rc = -1;
     }
     io = (kdtree_fits_t*)ind->starkd->tree->io;
-    if (io->fid) {
-        if (fclose(io->fid)) {
-            SYSERROR("Failed to fclose() an astrometry_net_data star kdtree");
-            return -1;
-        }
-        io->fid = NULL;
+    if (fitsbin_close_fd(io)) {
+        ERROR("Failed to close an astrometry_net_data star kdtree");
+        rc = -1;
     }
-    return 0;
+    return rc;
+}
+
+static int index_close_one_payload_fd(
+    fitsbin_t* fb,
+    const char* component,
+    const char* index_name) {
+    fitsbin_payload_io_stats_t stats;
+    int rc;
+
+    if (!fb) {
+        return 0;
+    }
+    fitsbin_take_payload_io_stats(fb, &stats);
+    if (stats.read_calls ||
+        stats.warm_calls ||
+        stats.cache_hits ||
+        stats.cache_misses ||
+        stats.failures) {
+        logverb(
+            "[index-payload-io] index=%s component=%s "
+            "direct_calls=%llu direct_batches=%llu "
+            "logical_bytes=%llu aligned_bytes=%llu page_coverage=%llu "
+            "direct_ms=%.3f "
+            "warm_calls=%llu warm_ranges=%llu warm_bytes=%llu "
+            "warm_ms=%.3f cache_hits=%llu cache_misses=%llu "
+            "cache_evictions=%llu cache_allocations=%llu "
+            "credit_wait_ms=%.3f failures=%llu\n",
+            index_name ? index_name : "(unnamed)",
+            component ? component : "(unknown)",
+            stats.read_calls,
+            stats.read_batches,
+            stats.read_logical_bytes,
+            stats.read_bytes,
+            stats.read_pages,
+            (double)stats.read_nanoseconds / 1000000.0,
+            stats.warm_calls,
+            stats.warm_ranges,
+            stats.warm_bytes,
+            (double)stats.warm_nanoseconds / 1000000.0,
+            stats.cache_hits,
+            stats.cache_misses,
+            stats.cache_evictions,
+            stats.cache_allocations,
+            (double)stats.wait_nanoseconds / 1000000.0,
+            stats.failures);
+    }
+    rc = fitsbin_close_payload_fd(fb);
+    if (rc) {
+        ERROR("Failed to close %s exact-payload descriptor",
+              component ? component : "index");
+    }
+    return rc;
+}
+
+int index_close_payload_fds(index_t* ind) {
+    int rc = 0;
+
+    if (!ind) {
+        return 0;
+    }
+    if (ind->quads &&
+        index_close_one_payload_fd(
+            ind->quads->fb,
+            "quad",
+            ind->indexname)) {
+        rc = -1;
+    }
+    if (ind->codekd && ind->codekd->tree &&
+        index_close_one_payload_fd(
+            (fitsbin_t*)ind->codekd->tree->io,
+            "codekd",
+            ind->indexname)) {
+        rc = -1;
+    }
+    if (ind->starkd && ind->starkd->tree &&
+        index_close_one_payload_fd(
+            (fitsbin_t*)ind->starkd->tree->io,
+            "starkd",
+            ind->indexname)) {
+        rc = -1;
+    }
+    return rc;
 }
 
 void index_close(index_t* index) {

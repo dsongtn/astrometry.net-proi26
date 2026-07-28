@@ -144,6 +144,57 @@ const fitsbin_t* get_fitsbin_const(const kdtree_fits_t* io) {
     return io;
 }
 
+static anbool kdtree_fits_table_is_component(
+    const char* tablename,
+    const char* component) {
+    size_t component_length;
+
+    if (!tablename || !component) {
+        return FALSE;
+    }
+
+    component_length = strlen(component);
+    if (strncmp(tablename, component, component_length)) {
+        return FALSE;
+    }
+
+    return tablename[component_length] == '\0' ||
+        tablename[component_length] == '_';
+}
+
+static fitsbin_mmap_region_t kdtree_fits_chunk_mmap_region(
+    const fitsbin_chunk_t* chunk) {
+    const char* tablename;
+
+    tablename = chunk->tablename;
+
+    /*
+     * Tree descent repeatedly follows these compact structures. Keep them
+     * distinct from sparsely referenced point/permutation payload even when
+     * a named tree adds a suffix to the production table name.
+     */
+    if (kdtree_fits_table_is_component(tablename, KD_STR_HEADER) ||
+        kdtree_fits_table_is_component(tablename, KD_STR_LR) ||
+        kdtree_fits_table_is_component(tablename, KD_STR_BB) ||
+        kdtree_fits_table_is_component(tablename, KD_STR_SPLIT) ||
+        kdtree_fits_table_is_component(tablename, KD_STR_SPLITDIM) ||
+        kdtree_fits_table_is_component(tablename, KD_STR_RANGE)) {
+        return FITSBIN_MMAP_REGION_TOPOLOGY;
+    }
+
+    if (kdtree_fits_table_is_component(tablename, KD_STR_PERM) ||
+        kdtree_fits_table_is_component(tablename, KD_STR_DATA)) {
+        return FITSBIN_MMAP_REGION_PAYLOAD;
+    }
+
+    /*
+     * Extra kdtree_fits chunks are not production tree components. Preserve
+     * the caller's FITSBIN classification, including its zero-init PAYLOAD
+     * fallback.
+     */
+    return chunk->mmap_region;
+}
+
 // CodeKD and StarKD enter through kdtree FITS I/O.  Configure their mapping
 // policy before any tree chunks are mapped.
 static kdtree_fits_t* configure_index_mmap_policy(kdtree_fits_t* io) {
@@ -172,6 +223,9 @@ qfits_header* kdtree_fits_get_primary_header(kdtree_fits_t* io) {
 
 int kdtree_fits_read_chunk(kdtree_fits_t* io, fitsbin_chunk_t* chunk) {
     int rtn;
+
+    chunk->mmap_region = kdtree_fits_chunk_mmap_region(chunk);
+
     //double t0 = timenow();
     rtn = fitsbin_read_chunk(io, chunk);
     //debug("kdtree_fits_read_chunk(%s) took %g ms\n", chunk->tablename, 1000. * (timenow() - t0));
@@ -257,16 +311,15 @@ int kdtree_fits_contains_tree(const kdtree_fits_t* io, const char* treename) {
     return rtn;
 }
 
-kdtree_t* kdtree_fits_read_tree(kdtree_fits_t* io, const char* treename,
-                                qfits_header** p_hdr) {
+kdtree_t* kdtree_fits_read_tree_header(kdtree_fits_t* io,
+                                       const char* treename,
+                                       qfits_header** p_hdr) {
     int ndim, ndata, nnodes;
     unsigned int tt;
     kdtree_t* kd = NULL;
     fitsbin_t* fb = kdtree_fits_get_fitsbin(io);
     qfits_header* header;
-    int rtn = 0;
     char* fn = fb->filename;
-    //double t0;
 
     kd = CALLOC(1, sizeof(kdtree_t));
     if (!kd) {
@@ -277,10 +330,11 @@ kdtree_t* kdtree_fits_read_tree(kdtree_fits_t* io, const char* treename,
     header = find_tree(treename, fb, &ndim, &ndata, &nnodes, &tt, &kd->name);
     if (!header) {
         // Not found.
-        if (treename)
+        if (treename) {
             ERROR("Kdtree header for a tree named \"%s\" was not found in file %s", treename, fn);
-        else
+        } else {
             ERROR("Kdtree header was not found in file %s", fn);
+        }
 
         FREE(kd);
         return NULL;
@@ -288,10 +342,11 @@ kdtree_t* kdtree_fits_read_tree(kdtree_fits_t* io, const char* treename,
 
     kd->has_linear_lr = qfits_header_getboolean(header, "KDT_LINL", 0);
 
-    if (p_hdr)
+    if (p_hdr) {
         *p_hdr = header;
-    else
+    } else {
         qfits_header_destroy(header);
+    }
 
     kd->ndata  = ndata;
     kd->ndim   = ndim;
@@ -300,20 +355,35 @@ kdtree_t* kdtree_fits_read_tree(kdtree_fits_t* io, const char* treename,
     kd->ninterior = nnodes - kd->nbottom;
     kd->nlevels = kdtree_nnodes_to_nlevels(nnodes);
     kd->treetype = tt;
+    kd->io = io;
+    kd->io_is_fitsbin = TRUE;
+
+    return kd;
+}
+
+kdtree_t* kdtree_fits_read_tree(kdtree_fits_t* io, const char* treename,
+                                qfits_header** p_hdr) {
+    kdtree_t* kd;
+    int rtn = 0;
+
+    kd = kdtree_fits_read_tree_header(io, treename, p_hdr);
+    if (!kd) {
+        return NULL;
+    }
 
     //t0 = timenow();
-    KD_DISPATCH(kdtree_read_fits, tt, rtn = , (io, kd));
+    KD_DISPATCH(kdtree_read_fits, kd->treetype, rtn = , (io, kd));
     //debug("kdtree_read_fits(%s) took %g ms\n", fn, 1000. * (timenow() - t0));
 
     if (rtn) {
+        kd->io = NULL;
+        kd->io_is_fitsbin = FALSE;
         FREE(kd->name);
         FREE(kd);
         return NULL;
     }
 
     kdtree_update_funcs(kd);
-
-    kd->io = io;
 
     return kd;
 }

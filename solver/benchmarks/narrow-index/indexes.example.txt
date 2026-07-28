@@ -1,0 +1,9 @@
+# Fixed production order. Prefixes of this exact list form I1, I2, I4 and I8.
+/absolute/path/to/index-01.fits
+/absolute/path/to/index-02.fits
+/absolute/path/to/index-03.fits
+/absolute/path/to/index-04.fits
+/absolute/path/to/index-05.fits
+/absolute/path/to/index-06.fits
+/absolute/path/to/index-07.fits
+/absolute/path/to/index-08.fits

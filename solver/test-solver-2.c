@@ -10,9 +10,18 @@
 #include "solver.h"
 #include "index.h"
 #include "pquad.h"
+#include "bl-sort.h"
 #include "permutedsort.h"
 #include "quad-utils.h"
 #include "log.h"
+
+/*
+ * Emitted only by solver_test_2.o. It executes the shared AB-block evaluator
+ * serially so exact ordering can be compared without worker threads.
+ */
+int solver_test_ab_blocks_serial(solver_t* solver, int worker_count);
+int solver_test_ab_packet_bounds(void);
+int solver_test_ab_planner_invariants(void);
 
 static int compare_n(const void* v1, const void* v2, int N) {
     const int* u1 = v1;
@@ -39,8 +48,41 @@ static int compare_quint(const void* v1, const void* v2) {
 bl* quadlist;
 int ninv;
 
+typedef struct hypothesis_event {
+    int dimquad;
+    int stars[DQMAX];
+    double code[DCMAX];
+} hypothesis_event_t;
+
+typedef struct enumeration_counters {
+    int numtries;
+    int nummatches;
+    int num_cxdx_skipped;
+    int num_meanx_skipped;
+} enumeration_counters_t;
+
+static bl* exact_events;
+
 void test_try_permutations(int* stars, double* code, int dimquad, solver_t* s) {
     int i;
+
+    if (exact_events) {
+        hypothesis_event_t event;
+        int dimcode = (dimquad - 2) * 2;
+
+        memset(&event, 0, sizeof(event));
+        event.dimquad = dimquad;
+        memcpy(
+            event.stars,
+            stars,
+            (size_t)dimquad * sizeof(*stars));
+        memcpy(
+            event.code,
+            code,
+            (size_t)dimcode * sizeof(*code));
+        bl_append(exact_events, &event);
+        return;
+    }
     fflush(NULL);
     /*
      printf("test_try_permutations: [");
@@ -96,6 +138,97 @@ static starxy_t* field1() {
     return starxy;
 }
 
+static bl* collect_exact_hypotheses(
+    int dimquads,
+    anbool cxdx,
+    anbool use_ab_blocks,
+    enumeration_counters_t* counters) {
+    solver_t* solver;
+    index_t index;
+    starxy_t* starxy;
+    bl* collected;
+
+    starxy = field1();
+    solver = solver_new();
+    memset(&index, 0, sizeof(index));
+    index.index_scale_lower = 1;
+    index.index_scale_upper = 10;
+    index.dimquads = dimquads;
+    index.cx_less_than_dx = cxdx;
+    index.meanx_less_than_half = cxdx;
+
+    solver->funits_lower = 0.1;
+    solver->funits_upper = 10;
+    solver->endobj = starxy_n(starxy);
+    solver_add_index(solver, &index);
+    solver_set_field(solver, starxy);
+    solver_preprocess_field(solver);
+    assert(solver_prepare_field_geometry(solver));
+
+    collected = bl_new(32, sizeof(hypothesis_event_t));
+    assert(collected);
+    exact_events = collected;
+    if (use_ab_blocks) {
+        assert(!solver_test_ab_blocks_serial(solver, 4));
+    } else {
+        assert(!solver_run(solver));
+    }
+    exact_events = NULL;
+
+    counters->numtries = solver->numtries;
+    counters->nummatches = solver->nummatches;
+    counters->num_cxdx_skipped =
+        solver->num_cxdx_skipped;
+    counters->num_meanx_skipped =
+        solver->num_meanx_skipped;
+
+    solver_free_field(solver);
+    solver_free(solver);
+    return collected;
+}
+
+static void test_ab_block_hypothesis_order_exact(void) {
+    int dimquads;
+    int cxdx;
+
+    for (dimquads = 3; dimquads <= 5; dimquads++) {
+        for (cxdx = 0; cxdx <= 1; cxdx++) {
+            enumeration_counters_t serial_counters;
+            enumeration_counters_t block_counters;
+            bl* serial;
+            bl* blocks;
+            int i;
+
+            serial = collect_exact_hypotheses(
+                dimquads,
+                cxdx,
+                FALSE,
+                &serial_counters);
+            blocks = collect_exact_hypotheses(
+                dimquads,
+                cxdx,
+                TRUE,
+                &block_counters);
+
+            assert(bl_size(serial) == bl_size(blocks));
+            for (i = 0; i < bl_size(serial); i++) {
+                assert(!memcmp(
+                    bl_access(serial, i),
+                    bl_access(blocks, i),
+                    sizeof(hypothesis_event_t)));
+            }
+            assert(!memcmp(
+                &serial_counters,
+                &block_counters,
+                sizeof(serial_counters)));
+            bl_free(serial);
+            bl_free(blocks);
+        }
+    }
+    assert(!solver_test_ab_packet_bounds());
+    assert(!solver_test_ab_planner_invariants());
+}
+
 void testit(int* wanted, int Nwanted, int dimquads, int (*compar)(const void *, const void *),
             anbool cxdx) {
     int i;
@@ -143,7 +276,7 @@ void testit(int* wanted, int Nwanted, int dimquads, int (*compar)(const void *, 
         printf("}, ");
     }
     printf("\n");
-    printf("N found: %i; N wanted: %i\n", bl_size(quadlist), Nwanted);
+    printf("N found: %zu; N wanted: %i\n", bl_size(quadlist), Nwanted);
     printf("N obeying invariants: %i\n", ninv);
     assert(bl_size(quadlist) == Nwanted);
     for (i=0; i<bl_size(quadlist); i++) {
@@ -215,7 +348,7 @@ int main(int argc, char** args) {
         {0,1,3}, {1,0,3}, {2,0,3}, {0,2,3}, {1,2,3}, {2,1,3}, {4,2,3}, {4,2,3}, {0,1,4}, {1,0,4}, {0,1,4}, {1,0,4}, {2,0,4}, {0,2,4}, {3,0,4}, {0,3,4}, {1,2,4}, {2,1,4}, {1,3,4}, {3,1,4}, {0,5,4}, {5,0,4}, {5,1,4}, {1,5,4}, {5,2,0}, {2,5,0}, {2,5,1}, {5,2,1}, {5,2,3}, {5,2,3}, {5,2,4}, {5,2,4}, {3,5,4}, {5,3,4}, {3,5,4}, {5,3,4}, {1,0,5}, {0,1,5}, {0,6,4}, {6,0,4}, {0,6,5}, {6,0,5}, {6,1,4}, {1,6,4}, {6,1,5}, {1,6,5}, {6,2,0}, {2,6,0}, {2,6,1}, {6,2,1}, {2,6,3}, {2,6,3}, {2,6,4}, {6,2,4}, {2,6,4}, {6,2,4}, {6,2,5}, {6,2,5}, {6,3,0}, {3,6,0}, {3,6,1}, {6,3,1}, {3,6,4}, {3,6,4}, {3,6,5}, {3,6,5}, {4,6,5}, {4,6,5}
     };
     int wanted5b[][5] = {
-        {5,2,0,3,1}, {5,2,1,3,0}, {5,2,0,4,1}, {5,2,1,4,0}, {5,2,0,4,3}, {5,2,4,3,0}, {5,2,4,3,1}, {5,2,1,4,3}, {0,1,3,4,5}, {1,0,5,4,3}, {0,1,5,4,3}, {1,0,3,4,5}, {2,6,1,3,0}, {2,6,0,3,1}, {2,6,1,4,0}, {6,2,0,4,1}, {2,6,0,4,1}, {6,2,1,4,0}, {6,2,0,5,1}, {6,2,1,5,0}, {6,2,0,4,3}, {2,6,0,3,4}, {6,2,0,5,3}, {2,6,0,3,5}, {6,2,0,5,4}, {2,6,0,4,5}, {2,6,1,3,4}, {6,2,1,4,3}, {2,6,1,3,5}, {6,2,1,5,3}, {2,6,1,4,5}, {6,2,1,5,4}, {2,6,3,4,5}, {6,2,5,4,3}, {2,6,3,4,5}, {6,2,5,4,3}, {3,6,1,4,0}, {3,6,0,4,1}, {3,6,1,5,0}, {3,6,0,5,1}, {3,6,4,5,0}, {3,6,0,4,5}, {3,6,1,4,5}, {3,6,4,5,1}, 
+        {5,2,0,3,1}, {5,2,1,3,0}, {5,2,0,4,1}, {5,2,1,4,0}, {5,2,0,4,3}, {5,2,4,3,0}, {5,2,4,3,1}, {5,2,1,4,3}, {0,1,3,4,5}, {1,0,5,4,3}, {0,1,5,4,3}, {1,0,3,4,5}, {2,6,1,3,0}, {2,6,0,3,1}, {2,6,1,4,0}, {6,2,0,4,1}, {2,6,0,4,1}, {6,2,1,4,0}, {6,2,0,5,1}, {6,2,1,5,0}, {6,2,0,4,3}, {2,6,0,3,4}, {6,2,0,5,3}, {2,6,0,3,5}, {6,2,0,5,4}, {2,6,0,4,5}, {2,6,1,3,4}, {6,2,1,4,3}, {2,6,1,3,5}, {6,2,1,5,3}, {2,6,1,4,5}, {6,2,1,5,4}, {2,6,3,4,5}, {6,2,5,4,3}, {2,6,3,4,5}, {6,2,5,4,3}, {3,6,1,4,0}, {3,6,0,4,1}, {3,6,1,5,0}, {3,6,0,5,1}, {3,6,4,5,0}, {3,6,0,4,5}, {3,6,1,4,5}, {3,6,4,5,1},
     };
     int wanted4b[][4] = {
         {0,1,3,4}, {1,0,3,4}, {2,0,3,4}, {0,2,4,3}, {1,2,4,3}, {2,1,3,4}, {5,2,0,1}, {5,2,1,0}, {5,2,0,3}, {2,5,0,3}, {5,2,3,0}, {5,2,0,4}, {5,2,4,0}, {2,5,1,3}, {5,2,3,1}, {5,2,1,3}, {5,2,4,1}, {5,2,1,4}, {5,2,4,3}, {5,2,4,3}, {0,1,3,5}, {1,0,5,3}, {0,1,5,3}, {1,0,3,5}, {1,0,5,4}, {0,1,5,4}, {0,6,4,5}, {6,0,5,4}, {6,1,5,4}, {1,6,4,5}, {2,6,1,0}, {6,2,0,1}, {2,6,0,1}, {6,2,1,0}, {6,2,0,3}, {2,6,0,3}, {6,2,0,4}, {2,6,0,4}, {6,2,0,5}, {2,6,0,5}, {2,6,1,3}, {6,2,1,3}, {2,6,1,4}, {6,2,1,4}, {2,6,1,5}, {6,2,1,5}, {2,6,3,4}, {2,6,3,4}, {2,6,3,5}, {6,2,5,3}, {2,6,3,5}, {6,2,5,3}, {6,2,5,4}, {6,2,5,4}, {3,6,1,0}, {3,6,0,1}, {3,6,4,0}, {3,6,0,4}, {3,6,5,0}, {6,3,0,5}, {3,6,0,5}, {3,6,1,4}, {3,6,4,1}, {3,6,1,5}, {3,6,5,1}, {6,3,1,5}, {3,6,4,5}, {3,6,4,5}
@@ -248,7 +381,7 @@ int main(int argc, char** args) {
     testit(flatwanted, Nwanted, 5, compare_quint, TRUE);
     free(flatwanted);
 
+    test_ab_block_hypothesis_order_exact();
 
     return 0;
 }
-

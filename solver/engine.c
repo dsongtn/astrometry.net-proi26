@@ -20,6 +20,7 @@
 #include <getopt.h>
 #include <dirent.h>
 #include <assert.h>
+#include <limits.h>
 
 #include "math.h"
 
@@ -43,6 +44,81 @@
 #include "solver.h"
 #include "solverutils.h"
 #include "tic.h"
+#include "index_shard_config.h"
+#include "engine_internal.h"
+
+void engine_pass_cursor_init(engine_pass_cursor_t* cursor) {
+    if (!cursor) {
+        return;
+    }
+    memset(cursor, 0, sizeof(*cursor));
+}
+
+anbool engine_pass_cursor_next(const job_t* job,
+                               double default_lower,
+                               double default_upper,
+                               engine_pass_cursor_t* cursor,
+                               engine_pass_t* pass) {
+    size_t depth_count;
+    size_t scale_count;
+    int raw_start;
+    int raw_end;
+    double raw_lower;
+    double raw_upper;
+
+    if (!job || !job->depths || !job->scales || !cursor || !pass) {
+        return FALSE;
+    }
+    depth_count = (size_t)il_size(job->depths) / 2U;
+    scale_count = (size_t)dl_size(job->scales) / 2U;
+    if (!depth_count || !scale_count ||
+        cursor->next_depth_index >= depth_count) {
+        return FALSE;
+    }
+
+    memset(pass, 0, sizeof(*pass));
+    pass->ordinal = cursor->next_ordinal;
+    pass->depth_index = cursor->next_depth_index;
+    pass->scale_index = cursor->next_scale_index;
+
+    raw_start = il_get(job->depths, pass->depth_index * 2U);
+    raw_end = il_get(job->depths, pass->depth_index * 2U + 1U);
+    if (raw_start < 0 || raw_end < 0) {
+        return FALSE;
+    }
+    pass->startobj = raw_start ? raw_start - 1 : 0;
+    /*
+     * The user-facing upper bound is inclusive and one-based. Its numeric
+     * value is therefore already the zero-based exclusive bound. Zero is the
+     * native open-upper sentinel and must be written on every pass.
+     */
+    pass->endobj = raw_end;
+
+    raw_lower = dl_get(job->scales, pass->scale_index * 2U);
+    raw_upper = dl_get(job->scales, pass->scale_index * 2U + 1U);
+    pass->funits_lower =
+        raw_lower == 0.0 ? default_lower : raw_lower;
+    pass->funits_upper =
+        raw_upper == 0.0 ? default_upper : raw_upper;
+
+    cursor->next_scale_index++;
+    cursor->next_ordinal++;
+    if (cursor->next_scale_index >= scale_count) {
+        cursor->next_scale_index = 0U;
+        cursor->next_depth_index++;
+    }
+    return TRUE;
+}
+
+void engine_pass_apply(solver_t* solver, const engine_pass_t* pass) {
+    if (!solver || !pass) {
+        return;
+    }
+    solver->startobj = pass->startobj;
+    solver->endobj = pass->endobj;
+    solver->funits_lower = pass->funits_lower;
+    solver->funits_upper = pass->funits_upper;
+}
 
 void engine_add_search_path(engine_t* engine, const char* path) {
     sl_append(engine->index_paths, path);
@@ -194,7 +270,13 @@ int engine_add_index(engine_t* engine, char* path) {
     free(base);
 
     t0 = timenow();
-    ind = index_load(path, engine->inparallel ? 0 : INDEX_ONLY_LOAD_METADATA, NULL);
+    /*
+     * Ordinary registration is always metadata-only. Legacy grouped mode
+     * still loads all selected filename-owned indexes together inside
+     * onefield; it no longer needs every configured payload resident before
+     * scale and sky selection.
+     */
+    ind = index_load(path, INDEX_ONLY_LOAD_METADATA, NULL);
     debug("index_load(\"%s\") took %g ms\n", path, 1000 * (timenow() - t0));
     if (!ind) {
         ERROR("Failed to load index from path %s", path);
@@ -207,39 +289,6 @@ int engine_add_index(engine_t* engine, char* path) {
     pl_append(engine->free_indexes, ind);
     return 0;
 }
-// SECTION INDEX-SHARD: engine-lifecycle
-static void add_index_to_onefield(engine_t* engine, onefield_t* bp,
-                               int i) {
-    index_t* index;
-    index = pl_get(engine->indexes, i);
-    /*
-     * In pthread mode, workers load/close indexes through the normal onefield
-     * ownership path.  Do not share loaded index_t across workers.
-     */
-    if (index_shard_pthread_enabled()) {
-      onefield_add_index(bp, index->indexname);
-      return;
-    }
-    if (engine->inparallel) {
-        // The "indexset" feature means that we can get here without having
-        // actually loaded the index yet.
-        if (!index->codekd) {
-            char* ifn = index->indexfn;
-            char* iname = index->indexname;
-            logverb("Loading index %s\n", ifn);
-            if (!index_load(ifn, 0, index)) {
-                ERROR("Failed to load index %s\n", index->indexname);
-                return;
-            }
-            free(iname);
-            free(ifn);
-        }
-        onefield_add_loaded_index(bp, index);
-    } else {
-        onefield_add_index(bp, index->indexname);
-    }
-}
-
 int engine_parse_config_file(engine_t* engine, const char* fn) {
     FILE* fconf;
     int rtn;
@@ -308,6 +357,24 @@ int engine_parse_config_file_stream(engine_t* engine, FILE* fconf) {
             engine->maxwidth = atof(nextword);
         } else if (is_word(line, "cpulimit ", &nextword)) {
             engine->cpulimit = atof(nextword);
+        } else if (is_word(line, "p_workers ", &nextword) ||
+                   is_word(line, "index_shard_workers ", &nextword)) {
+            int available_cpus = index_shard_config_available_cpus();
+            int requested_workers;
+
+            if (index_shard_config_parse_workers(nextword,
+                                                 available_cpus,
+                                                 &requested_workers)) {
+                ERROR("Invalid p_workers value \"%s\": "
+                      "expected \"auto\" or an integer from 1 through %i",
+                      nextword,
+                      available_cpus);
+                rtn = -1;
+                goto done;
+            }
+
+            engine->index_shard_workers_config = requested_workers;
+            engine->index_shard_workers_config_set = TRUE;
         } else if (is_word(line, "depths ", &nextword)) {
             if (parse_depth_string(engine->default_depths, nextword)) {
                 rtn = -1;
@@ -465,6 +532,7 @@ static job_t* job_new() {
     }
     job->scales = dl_new(8);
     job->depths = il_new(8);
+    job->index_shard_workers_override = INDEX_SHARD_WORKERS_UNSET;
     return job;
 }
 
@@ -487,11 +555,17 @@ int engine_run_job(engine_t* engine, job_t* job) {
     onefield_t* bp = &(job->bp);
     solver_t* sp = &(bp->solver);
 
-    int i;
+    int rtn = 0;
     double app_min_default;
     double app_max_default;
-    anbool solved = FALSE;
+    double engine_wall_start = monotonic_seconds();
+    double pool_start_seconds = 0.0;
+    double pool_stop_seconds = 0.0;
     anbool index_shard_pool_started = FALSE;
+    anbool legacy_grouped =
+        engine->inparallel && !job->index_shard_workers_controlled;
+    engine_pass_cursor_t pass_cursor;
+    engine_pass_t pass;
 
     if (onefield_is_run_obsolete(bp, sp)) {
         goto finish;
@@ -499,21 +573,10 @@ int engine_run_job(engine_t* engine, job_t* job) {
     // SECTION INDEX-SHARD: engine-lifecycle
     bp->time_total_start = monotonic_seconds();
     bp->cpu_total_start = get_cpu_usage();
-
-    if (index_shard_pthread_enabled()) {
-      if (index_shard_pool_start(bp, sp)) {
-        ERROR("Failed to start index-shard pthread pool");
-        return -1;
-      }
-
-      index_shard_pool_started = TRUE;
-    }
+    bp->indexes_inparallel = legacy_grouped;
 
     app_min_default = deg2arcsec(engine->minwidth) / job_imagew(job);
     app_max_default = deg2arcsec(engine->maxwidth) / job_imagew(job);
-
-    if (engine->inparallel && !index_shard_pthread_enabled())
-      bp->indexes_inparallel = TRUE;
 
     if (job->use_radec_center) {
         logmsg("Only searching for solutions within %g degrees of RA,Dec (%g,%g)\n",
@@ -521,41 +584,68 @@ int engine_run_job(engine_t* engine, job_t* job) {
         solver_set_radec(sp, job->ra_center, job->dec_center, job->search_radius);
     }
 
-    for (i=0; i<il_size(job->depths)/2; i++) {
-        int startobj = il_get(job->depths, i*2);
-        int endobj = il_get(job->depths, i*2+1);
-        int j;
+    if (onefield_job_field_cache_begin(bp)) {
+        ERROR("Failed to initialize job field cache");
+        rtn = -1;
+        goto finish;
+    }
 
-        if (startobj || endobj) {
-            // make depth ranges be inclusive.
-            endobj++;
-            // up to this point they are 1-indexed, but with default value
-            // zero; onefield uses 0-indexed.
-            if (startobj)
-                startobj--;
-            if (endobj)
-                endobj--;
+    if (index_shard_pthread_enabled(bp) && !legacy_grouped) {
+        double pool_wall_start = monotonic_seconds();
+
+        if (index_shard_pool_start(bp, sp)) {
+            ERROR("Failed to start parallel solver pool");
+            rtn = -1;
+            goto finish;
         }
 
-        for (j=0; j<dl_size(job->scales) / 2; j++) {
+        pool_start_seconds =
+            monotonic_seconds() - pool_wall_start;
+        index_shard_pool_started = TRUE;
+    }
+
+    engine_pass_cursor_init(&pass_cursor);
+    while (engine_pass_cursor_next(
+               job,
+               app_min_default,
+               app_max_default,
+               &pass_cursor,
+               &pass)) {
             double fmin, fmax;
             double app_max, app_min;
             int k;
             il* indexlist;
+            il* selectedlist;
+            anbool selected_loaded_index = FALSE;
+            anbool pass_limit_reached = FALSE;
+
+            /*
+             * Index selection and materialization can be expensive and fault
+             * mapped metadata.  A job budget is terminal across the whole
+             * pass sequence; never start another pass after it expires.
+             */
+            if (onefield_check_total_limits(bp)) {
+                break;
+            }
 
             // arcsec per pixel range
-            app_min = dl_get(job->scales, j * 2);
-            app_max = dl_get(job->scales, j * 2 + 1);
-            if (app_min == 0.0)
-                app_min = app_min_default;
-            if (app_max == 0.0)
-                app_max = app_max_default;
-            sp->funits_lower = app_min;
-            sp->funits_upper = app_max;
-
-            sp->startobj = startobj;
-            if (endobj)
-                sp->endobj = endobj;
+            app_min = pass.funits_lower;
+            app_max = pass.funits_upper;
+            engine_pass_apply(sp, &pass);
+            bp->engine_pass_ordinal = pass.ordinal;
+            bp->engine_depth_index = pass.depth_index;
+            bp->engine_scale_index = pass.scale_index;
+            logverb("[engine-pass] state=begin ordinal=%zu "
+                    "depth_index=%zu scale_index=%zu "
+                    "startobj=%i endobj=%i "
+                    "funits_lower=%.17g funits_upper=%.17g\n",
+                    pass.ordinal,
+                    pass.depth_index,
+                    pass.scale_index,
+                    pass.startobj,
+                    pass.endobj,
+                    pass.funits_lower,
+                    pass.funits_upper);
 
             // minimum quad size to try (in pixels)
             sp->quadsize_min = bp->quad_size_fraction_lo *
@@ -590,41 +680,111 @@ int engine_run_job(engine_t* engine, job_t* job) {
                 il_append_list(indexlist, list);
             }
 
+            selectedlist = il_new(il_size(indexlist));
             for (k=0; k<il_size(indexlist); k++) {
                 int ii = il_get(indexlist, k);
                 index_t* index = pl_get(engine->indexes, ii);
                 anbool inrange = TRUE;
-                if (job->use_radec_center)
+                if (job->use_radec_center) {
                     inrange = index_is_within_range(index, job->ra_center, job->dec_center, job->search_radius);
+                }
                 if (!inrange) {
                     logverb("Not using index %s because it's not within %g degrees of (RA,Dec) = (%g,%g)\n",
                             index->indexname, job->search_radius, job->ra_center, job->dec_center);
                     continue;
                 }
-                add_index_to_onefield(engine, bp, ii);
+                il_append(selectedlist, ii);
+                if (index->starkd && index->quads && index->codekd) {
+                    selected_loaded_index = TRUE;
+                }
             }
 
             il_free(indexlist);
+            if (onefield_check_total_limits(bp)) {
+                il_free(selectedlist);
+                logverb("[engine-pass] state=end ordinal=%zu "
+                        "reason=limit-before-materialization\n",
+                        pass.ordinal);
+                break;
+            }
+            /*
+             * onefield keeps filename and loaded handles in separate lists.
+             * If a pass contains a borrowed multiindex component, materialize
+             * every ordinary member into the loaded list so their original
+             * interleaved order is preserved exactly.
+             */
+            for (k = 0; k < il_size(selectedlist); k++) {
+                int ii = il_get(selectedlist, k);
+                index_t* index = pl_get(engine->indexes, ii);
+
+                if (!selected_loaded_index) {
+                    onefield_add_index(bp, index->indexfn);
+                } else if (index->starkd &&
+                           index->quads &&
+                           index->codekd) {
+                    onefield_add_loaded_index(bp, index);
+                } else {
+                    index_t* owned_index =
+                        index_load(index->indexfn, 0, NULL);
+
+                    if (!owned_index) {
+                        ERROR("Failed to load selected index %s",
+                              index->indexfn);
+                        il_free(selectedlist);
+                        rtn = -1;
+                        goto finish;
+                    }
+                    onefield_add_owned_index(bp, owned_index);
+                }
+
+                if (onefield_check_total_limits(bp)) {
+                    pass_limit_reached = TRUE;
+                    break;
+                }
+            }
+            il_free(selectedlist);
+            if (pass_limit_reached) {
+                onefield_clear_indexes(bp);
+                solver_clear_indexes(sp);
+                logverb("[engine-pass] state=end ordinal=%zu "
+                        "reason=limit-during-materialization\n",
+                        pass.ordinal);
+                break;
+            }
 
             logverb("Running solver:\n");
             onefield_log_run_parameters(bp);
 
             onefield_run(bp);
 
+            if (bp->solver_failed) {
+                rtn = -1;
+                goto finish;
+            }
+
             // we only want to try using the verify_wcses the first time.
             onefield_clear_verify_wcses(bp);
             onefield_clear_indexes(bp);
             onefield_clear_solutions(bp);
-            onefield_clear_indexes(bp);
             solver_clear_indexes(sp);
 
-            if (onefield_is_run_obsolete(bp, sp)) {
-                solved = TRUE;
+            logverb("[engine-pass] state=end ordinal=%zu "
+                    "solved=%i cancelled=%i "
+                    "hit_total_cpu_limit=%i "
+                    "hit_total_wall_limit=%i failed=%i\n",
+                    pass.ordinal,
+                    bp->single_field_solved ? 1 : 0,
+                    bp->cancelled ? 1 : 0,
+                    bp->hit_total_cpulimit ? 1 : 0,
+                    bp->hit_total_timelimit ? 1 : 0,
+                    bp->solver_failed ? 1 : 0);
+
+            if (onefield_check_total_limits(bp)) {
                 break;
             }
-        }
-        if (solved)
-            break;
+            if (onefield_is_run_obsolete(bp, sp)) {
+                break;
+            }
     }
 
     logverb("cx<=dx constraints: %i\n", sp->num_cxdx_skipped);
@@ -634,11 +794,25 @@ int engine_run_job(engine_t* engine, job_t* job) {
 
  finish:
    // SECTION INDEX-SHARD: engine-lifecycle
-   if (index_shard_pool_started)
+   if (index_shard_pool_started) {
+     double pool_wall_start = monotonic_seconds();
+
      index_shard_pool_stop(bp);
+     pool_stop_seconds =
+         monotonic_seconds() - pool_wall_start;
+   }
+   onefield_job_field_cache_end(bp);
+
+   logverb("[engine-profile] pool_start=%.6f pool_stop=%.6f "
+           "engine_total=%.6f solver_failed=%i\n",
+           pool_start_seconds,
+           pool_stop_seconds,
+           monotonic_seconds() - engine_wall_start,
+           bp->solver_failed ? 1 : 0);
+
    solver_cleanup(sp);
    onefield_cleanup(bp);
-   return 0;
+   return rtn;
 }
 
 static void parse_sip_coeffs(const qfits_header* hdr, const char* prefix, sip_t* wcs) {
@@ -752,6 +926,18 @@ static anbool parse_job_from_qfits_header(const qfits_header* hdr, job_t* job) {
 
     bp->timelimit = qfits_header_getdouble(hdr, "ANTLIM", 0.0);
     bp->cpulimit = qfits_header_getdouble(hdr, "ANCLIM", 0.0);
+    if (qfits_header_getstr(hdr, "ANSHWRK")) {
+        int requested_workers =
+            qfits_header_getint(hdr, "ANSHWRK", INT_MIN);
+
+        if (requested_workers == INT_MIN) {
+            logerr("Invalid ANSHWRK worker value in augmented job header.\n");
+            goto bailout;
+        }
+
+        job->index_shard_workers_override = requested_workers;
+        job->index_shard_workers_override_set = TRUE;
+    }
     bp->logratio_tosolve = log(qfits_header_getdouble(hdr, "ANODDSSL", default_odds_tosolve));
     logverb("Set odds ratio to solve to %g (log = %g)\n", exp(bp->logratio_tosolve), bp->logratio_tosolve);
 
@@ -1011,6 +1197,7 @@ engine_t* engine_new() {
     engine->minwidth = 0.1;
     engine->maxwidth = 180.0;
     engine->cpulimit = 600.0;
+    engine->index_shard_workers_config = INDEX_SHARD_WORKERS_AUTO;
     return engine;
 }
 
@@ -1044,6 +1231,94 @@ void engine_free(engine_t* engine) {
     free(engine);
 }
 
+static int engine_resolve_index_shard_workers(engine_t *engine,
+                                              job_t *job) {
+    const char *environment_value;
+    const char *source;
+    int available_cpus;
+    int requested_workers;
+    int resolved_workers;
+    char requested_text[32];
+
+    if (!engine || !job) {
+        ERROR("Cannot resolve parallel workers without engine and job state");
+        return -1;
+    }
+
+    available_cpus = index_shard_config_available_cpus();
+    requested_workers = engine->index_shard_workers_config;
+    source = engine->index_shard_workers_config_set
+        ? "config"
+        : "built-in";
+
+    if (job->index_shard_workers_override_set) {
+        requested_workers = job->index_shard_workers_override;
+        if (index_shard_config_validate_workers(requested_workers,
+                                                available_cpus)) {
+            ERROR("Invalid ANSHWRK worker override %i: "
+                  "expected automatic selection or an integer from "
+                  "1 through %i",
+                  requested_workers,
+                  available_cpus);
+            return -1;
+        }
+        source = "solve-field";
+    } else {
+        /*
+         * Retain the legacy environment override for existing measurement
+         * harnesses. New production commands should use the per-job
+         * solve-field option, whose AXY header has higher precedence.
+         */
+        environment_value = getenv("ASTROMETRY_P_WORKERS");
+        if (!environment_value || !environment_value[0]) {
+            environment_value = getenv("ASTROMETRY_INDEX_SHARD_WORKERS");
+        }
+        if (environment_value && environment_value[0]) {
+            if (index_shard_config_parse_workers(environment_value,
+                                                 available_cpus,
+                                                 &requested_workers)) {
+                ERROR("Invalid parallel worker environment value \"%s\": "
+                      "expected \"auto\" or an integer from 1 through %i",
+                      environment_value,
+                      available_cpus);
+                return -1;
+            }
+            source = "environment";
+        }
+    }
+
+    resolved_workers =
+        index_shard_config_resolve_workers(requested_workers,
+                                           available_cpus);
+    if (resolved_workers < 1) {
+        ERROR("Failed to resolve parallel worker count");
+        return -1;
+    }
+
+    job->bp.index_shard_workers = resolved_workers;
+    job->index_shard_workers_controlled =
+        strcmp(source, "built-in") != 0;
+
+    if (requested_workers == INDEX_SHARD_WORKERS_AUTO) {
+        snprintf(requested_text, sizeof(requested_text), "auto");
+    } else {
+        snprintf(requested_text,
+                 sizeof(requested_text),
+                 "%i",
+                 requested_workers);
+    }
+
+    logverb("[parallel] worker-config source=%s requested=%s "
+            "available=%i effective=%i mode=%s\n",
+            source,
+            requested_text,
+            available_cpus,
+            resolved_workers,
+            resolved_workers > 1 ? "pthread" : "serial");
+
+    return 0;
+}
+
 job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
     qfits_header* hdr;
     job_t* job;
@@ -1064,6 +1339,13 @@ job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
     qfits_header_destroy(hdr);
 
     bp = &(job->bp);
+
+    if (engine_resolve_index_shard_workers(engine, job)) {
+        solver_cleanup(&bp->solver);
+        onefield_cleanup(bp);
+        job_free(job);
+        return NULL;
+    }
 
     onefield_set_field_file(bp, jobfn);
 
@@ -1125,7 +1407,7 @@ job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
                 job_cpulimit, cfg_cpulimit);
       }
 
-      if (index_shard_pthread_enabled()) {
+      if (index_shard_pthread_enabled(bp)) {
         /*
          * pthread path:
          * total_cpulimit is the process-wide budget checked by
@@ -1139,31 +1421,30 @@ job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
          * keep bp->cpulimit as the ordinary effective run limit.
          */
         bp->cpulimit = effective_cpulimit;
-
-        /*
-         * Preserve the original total-limit behavior outside the old
-         * indexes-inparallel engine path.
-         */
-        if (!engine->inparallel)
-          bp->total_cpulimit = effective_cpulimit;
+        bp->total_cpulimit = effective_cpulimit;
       }
 
       bp->total_timelimit = bp->timelimit;
     }
 
-    logmsg("[index-shard] engine limits after setup: "
-           "cpulimit=%f total_cpulimit=%f timelimit=%g total_timelimit=%g\n",
-           bp->cpulimit, bp->total_cpulimit, bp->timelimit,
-           bp->total_timelimit);
+    logverb("[index-shard] engine limits after setup: "
+            "cpulimit=%f total_cpulimit=%f timelimit=%g total_timelimit=%g\n",
+            bp->cpulimit, bp->total_cpulimit, bp->timelimit,
+            bp->total_timelimit);
 
     // If the job didn't specify depths, set defaults.
     if (il_size(job->depths) == 0) {
-        if (engine->inparallel) {
-            // no limit.
-            il_append(job->depths, 0);
-            il_append(job->depths, 0);
-        } else
+        if (il_size(engine->default_depths) != 0) {
             il_append_list(job->depths, engine->default_depths);
+        } else {
+            /*
+             * An empty site default means the original unbounded depth
+             * interval. Keep this scientific search space independent of
+             * worker count and of the legacy "inparallel" token.
+             */
+            il_append(job->depths, 0);
+            il_append(job->depths, 0);
+        }
     }
 
     if (engine->cancelfn)
@@ -1246,4 +1527,3 @@ int job_set_output_base_dir(job_t* job, const char* dir) {
     }
     return 0;
 }
-

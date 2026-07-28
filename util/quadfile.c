@@ -128,19 +128,28 @@ qfits_header* quadfile_get_header(const quadfile_t* qf) {
     return fitsbin_get_primary_header(qf->fb);
 }
 
-static quadfile_t* my_open(const char* fn, anqfits_t* fits) {
+static quadfile_t* my_open(const char* fn, anqfits_t* fits,
+                           anbool metadata_only) {
     quadfile_t* qf = NULL;
     fitsbin_chunk_t* chunk;
 
     qf = new_quadfile(fn, fits, FALSE);
-    if (!qf)
-        goto bailout;
-    if (fitsbin_read(qf->fb)) {
-        ERROR("Failed to open quads file");
+    if (!qf) {
         goto bailout;
     }
     chunk = quads_chunk(qf);
-    qf->quadarray = chunk->data;
+    if (metadata_only) {
+        if (fitsbin_read_chunk_header(qf->fb, chunk)) {
+            ERROR("Failed to read quads metadata");
+            goto bailout;
+        }
+    } else {
+        if (fitsbin_read(qf->fb)) {
+            ERROR("Failed to open quads file");
+            goto bailout;
+        }
+        qf->quadarray = chunk->data;
+    }
 
     // close fd.
     if (qf->fb->fid) {
@@ -164,11 +173,15 @@ char* quadfile_get_filename(const quadfile_t* qf) {
 }
 
 quadfile_t* quadfile_open_fits(anqfits_t* fits) {
-    return my_open(NULL, fits);
+    return my_open(NULL, fits, FALSE);
+}
+
+quadfile_t* quadfile_open_fits_metadata(anqfits_t* fits) {
+    return my_open(NULL, fits, TRUE);
 }
 
 quadfile_t* quadfile_open(const char* fn) {
-    return my_open(fn, NULL);
+    return my_open(fn, NULL, FALSE);
 }
 
 int quadfile_close(quadfile_t* qf) {
@@ -357,7 +370,9 @@ int quadfile_get_stars(const quadfile_t* qf, unsigned int quadid, unsigned int* 
 int quadfile_prefetch_stars(const quadfile_t* qf,
                             const unsigned int* quadids,
                             int nquads) {
+    fitsbin_prefetch_range_t ranges[32];
     size_t row_size;
+    int accepted;
     int i;
 
     if (!qf || !quadids || nquads <= 0 || !qf->quadarray) {
@@ -365,8 +380,9 @@ int quadfile_prefetch_stars(const quadfile_t* qf,
     }
 
     row_size = (size_t)qf->dimquads * sizeof(uint32_t);
+    accepted = MIN(nquads, (int)(sizeof(ranges) / sizeof(ranges[0])));
 
-    for (i = 0; i < nquads; i++) {
+    for (i = 0; i < accepted; i++) {
         const uint32_t* row;
 
         if (quadids[i] >= qf->numquads) {
@@ -375,9 +391,81 @@ int quadfile_prefetch_stars(const quadfile_t* qf,
 
         row = qf->quadarray +
             (size_t)quadids[i] * (size_t)qf->dimquads;
-        fitsbin_prefetch_data(qf->fb, row, row_size);
+        ranges[i].data = row;
+        ranges[i].size = row_size;
     }
 
+    /*
+     * Exact acquisition is advisory.  A refused/unsupported reader leaves the
+     * normal mmap path authoritative for scientific behavior.
+     */
+    (void)fitsbin_prefetch_ranges(
+        qf->fb,
+        ranges,
+        (size_t)accepted,
+        256U * 1024U);
     return 0;
 }
 
+#define QUADFILE_MAPPED_ADVICE_RANGE_LIMIT 256U
+
+int quadfile_advise_rows(const quadfile_t* qf,
+                         const unsigned int* quadids,
+                         int nquads) {
+    fitsbin_prefetch_range_t
+        ranges[QUADFILE_MAPPED_ADVICE_RANGE_LIMIT];
+    size_t accepted;
+    size_t byte_budget;
+    size_t per_range_budget;
+    size_t row_size;
+    long detected_page_size;
+    int advised;
+    size_t i;
+
+    if (!qf || !quadids || nquads <= 0 ||
+        !qf->fb || !qf->quadarray || qf->dimquads <= 0) {
+        return 0;
+    }
+    if ((size_t)qf->dimquads >
+        SIZE_MAX / sizeof(*qf->quadarray)) {
+        return -1;
+    }
+    row_size =
+        (size_t)qf->dimquads * sizeof(*qf->quadarray);
+    accepted = MIN(
+        (size_t)nquads,
+        (size_t)QUADFILE_MAPPED_ADVICE_RANGE_LIMIT);
+    detected_page_size = sysconf(_SC_PAGESIZE);
+    if (detected_page_size <= 0 ||
+        (size_t)detected_page_size >
+            (SIZE_MAX - row_size) / 2U) {
+        return 0;
+    }
+    per_range_budget = row_size +
+        2U * (size_t)detected_page_size;
+    if (accepted > SIZE_MAX / per_range_budget) {
+        return 0;
+    }
+    byte_budget = accepted * per_range_budget;
+
+    /*
+     * Populate only a fixed canonical lookahead. Later rows stay under
+     * NORMAL advice and are consumed by the original loop on demand.
+     */
+    for (i = 0U; i < accepted; i++) {
+        unsigned int quadid = quadids[i];
+
+        if (quadid >= qf->numquads) {
+            return -1;
+        }
+        ranges[i].data = qf->quadarray +
+            (size_t)quadid * (size_t)qf->dimquads;
+        ranges[i].size = row_size;
+    }
+    advised = fitsbin_advise_mapped_ranges(
+        qf->fb,
+        ranges,
+        accepted,
+        byte_budget);
+    return advised;
+}

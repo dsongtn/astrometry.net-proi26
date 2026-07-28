@@ -4,7 +4,9 @@
  */
 
 #include <assert.h>
+#include <limits.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -17,8 +19,30 @@
 #include "sip-utils.h"
 #include "healpix.h"
 #include "datalog.h"
+#include "index_shard_internal.h"
 
 #define DEBUGVERIFY 0
+
+#define VERIFY_PROJECTION_MAX_TASKS 6U
+#define VERIFY_PROJECTION_MIN_STARS_PER_TASK 256U
+
+/*
+ * verify.o is also linked into legacy tools that do not include
+ * index_shard.o. Weak references keep those tools on the original inline
+ * path while the solver engine supplies the strong helper scheduler.
+ */
+#if defined(__GNUC__) && !defined(_WIN32)
+extern size_t index_shard_helper_available_workers(void)
+    __attribute__((weak));
+extern index_shard_helper_run_status_t index_shard_helper_run(
+    const index_shard_helper_ops_t* ops,
+    index_shard_helper_task_t* tasks,
+    size_t task_count,
+    index_shard_helper_run_stats_t* stats) __attribute__((weak));
+#define VERIFY_PROJECTION_HELPERS_LINKED 1
+#else
+#define VERIFY_PROJECTION_HELPERS_LINKED 0
+#endif
 
 #if DEBUGVERIFY
 #define debug2(args...) logdebug(args)
@@ -34,6 +58,10 @@
 #define DLOG_ODDS_MIN log(1e6)
 
 #define dlog(lev, fmt, ...) data_log(DATALOG_MASK_VERIFY, lev, fmt, ##__VA_ARGS__)
+
+anbool verify_datalog_enabled(void) {
+    return data_log_passes(DATALOG_MASK_VERIFY, DLOG_ODDS);
+}
 
 struct verify_s {
     const sip_t* wcs;
@@ -58,6 +86,384 @@ struct verify_s {
 
 };
 typedef struct verify_s verify_t;
+
+typedef enum verify_prepared_state {
+    VERIFY_PREPARED_READY = 0,
+    VERIFY_PREPARED_NO_REFERENCE = 1,
+    VERIFY_PREPARED_NO_QUAD_REFERENCE = 2,
+    VERIFY_PREPARED_NO_ROR_REFERENCE = 3,
+    VERIFY_PREPARED_EMPTY_LISTS = 4
+} verify_prepared_state_t;
+
+struct verify_prepared_hit {
+    verify_t verify;
+    sip_t wcs;
+    double* refxyz;
+    double effective_area;
+    double distractors;
+    double logbail;
+    double logaccept;
+    double logstoplooking;
+    int nrimage;
+    verify_prepared_state_t state;
+    anbool fake_match;
+};
+
+/*
+ * Verification projects a different reference-star set for every candidate.
+ * Building a general-purpose KD tree for each set is expensive, particularly
+ * for candidates that bail out after only a few test stars.  Use a bounded
+ * flat spatial hash for the common case and retain the original KD path for
+ * exact ties and pathological geometry.
+ */
+#define VERIFY_NN_LINEAR_WORK_LIMIT 256
+#define VERIFY_NN_SMALL_KD_LIMIT 24
+#define VERIFY_NN_MAX_CELL_OCCUPANCY 64
+#define VERIFY_NN_MIN_SLOTS 64
+
+typedef enum verify_nn_mode {
+    VERIFY_NN_LINEAR,
+    VERIFY_NN_GRID,
+    VERIFY_NN_KDTREE
+} verify_nn_mode_t;
+
+typedef struct verify_nn {
+    verify_nn_mode_t mode;
+    double* points;
+    int npoints;
+    double cellsize;
+    size_t nslots;
+    unsigned char* workspace;
+    int* heads;
+    int* next;
+    int64_t* cellx;
+    int64_t* celly;
+    kdtree_t* tree;
+} verify_nn_t;
+
+static uint64_t verify_nn_hash_word(uint64_t value) {
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+
+static size_t verify_nn_hash_cell(int64_t x, int64_t y, size_t mask) {
+    uint64_t hx = verify_nn_hash_word((uint64_t)x);
+    uint64_t hy = verify_nn_hash_word((uint64_t)y);
+    return (size_t)(hx ^ ((hy << 32) | (hy >> 32))) & mask;
+}
+
+static anbool verify_nn_cell_coord(double value, double cellsize,
+                                  int64_t* cell) {
+    double scaled;
+
+    scaled = value / cellsize;
+    /*
+     * Beyond 2^52, adjacent double-precision cell coordinates are no longer
+     * reliable.  The legacy KD implementation remains exact for that case.
+     */
+    if (!isfinite(scaled) || fabs(scaled) > 0x1p52) {
+        return FALSE;
+    }
+    *cell = (int64_t)floor(scaled);
+    return TRUE;
+}
+
+static void verify_nn_free_grid(verify_nn_t* nn) {
+    free(nn->workspace);
+    nn->workspace = NULL;
+    nn->heads = NULL;
+    nn->next = NULL;
+    nn->cellx = NULL;
+    nn->celly = NULL;
+    nn->nslots = 0;
+}
+
+static anbool verify_nn_build_grid(verify_nn_t* nn,
+                                  const double* sigma2,
+                                  const int* testperm,
+                                  int ntest) {
+    double maxd2 = 0.0;
+    size_t coordoffset;
+    size_t intcount;
+    size_t nbytes;
+    size_t target;
+    size_t mask;
+    size_t nslots;
+    int maxoccupancy = 0;
+    int i;
+    size_t slot;
+
+    for (i=0; i<ntest; i++) {
+        double d2 = sigma2[testperm[i]] * 25.0;
+        if (!isfinite(d2) || d2 <= 0.0) {
+            return FALSE;
+        }
+        maxd2 = MAX(maxd2, d2);
+    }
+    if (!(maxd2 > 0.0)) {
+        return FALSE;
+    }
+    nn->cellsize = nextafter(sqrt(maxd2), HUGE_VAL);
+    if (!isfinite(nn->cellsize) || nn->cellsize <= 0.0) {
+        return FALSE;
+    }
+
+    if ((size_t)nn->npoints > SIZE_MAX / 2U) {
+        return FALSE;
+    }
+    target = (size_t)nn->npoints * 2U;
+    nslots = VERIFY_NN_MIN_SLOTS;
+    while (nslots < target) {
+        if (nslots > SIZE_MAX / 2U) {
+            return FALSE;
+        }
+        nslots *= 2U;
+    }
+
+    if (nslots > SIZE_MAX - (size_t)nn->npoints) {
+        return FALSE;
+    }
+    intcount = nslots + (size_t)nn->npoints;
+    if (intcount > SIZE_MAX / sizeof(int)) {
+        return FALSE;
+    }
+    coordoffset = intcount * sizeof(int);
+    if (coordoffset > SIZE_MAX - (sizeof(int64_t) - 1U)) {
+        return FALSE;
+    }
+    coordoffset = (coordoffset + sizeof(int64_t) - 1U) &
+                  ~(sizeof(int64_t) - 1U);
+    if (nslots > (SIZE_MAX - coordoffset) / (2U * sizeof(int64_t))) {
+        return FALSE;
+    }
+    nbytes = coordoffset + 2U * nslots * sizeof(int64_t);
+
+    nn->workspace = calloc(1, nbytes);
+    if (!nn->workspace) {
+        return FALSE;
+    }
+    nn->nslots = nslots;
+    nn->heads = (int*)nn->workspace;
+    nn->next = nn->heads + nslots;
+    nn->cellx = (int64_t*)(nn->workspace + coordoffset);
+    nn->celly = nn->cellx + nslots;
+    mask = nslots - 1U;
+
+    for (i=0; i<nn->npoints; i++) {
+        int64_t x;
+        int64_t y;
+        size_t slot;
+
+        if (!verify_nn_cell_coord(nn->points[2*i], nn->cellsize, &x) ||
+            !verify_nn_cell_coord(nn->points[2*i+1], nn->cellsize, &y)) {
+            verify_nn_free_grid(nn);
+            return FALSE;
+        }
+        slot = verify_nn_hash_cell(x, y, mask);
+        while (nn->heads[slot] &&
+               (nn->cellx[slot] != x || nn->celly[slot] != y)) {
+            slot = (slot + 1U) & mask;
+        }
+        if (!nn->heads[slot]) {
+            nn->cellx[slot] = x;
+            nn->celly[slot] = y;
+        }
+        nn->next[i] = nn->heads[slot] - 1;
+        nn->heads[slot] = i + 1;
+    }
+
+    for (slot=0; slot<nslots; slot++) {
+        int occupancy = 0;
+        int point;
+        for (point=nn->heads[slot] - 1;
+             point >= 0;
+             point=nn->next[point]) {
+            occupancy++;
+        }
+        maxoccupancy = MAX(maxoccupancy, occupancy);
+    }
+    if (maxoccupancy > VERIFY_NN_MAX_CELL_OCCUPANCY) {
+        verify_nn_free_grid(nn);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void verify_nn_init(verify_nn_t* nn,
+                           double* points,
+                           int npoints,
+                           const double* sigma2,
+                           const int* testperm,
+                           int ntest) {
+    memset(nn, 0, sizeof(*nn));
+    nn->mode = VERIFY_NN_LINEAR;
+    nn->points = points;
+    nn->npoints = npoints;
+    if (npoints > 0 && ntest > 0 &&
+        (size_t)npoints <=
+        (size_t)VERIFY_NN_LINEAR_WORK_LIMIT / (size_t)ntest) {
+        return;
+    }
+    if (npoints <= VERIFY_NN_SMALL_KD_LIMIT) {
+        nn->tree = kdtree_build(NULL, nn->points, nn->npoints, 2, 10,
+                                KDTT_DOUBLE, KD_BUILD_SPLIT);
+        nn->mode = VERIFY_NN_KDTREE;
+        return;
+    }
+    {
+        if (verify_nn_build_grid(nn, sigma2, testperm, ntest)) {
+            nn->mode = VERIFY_NN_GRID;
+        } else {
+            nn->tree = kdtree_build(NULL, nn->points, nn->npoints, 2, 10,
+                                    KDTT_DOUBLE, KD_BUILD_SPLIT);
+            nn->mode = VERIFY_NN_KDTREE;
+        }
+    }
+}
+
+static size_t verify_nn_find_slot(const verify_nn_t* nn,
+                                  int64_t x, int64_t y) {
+    size_t mask = nn->nslots - 1U;
+    size_t slot = verify_nn_hash_cell(x, y, mask);
+
+    while (nn->heads[slot]) {
+        if (nn->cellx[slot] == x && nn->celly[slot] == y) {
+            return slot;
+        }
+        slot = (slot + 1U) & mask;
+    }
+    return SIZE_MAX;
+}
+
+static void verify_nn_consider_point(const verify_nn_t* nn,
+                                     int point,
+                                     const double* query,
+                                     double* bestd2,
+                                     int* best,
+                                     anbool* tied) {
+    const double* ref = nn->points + 2*point;
+    double delta;
+    double d2;
+
+    /*
+     * Force a scalar rounding point between dimensions.  This matches the KD
+     * kernel even when the build permits floating-point contraction.
+     */
+    delta = query[0] - ref[0];
+    d2 = delta * delta;
+    {
+        volatile double rounded = d2;
+        d2 = rounded;
+    }
+    delta = query[1] - ref[1];
+    {
+        volatile double squared = delta * delta;
+        d2 += squared;
+    }
+    if (d2 > *bestd2) {
+        return;
+    }
+    if (*best == -1 || d2 < *bestd2) {
+        *best = point;
+        *bestd2 = d2;
+        *tied = FALSE;
+    } else if (d2 == *bestd2) {
+        *tied = TRUE;
+    }
+}
+
+static anbool verify_nn_flat_query(const verify_nn_t* nn,
+                                   const double* query,
+                                   double maxd2,
+                                   int* best,
+                                   double* bestd2,
+                                   anbool* tied) {
+    int i;
+
+    if (!isfinite(query[0]) || !isfinite(query[1]) ||
+        !isfinite(maxd2) || maxd2 < 0.0) {
+        return FALSE;
+    }
+    *best = -1;
+    *bestd2 = maxd2;
+    *tied = FALSE;
+
+    if (nn->mode == VERIFY_NN_LINEAR) {
+        for (i=0; i<nn->npoints; i++) {
+            verify_nn_consider_point(nn, i, query, bestd2, best, tied);
+        }
+        return TRUE;
+    }
+
+    {
+        int64_t qx;
+        int64_t qy;
+        int dx;
+        int dy;
+
+        if (!verify_nn_cell_coord(query[0], nn->cellsize, &qx) ||
+            !verify_nn_cell_coord(query[1], nn->cellsize, &qy)) {
+            return FALSE;
+        }
+        for (dy=-1; dy<=1; dy++) {
+            for (dx=-1; dx<=1; dx++) {
+                size_t slot = verify_nn_find_slot(nn, qx + dx, qy + dy);
+                int point;
+                if (slot == SIZE_MAX) {
+                    continue;
+                }
+                for (point=nn->heads[slot] - 1;
+                     point >= 0;
+                     point=nn->next[point]) {
+                    verify_nn_consider_point(nn, point, query,
+                                             bestd2, best, tied);
+                }
+            }
+        }
+    }
+    return TRUE;
+}
+
+static void verify_nn_promote(verify_nn_t* nn) {
+    if (nn->mode == VERIFY_NN_KDTREE) {
+        return;
+    }
+    verify_nn_free_grid(nn);
+    nn->tree = kdtree_build(NULL, nn->points, nn->npoints, 2, 10,
+                            KDTT_DOUBLE, KD_BUILD_SPLIT);
+    nn->mode = VERIFY_NN_KDTREE;
+}
+
+static int verify_nn_query(verify_nn_t* nn,
+                           const double* query,
+                           double maxd2,
+                           double* bestd2) {
+    int best;
+
+    if (nn->mode != VERIFY_NN_KDTREE) {
+        anbool tied;
+        if (verify_nn_flat_query(nn, query, maxd2,
+                                 &best, bestd2, &tied) && !tied) {
+            return best;
+        }
+        verify_nn_promote(nn);
+    }
+
+    best = kdtree_nearest_neighbour_within(nn->tree, query, maxd2, bestd2);
+    if (best == -1) {
+        return -1;
+    }
+    return kdtree_permute(nn->tree, best);
+}
+
+static void verify_nn_cleanup(verify_nn_t* nn) {
+    verify_nn_free_grid(nn);
+    kdtree_free(nn->tree);
+    nn->tree = NULL;
+}
 
 static anbool* verify_deduplicate_field_stars(verify_t* v, const verify_field_t* vf, double nsigmas);
 
@@ -157,6 +563,18 @@ double* verify_compute_sigma2s_arr(const double* xy, int NF,
 
 static double logd_at(double distractor, int mu, int NR, double logbg) {
     return log(distractor + (1.0-distractor)*mu / (double)NR) + logbg;
+}
+
+static double logd_cached(double* values, unsigned char* ready, int count,
+                          double distractor, int mu, int NR, double logbg) {
+    assert(mu >= 0);
+    assert(mu < count);
+    (void)count;
+    if (!ready[mu]) {
+        values[mu] = logd_at(distractor, mu, NR, logbg);
+        ready[mu] = TRUE;
+    }
+    return values[mu];
 }
 
 static int get_xy_bin(const double* xy,
@@ -463,11 +881,13 @@ static double real_verify_star_lists(verify_t* v,
     double logbg;
     double logd;
     //double matchnsigma = 5.0;
+    unsigned char* arrays;
     double* refcopy;
-    kdtree_t* rtree;
-    int Nleaf = 10;
+    verify_nn_t nn;
     int* rmatches;
     double* rprobs;
+    double* logdcache;
+    unsigned char* logdready;
     double* all_logodds = NULL;
     int* theta = NULL;
     int mu;
@@ -478,9 +898,21 @@ static double real_verify_star_lists(verify_t* v,
         return -LARGE_VAL;
     }
 
-    // Build a tree out of the index stars in pixel space...
-    // kdtree scrambles the data array so make a copy first.
-    refcopy = malloc(2 * v->NR * sizeof(double));
+    /*
+     * Keep the fixed-size per-candidate arrays in one allocation.  The
+     * fallback KD builder may scramble refcopy, so it remains a packed copy.
+     */
+    arrays = malloc(((size_t)3 * (size_t)v->NR +
+                     (size_t)v->NT + 1U) * sizeof(double) +
+                    (size_t)v->NR * sizeof(int) +
+                    ((size_t)v->NT + 1U) * sizeof(unsigned char));
+    refcopy = (double*)arrays;
+    rprobs = refcopy + 2 * v->NR;
+    logdcache = rprobs + v->NR;
+    rmatches = (int*)(logdcache + v->NT + 1);
+    logdready = (unsigned char*)(rmatches + v->NR);
+    memset(logdready, 0, ((size_t)v->NT + 1U) * sizeof(unsigned char));
+
     // we must pack/unpermute the refxys; remember this packing order in "rperm".
     // we borrow storage for "rperm"...
     if (!v->badguys)
@@ -492,21 +924,19 @@ static double real_verify_star_lists(verify_t* v,
         refcopy[2*i+0] = v->refxy[2*ri+0];
         refcopy[2*i+1] = v->refxy[2*ri+1];
     }
-    rtree = kdtree_build(NULL, refcopy, v->NR, 2, Nleaf, KDTT_DOUBLE, KD_BUILD_SPLIT);
+    verify_nn_init(&nn, refcopy, v->NR,
+                   v->testsigma, v->testperm, v->NT);
 
-    rmatches = malloc(v->NR * sizeof(int));
-    for (i=0; i<v->NR; i++)
+    for (i=0; i<v->NR; i++) {
         rmatches[i] = -1;
-
-    rprobs = malloc(v->NR * sizeof(double));
-    for (i=0; i<v->NR; i++)
         rprobs[i] = -LARGE_VAL;
+    }
 
     if (p_logodds || data_log_passes(DATALOG_MASK_VERIFY, DLOG_ODDS))
         all_logodds = calloc(v->NT, sizeof(double));
     if (p_logodds)
         *p_logodds = all_logodds;
-	
+
     if (p_ibailed)
         *p_ibailed = -1;
     if (p_istopped)
@@ -526,7 +956,6 @@ static double real_verify_star_lists(verify_t* v,
         const double* testxy;
         double sig2;
         int refi;
-        int tmpi;
         double d2;
         //double reallogfg;
         double logfg;
@@ -536,22 +965,20 @@ static double real_verify_star_lists(verify_t* v,
         testxy = v->testxy + 2*ti;
         sig2 = v->testsigma[ti];
 
-        logd = logd_at(distractors, mu, v->NR, logbg);
+        logd = logd_cached(logdcache, logdready, v->NT + 1,
+                           distractors, mu, v->NR, logbg);
 
         debug2("\n");
         debug2("test star %i: (%.1f,%.1f), sigma: %.1f\n", i, testxy[0], testxy[1], sqrt(sig2));
 
         // find nearest ref star (within 5 sigma)
-        tmpi = kdtree_nearest_neighbour_within(rtree, testxy, sig2 * 25.0, &d2);
-        if (tmpi == -1) {
+        refi = verify_nn_query(&nn, testxy, sig2 * 25.0, &d2);
+        if (refi == -1) {
             // no nearest neighbour within range.
             debug2("  No nearest neighbour.\n");
-            refi = -1;
             logfg = -LARGE_VAL;
         } else {
             double loggmax;
-            // Note that "refi" is w.r.t. the "refcopy" array (not the original data).
-            refi = kdtree_permute(rtree, tmpi);
             // peak value of the Gaussian
             loggmax = log((1.0 - distractors) / (2.0 * M_PI * sig2 * v->NR));
             // FIXME - do something with uninformative hits?
@@ -561,13 +988,13 @@ static double real_verify_star_lists(verify_t* v,
 
             // value of the foreground Gaussian
             logfg = loggmax - d2 / (2.0 * sig2);
-			
+
             debug2("  NN: ref star %i, dist %.2f, sigmas: %.3f, logfg: %.1f (%.1f above distractor, %.1f above bg)\n",
                    refi, sqrt(d2), sqrt(d2 / sig2), logfg, logfg - logd, logfg - logbg);
         }
 
         if (logfg < logd) {
-            //reallogfg = 
+            //reallogfg =
             logfg = logd;
             debug2("  Distractor.\n");
             theta[i] = THETA_DISTRACTOR;
@@ -589,25 +1016,32 @@ static double real_verify_star_lists(verify_t* v,
                 for (j=0; j<oldj; j++)
                     if (theta[j] >= 0)
                         muj++;
-                switchfg += (logd_at(distractors, muj, v->NR, logbg) - oldfg);
+                switchfg +=
+                    logd_cached(logdcache, logdready, v->NT + 1,
+                                distractors, muj, v->NR, logbg) - oldfg;
                 // FIXME - could estimate/bound the distractor change and avoid computing it...
 
                 // ... and the intervening distractors become worse.
                 debug2("  oldj is %i, muj is %i.\n", oldj, muj);
                 debug2("  changing old point to distractor: %.1f change in logodds\n",
-                       (logd_at(distractors, muj, v->NR, logbg) - oldfg));
+                       (logd_cached(logdcache, logdready, v->NT + 1,
+                                    distractors, muj, v->NR, logbg) - oldfg));
                 for (; j<i; j++)
                     if (theta[j] < 0) {
-                        switchfg += (logd_at(distractors, muj, v->NR, logbg) -
-                                     logd_at(distractors, muj+1, v->NR, logbg));
+                        double current_logd =
+                            logd_cached(logdcache, logdready, v->NT + 1,
+                                        distractors, muj, v->NR, logbg);
+                        double next_logd =
+                            logd_cached(logdcache, logdready, v->NT + 1,
+                                        distractors, muj+1, v->NR, logbg);
+                        switchfg += current_logd - next_logd;
                         debug2("  adjusting distractor %i: %g change in logodds\n",
-                               j, (logd_at(distractors, muj, v->NR, logbg) -
-                                   logd_at(distractors, muj+1, v->NR, logbg)));
+                               j, current_logd - next_logd);
                     } else
                         muj++;
                 debug2("  Conflict: keeping   old match, logfg would be %.1f\n", keepfg);
                 debug2("  Conflict: accepting new match, logfg would be %.1f\n", switchfg);
-				
+
                 if (switchfg > keepfg) {
                     // upgrade: old match becomes a distractor.
                     debug2("  Conflict: upgrading.\n");
@@ -748,8 +1182,6 @@ static double real_verify_star_lists(verify_t* v,
          */
     }
 
-    free(rmatches);
-
     if (p_theta)
         *p_theta = theta;
     else
@@ -764,12 +1196,253 @@ static double real_verify_star_lists(verify_t* v,
     if (all_logodds && !*p_logodds)
         free(all_logodds);
 
-    free(rprobs);
-
-    kdtree_free(rtree);
-    free(refcopy);
+    verify_nn_cleanup(&nn);
+    free(arrays);
 
     return bestlogodds;
+}
+
+typedef struct verify_projection_context {
+    const double* xyz;
+    int npoints;
+    int width;
+    int height;
+    anbool use_sip;
+    union {
+        sip_t sip;
+        tan_t tan;
+    } wcs;
+} verify_projection_context_t;
+
+typedef struct verify_projection_task_input {
+    const verify_projection_context_t* context;
+    size_t first;
+    size_t count;
+} verify_projection_task_input_t;
+
+typedef struct verify_projection_task_output {
+    double x;
+    double y;
+    anbool inside;
+} verify_projection_task_output_t;
+
+static index_shard_helper_task_status_t
+verify_projection_helper_execute(
+    const void* input_bytes,
+    size_t input_size,
+    void* output_bytes,
+    size_t output_size) {
+    const verify_projection_task_input_t* input = input_bytes;
+    const verify_projection_context_t* context;
+    verify_projection_task_output_t* output = output_bytes;
+    size_t point;
+
+    if (!input || input_size != sizeof(*input) ||
+        !output ||
+        input->count > SIZE_MAX / sizeof(*output) ||
+        output_size != input->count * sizeof(*output)) {
+        return INDEX_SHARD_HELPER_TASK_ERROR;
+    }
+    context = input->context;
+    if (!context || !context->xyz || context->npoints < 0 ||
+        input->first > (size_t)context->npoints ||
+        input->count >
+            (size_t)context->npoints - input->first) {
+        return INDEX_SHARD_HELPER_TASK_ERROR;
+    }
+
+    for (point = 0U; point < input->count; point++) {
+        const double* xyz = context->xyz +
+            3U * (input->first + point);
+        double x = 0.0;
+        double y = 0.0;
+        anbool projected;
+
+        if (context->use_sip) {
+            projected = sip_xyzarr2pixelxy(
+                &context->wcs.sip, xyz, &x, &y);
+        } else {
+            projected = tan_xyzarr2pixelxy(
+                &context->wcs.tan, xyz, &x, &y);
+        }
+        output[point].x = x;
+        output[point].y = y;
+        output[point].inside =
+            projected &&
+            x >= 0.0 && y >= 0.0 &&
+            x < context->width && y < context->height;
+    }
+    return INDEX_SHARD_HELPER_TASK_OK;
+}
+
+static const index_shard_helper_ops_t
+verify_projection_helper_ops = {
+    "verify-projection",
+    verify_projection_helper_execute
+};
+
+/*
+ * Project only the already-copied startree_search_for() result. The helper
+ * package is index-free and immutable; stable owner compaction preserves the
+ * exact input ordering of sip_filter_stars_in_field().
+ */
+static anbool verify_filter_stars_in_field_parallel(
+    const sip_t* sip,
+    const tan_t* tan,
+    const double* xyz,
+    int npoints,
+    double** p_xy,
+    int** p_inbounds,
+    int* p_ngood) {
+#if VERIFY_PROJECTION_HELPERS_LINKED
+    verify_projection_context_t context;
+    verify_projection_task_input_t
+        inputs[VERIFY_PROJECTION_MAX_TASKS];
+    index_shard_helper_task_t
+        tasks[VERIFY_PROJECTION_MAX_TASKS];
+    verify_projection_task_output_t* projected = NULL;
+    int* inbounds = NULL;
+    double* xy = NULL;
+    size_t available;
+    size_t task_count;
+    size_t base;
+    size_t remainder;
+    size_t cursor = 0U;
+    size_t task_index;
+    int ngood = 0;
+    int point;
+    index_shard_helper_run_status_t run_status;
+
+    if (!index_shard_helper_available_workers ||
+        !index_shard_helper_run ||
+        (!sip && !tan) || !xyz || npoints <= 0 ||
+        !p_inbounds || !p_ngood ||
+        (size_t)npoints <
+            2U * VERIFY_PROJECTION_MIN_STARS_PER_TASK) {
+        return FALSE;
+    }
+    available = index_shard_helper_available_workers();
+    if (!available) {
+        return FALSE;
+    }
+    task_count = (size_t)npoints /
+        VERIFY_PROJECTION_MIN_STARS_PER_TASK;
+    if (task_count > VERIFY_PROJECTION_MAX_TASKS) {
+        task_count = VERIFY_PROJECTION_MAX_TASKS;
+    }
+    if (available < task_count - 1U) {
+        task_count = available + 1U;
+    }
+    if (task_count < 2U ||
+        (size_t)npoints > SIZE_MAX / sizeof(*projected) ||
+        (size_t)npoints > SIZE_MAX / sizeof(*inbounds) ||
+        (p_xy &&
+         (size_t)npoints > SIZE_MAX / (2U * sizeof(*xy)))) {
+        return FALSE;
+    }
+
+    projected = malloc((size_t)npoints * sizeof(*projected));
+    inbounds = malloc((size_t)npoints * sizeof(*inbounds));
+    if (p_xy) {
+        xy = malloc((size_t)npoints * 2U * sizeof(*xy));
+    }
+    if (!projected || !inbounds || (p_xy && !xy)) {
+        free(xy);
+        free(inbounds);
+        free(projected);
+        return FALSE;
+    }
+
+    memset(&context, 0, sizeof(context));
+    context.xyz = xyz;
+    context.npoints = npoints;
+    context.use_sip = sip != NULL;
+    if (sip) {
+        context.wcs.sip = *sip;
+        context.width = sip->wcstan.imagew;
+        context.height = sip->wcstan.imageh;
+    } else {
+        context.wcs.tan = *tan;
+        context.width = tan->imagew;
+        context.height = tan->imageh;
+    }
+
+    memset(inputs, 0, sizeof(inputs));
+    memset(tasks, 0, sizeof(tasks));
+    base = (size_t)npoints / task_count;
+    remainder = (size_t)npoints % task_count;
+    for (task_index = 0U;
+         task_index < task_count;
+         task_index++) {
+        size_t count = base +
+            (task_index < remainder ? 1U : 0U);
+
+        inputs[task_index].context = &context;
+        inputs[task_index].first = cursor;
+        inputs[task_index].count = count;
+        tasks[task_index].input = &inputs[task_index];
+        tasks[task_index].input_bytes = sizeof(inputs[task_index]);
+        tasks[task_index].output = projected + cursor;
+        tasks[task_index].output_bytes =
+            count * sizeof(*projected);
+        tasks[task_index].work_units =
+            (unsigned long long)count;
+        cursor += count;
+    }
+    if (cursor != (size_t)npoints) {
+        free(xy);
+        free(inbounds);
+        free(projected);
+        return FALSE;
+    }
+
+    run_status = index_shard_helper_run(
+        &verify_projection_helper_ops,
+        tasks,
+        task_count,
+        NULL);
+    if (run_status != INDEX_SHARD_HELPER_OK) {
+        free(xy);
+        free(inbounds);
+        free(projected);
+        return FALSE;
+    }
+
+    for (point = 0; point < npoints; point++) {
+        if (!projected[point].inside) {
+            continue;
+        }
+        inbounds[ngood] = point;
+        if (xy) {
+            xy[2 * ngood] = projected[point].x;
+            xy[2 * ngood + 1] = projected[point].y;
+        }
+        ngood++;
+    }
+    free(projected);
+
+    if (!ngood) {
+        free(xy);
+        free(inbounds);
+        xy = NULL;
+        inbounds = NULL;
+    }
+    if (p_xy) {
+        *p_xy = xy;
+    }
+    *p_inbounds = inbounds;
+    *p_ngood = ngood;
+    return TRUE;
+#else
+    (void)sip;
+    (void)tan;
+    (void)xyz;
+    (void)npoints;
+    (void)p_xy;
+    (void)p_inbounds;
+    (void)p_ngood;
+    return FALSE;
+#endif
 }
 
 void verify_get_index_stars(const double* fieldcenter, double fieldr2,
@@ -799,8 +1472,11 @@ void verify_get_index_stars(const double* fieldcenter, double fieldr2,
     }
 
     // Find index stars within the rectangular field.
-    inbounds = sip_filter_stars_in_field(sip, tan, indxyz, NULL, N, indexpix,
-                                         NULL, &NI);
+    if (!verify_filter_stars_in_field_parallel(
+            sip, tan, indxyz, N, indexpix, &inbounds, &NI)) {
+        inbounds = sip_filter_stars_in_field(
+            sip, tan, indxyz, NULL, N, indexpix, NULL, &NI);
+    }
     // Apply the permutation now, so that "indexpix" and "starid" stay in sync:
     // indexpix is already in the "inbounds" ordering.
     permutation_apply(inbounds, NI, starid, starid, sizeof(int));
@@ -880,7 +1556,7 @@ static anbool* verify_deduplicate_field_stars(verify_t* v, const verify_field_t*
                 if (DEBUGVERIFY) {
                     double otherxy[2];
                     starxy_get(vf->field, ind, otherxy);
-                    logdebug("Field star %i at %g,%g: is close to field star %i at %g,%g.  dist is %g, sigma is %g\n", 
+                    logdebug("Field star %i at %g,%g: is close to field star %i at %g,%g.  dist is %g, sigma is %g\n",
                              i, sxy[0], sxy[1], ind, otherxy[0], otherxy[1],
                              sqrt(distsq(sxy, otherxy, 2)), sqrt(nsig2 * v->testsigma[ti]));
                 }
@@ -924,8 +1600,15 @@ void verify_uniformize_field(const double* xy,
                              int nw, int nh,
                              int** p_bincounts,
                              int** p_binids) {
-    il** lists;
-    int i,j,k,p;
+    int* workspace;
+    int* bincount;
+    int* binoffset;
+    int* binwrite;
+    int* binmembers;
+    int* inputbins;
+    int i,k,p;
+    int activecount;
+    int nbins = nw * nh;
     int* bincounts = NULL;
     int* binids = NULL;
 
@@ -934,11 +1617,16 @@ void verify_uniformize_field(const double* xy,
         *p_binids = binids;
     }
 
-    lists = malloc((size_t)nw * (size_t)nh * sizeof(il*));
-    for (i=0; i<(nw*nh); i++)
-        lists[i] = il_new(16);
+    workspace = malloc(((size_t)3 * (size_t)nbins + (size_t)2 * (size_t)N) *
+                       sizeof(int));
+    bincount = workspace;
+    binoffset = bincount + nbins;
+    binwrite = binoffset + nbins;
+    binmembers = binwrite + nbins;
+    inputbins = binmembers + N;
+    memset(bincount, 0, (size_t)nbins * sizeof(int));
 
-    // put the stars in the appropriate bins.
+    // Count stars in each bin.
     debug2("Test star bins:\n");
     for (i=0; i<N; i++) {
         int ind;
@@ -946,43 +1634,76 @@ void verify_uniformize_field(const double* xy,
         ind = perm[i];
         bin = get_xy_bin(xy + 2*ind, fieldW, fieldH, nw, nh);
         debug2("%i ", bin);
-        il_append(lists[bin], ind);
+        inputbins[i] = bin;
+        bincount[bin]++;
     }
     debug2("\n");
 
     if (p_bincounts) {
         // note the bin occupancies.
-        bincounts = malloc((size_t)nw * (size_t)nh * sizeof(int));
-        for (i=0; i<(nw*nh); i++) {
-            bincounts[i] = il_size(lists[i]);
-            //logverb("bin %i has %i stars\n", i, bincounts[i]);
-        }
+        bincounts = malloc((size_t)nbins * sizeof(int));
+        memcpy(bincounts, bincount, (size_t)nbins * sizeof(int));
         *p_bincounts = bincounts;
     }
 
-    // make sweeps through the bins, grabbing one star from each.
+    // Lay out each bin contiguously while preserving input permutation order.
+    p = 0;
+    for (i=0; i<nbins; i++) {
+        binoffset[i] = p;
+        binwrite[i] = p;
+        p += bincount[i];
+    }
+    assert(p == N);
+    for (i=0; i<N; i++) {
+        int ind;
+        int bin;
+        ind = perm[i];
+        bin = inputbins[i];
+        binmembers[binwrite[bin]] = ind;
+        binwrite[bin]++;
+    }
+
+    /*
+     * Make the same round-robin sweeps as the legacy nested loops, but keep
+     * only non-empty bins in the active list. The old maxcount * nbins scan
+     * repeatedly visited empty/exhausted bins and dominated deep verification
+     * when a field occupied only a small part of a fine grid.
+     *
+     * binwrite is dead after the contiguous layout above, so reuse it as the
+     * ordered active-bin list without another allocation. Stable in-place
+     * compaction preserves ascending bin order in every sweep and therefore
+     * preserves the exact output permutation.
+     */
+    activecount = 0;
+    for (i=0; i<nbins; i++) {
+        if (bincount[i] > 0) {
+            binwrite[activecount++] = i;
+        }
+    }
+
     p=0;
-    for (k=0;; k++) {
-        for (j=0; j<nh; j++) {
-            for (i=0; i<nw; i++) {
-                int binid = j*nw + i;
-                il* lst = lists[binid];
-                if (k >= il_size(lst))
-                    continue;
-                perm[p] = il_get(lst, k);
-                if (binids)
-                    binids[p] = binid;
-                p++;
+    for (k=0; activecount > 0; k++) {
+        int nextactive = 0;
+
+        for (i=0; i<activecount; i++) {
+            int binid = binwrite[i];
+
+            assert(k < bincount[binid]);
+            perm[p] = binmembers[binoffset[binid] + k];
+            if (binids) {
+                binids[p] = binid;
+            }
+            p++;
+
+            if (k + 1 < bincount[binid]) {
+                binwrite[nextactive++] = binid;
             }
         }
-        if (p == N)
-            break;
+        activecount = nextactive;
     }
     assert(p == N);
 
-    for (i=0; i<(nw*nh); i++)
-        il_free(lists[i]);
-    free(lists);
+    free(workspace);
 }
 
 double* verify_uniformize_bin_centers(double fieldW, double fieldH,
@@ -1187,7 +1908,7 @@ static void fixup_theta(int* theta, double* allodds, int ibailed, int istopped, 
                        etheta[i] == THETA_CONFLICT ||
                        etheta[i] == THETA_BAILEDOUT ||
                        etheta[i] == THETA_STOPPEDLOOKING);
-					   
+
     }
 
     *p_etheta = etheta;
@@ -1214,12 +1935,14 @@ void verify_count_hits(int* theta, int besti, int* p_nmatch, int* p_nconflict, i
 }
 
 
-void verify_hit(const startree_t* skdt, int index_cutnside, MatchObj* mo,
-                const sip_t* sip, const verify_field_t* vf,
-                double pix2, double distractors,
-                double fieldW, double fieldH,
-                double logbail, double logaccept, double logstoplooking,
-                anbool do_gamma, anbool fake_match) {
+static void verify_hit_original(const startree_t* skdt, int index_cutnside,
+                                MatchObj* mo, const sip_t* sip,
+                                const verify_field_t* vf,
+                                double pix2, double distractors,
+                                double fieldW, double fieldH,
+                                double logbail, double logaccept,
+                                double logstoplooking,
+                                anbool do_gamma, anbool fake_match) {
     int i,j;
     double* fieldcenter;
     double fieldr2;
@@ -1252,14 +1975,6 @@ void verify_hit(const startree_t* skdt, int index_cutnside, MatchObj* mo,
     // center and radius of the field in xyz space:
     fieldcenter = mo->center;
     fieldr2 = square(mo->radius);
-    debug("Field center %g,%g,%g, radius2 %g\n", fieldcenter[0], fieldcenter[1], fieldcenter[2], fieldr2);
-
-    if (log_get_level() >= LOG_VERB) {
-        double ra,dec, r;
-        xyzarr2radecdeg(fieldcenter, &ra, &dec);
-        r = distsq2deg(fieldr2);
-        debug("Field center RA,Dec %g,%g, radius %g deg\n", ra, dec, r);
-    }
 
     // find index stars and project them into pixel coordinates.
     /*
@@ -1268,7 +1983,7 @@ void verify_hit(const startree_t* skdt, int index_cutnside, MatchObj* mo,
      */
     /*
      Gotta be a bit careful with reference stars:
-	 
+
      We want to be able to return a list of all the reference
      stars in the image, but during the verification process we
      want to apply some filtering of reference stars.  We
@@ -1363,7 +2078,7 @@ void verify_hit(const startree_t* skdt, int index_cutnside, MatchObj* mo,
         v->NR = igood;
         debug2("After removing stars in the quad: %i reference stars.\n", v->NR);
     }
-	
+
     if (!v->NR) {
         logverb("After removing quad stars: no reference stars\n");
         goto bailout;
@@ -1491,6 +2206,454 @@ void verify_hit(const startree_t* skdt, int index_cutnside, MatchObj* mo,
     set_null_mo(mo);
     // uh oh, spaghetti-code-oh!
     goto cleanup;
+}
+
+int verify_prepare_hit(const startree_t* skdt, int index_cutnside,
+                       const MatchObj* mo, const sip_t* sip,
+                       const verify_field_t* vf,
+                       double pix2, double distractors,
+                       double fieldW, double fieldH,
+                       double logbail, double logaccept,
+                       double logstoplooking,
+                       anbool do_gamma, anbool fake_match,
+                       verify_prepared_hit_t** prepared) {
+    verify_prepared_hit_t* context;
+    verify_t* v;
+    double fieldr2;
+    int* sweep = NULL;
+    int i;
+    int j;
+    int ibad;
+    int igood;
+
+    if (!prepared || !skdt || !mo || !vf ||
+        (!mo->wcs_valid && !sip) ||
+        !isfinite(logaccept) || !isfinite(logbail)) {
+        return -1;
+    }
+    *prepared = NULL;
+    context = calloc(1, sizeof(*context));
+    if (!context) {
+        return -1;
+    }
+    context->distractors = distractors;
+    context->logbail = logbail;
+    context->logaccept = logaccept;
+    context->logstoplooking = logstoplooking;
+    context->fake_match = fake_match;
+    context->state = VERIFY_PREPARED_READY;
+    v = &context->verify;
+
+    if (sip) {
+        memcpy(&context->wcs, sip, sizeof(context->wcs));
+    } else {
+        sip_wrap_tan(&mo->wcstan, &context->wcs);
+    }
+    v->wcs = &context->wcs;
+    fieldr2 = square(mo->radius);
+
+    assert(skdt->sweep);
+    startree_search_for(skdt, mo->center, fieldr2,
+                        &context->refxyz, NULL,
+                        &v->refstarid, &v->NRall);
+    if (!context->refxyz) {
+        context->state = VERIFY_PREPARED_NO_REFERENCE;
+        *prepared = context;
+        return 0;
+    }
+
+    if ((size_t)v->NRall > SIZE_MAX / (2U * sizeof(double)) ||
+        (size_t)v->NRall > SIZE_MAX / sizeof(int)) {
+        goto fail;
+    }
+    v->refxy = malloc((size_t)v->NRall * 2U * sizeof(double));
+    v->refperm = malloc((size_t)v->NRall * sizeof(int));
+    if (!v->refxy || !v->refperm) {
+        goto fail;
+    }
+    igood = 0;
+    for (i = 0; i < v->NRall; i++) {
+        if (!sip_xyzarr2pixelxy(v->wcs,
+                                context->refxyz + 3 * i,
+                                v->refxy + 2 * i,
+                                v->refxy + 2 * i + 1) ||
+            !sip_pixel_is_inside_image(v->wcs,
+                                       v->refxy[2 * i],
+                                       v->refxy[2 * i + 1])) {
+            continue;
+        }
+        v->refperm[igood++] = i;
+    }
+    v->NR = igood;
+    context->nrimage = v->NR;
+
+    sweep = malloc((size_t)v->NRall * sizeof(int));
+    if (!sweep) {
+        goto fail;
+    }
+    for (i = 0; i < v->NRall; i++) {
+        sweep[i] = skdt->sweep[v->refstarid[i]];
+    }
+    permuted_sort(sweep, sizeof(int), compare_ints_asc,
+                  v->refperm, v->NR);
+    free(sweep);
+    sweep = NULL;
+
+    if (v->NR) {
+        v->badguys = malloc((size_t)v->NR * sizeof(int));
+        if (!v->badguys) {
+            goto fail;
+        }
+    }
+    if (!fake_match) {
+        ibad = 0;
+        igood = 0;
+        for (i = 0; i < v->NR; i++) {
+            anbool inquad = FALSE;
+            int ri = v->refperm[i];
+
+            for (j = 0; j < mo->dimquads; j++) {
+                if (v->refstarid[ri] == (int)mo->star[j]) {
+                    inquad = TRUE;
+                    v->badguys[ibad++] = ri;
+                    break;
+                }
+            }
+            if (!inquad) {
+                v->refperm[igood++] = ri;
+            }
+        }
+        if (ibad) {
+            memcpy(v->refperm + igood, v->badguys,
+                   (size_t)ibad * sizeof(int));
+        }
+        v->NR = igood;
+    }
+    if (!v->NR) {
+        context->state = VERIFY_PREPARED_NO_QUAD_REFERENCE;
+        goto done;
+    }
+
+    if (!fake_match) {
+        verify_apply_ror(v, index_cutnside, (MatchObj*)mo,
+                         vf, pix2, distractors, fieldW, fieldH,
+                         do_gamma, fake_match,
+                         &context->effective_area, NULL, NULL);
+        if (!v->NR) {
+            context->state = VERIFY_PREPARED_NO_ROR_REFERENCE;
+            goto done;
+        }
+    } else {
+        verify_get_test_stars(v, vf, (MatchObj*)mo,
+                              pix2, do_gamma, fake_match);
+        context->effective_area = fieldW * fieldH;
+    }
+    if (!v->NR || !v->NT) {
+        context->state = VERIFY_PREPARED_EMPTY_LISTS;
+        goto done;
+    }
+
+done:
+    free(v->badguys);
+    v->badguys = NULL;
+    free(v->tbadguys);
+    v->tbadguys = NULL;
+    *prepared = context;
+    return 0;
+
+fail:
+    free(sweep);
+    verify_destroy_prepared_hit(context);
+    return -1;
+}
+
+int verify_score_prepared_hit(const verify_prepared_hit_t* prepared,
+                              verify_prepared_score_t* score) {
+    verify_t local;
+
+    if (!prepared || !score || score->theta || score->allodds ||
+        score->complete) {
+        return -1;
+    }
+    memset(score, 0, sizeof(*score));
+    score->logodds = -LARGE_VAL;
+    score->worstlogodds = -LARGE_VAL;
+    score->besti = -1;
+    score->ibailed = -1;
+    score->istopped = -1;
+    if (prepared->state != VERIFY_PREPARED_READY) {
+        score->complete = TRUE;
+        return 0;
+    }
+
+    local = prepared->verify;
+    local.badguys = malloc((size_t)local.NR * sizeof(int));
+    if (!local.badguys) {
+        return -1;
+    }
+    local.tbadguys = NULL;
+    score->logodds = real_verify_star_lists(
+        &local,
+        prepared->effective_area,
+        prepared->distractors,
+        prepared->logbail,
+        prepared->logstoplooking,
+        &score->besti,
+        &score->allodds,
+        &score->theta,
+        &score->worstlogodds,
+        &score->ibailed,
+        &score->istopped);
+    free(local.badguys);
+    score->complete = TRUE;
+    return 0;
+}
+
+int verify_finish_prepared_hit(verify_prepared_hit_t* prepared,
+                               verify_prepared_score_t* score,
+                               MatchObj* mo) {
+    verify_t* v;
+    double* refxyz;
+    double K;
+    int besti;
+    int i;
+    int j;
+
+    if (!prepared || !score || !score->complete || !mo) {
+        return -1;
+    }
+    switch (prepared->state) {
+    case VERIFY_PREPARED_NO_REFERENCE:
+        logverb("No reference stars in the bounding circle\n");
+        set_null_mo(mo);
+        verify_destroy_prepared_score(score);
+        return 0;
+    case VERIFY_PREPARED_NO_QUAD_REFERENCE:
+        logverb("After removing quad stars: no reference stars\n");
+        set_null_mo(mo);
+        verify_destroy_prepared_score(score);
+        return 0;
+    case VERIFY_PREPARED_NO_ROR_REFERENCE:
+        logerr("After applying ROR, NR = 0!\n");
+        set_null_mo(mo);
+        verify_destroy_prepared_score(score);
+        return 0;
+    case VERIFY_PREPARED_EMPTY_LISTS:
+        logverb("After applying RoR, NR=%i, NT=%i\n",
+                prepared->verify.NR, prepared->verify.NT);
+        set_null_mo(mo);
+        verify_destroy_prepared_score(score);
+        return 0;
+    case VERIFY_PREPARED_READY:
+        break;
+    default:
+        return -1;
+    }
+
+    v = &prepared->verify;
+    refxyz = prepared->refxyz;
+    K = score->logodds;
+    besti = score->besti;
+    mo->logodds = K;
+    mo->worstlogodds = score->worstlogodds;
+    mo->nfield = v->NTall;
+    mo->nindex = prepared->nrimage;
+
+    if (log_get_level() >= LOG_ALL) {
+        int nm;
+        int nc;
+        int nd;
+
+        verify_count_hits(score->theta, besti, &nm, &nc, &nd);
+        debug("verify: logodds %g, %i matches, %i conflicts, "
+              "%i distractors after %i field objects.\n",
+              K, nm, nc, nd, besti);
+    }
+
+    if (K >= prepared->logaccept) {
+        int* etheta;
+        double* eodds;
+        int nm;
+        int nc;
+        int nd;
+
+        verify_count_hits(score->theta, besti, &nm, &nc, &nd);
+        mo->nmatch = nm;
+        mo->nconflict = nc;
+        mo->ndistractor = nd;
+        fixup_theta(score->theta, score->allodds,
+                    score->ibailed, score->istopped,
+                    v, besti, prepared->nrimage, refxyz,
+                    &etheta, &eodds);
+
+        if (!prepared->fake_match) {
+            for (j = 0; j < mo->dimquads; j++) {
+                for (i = 0; i < prepared->nrimage; i++) {
+                    if (v->refstarid[i] == (int)mo->star[j]) {
+                        int ti = mo->field[j];
+
+                        assert(etheta[ti] == THETA_FILTERED);
+                        etheta[ti] = i;
+                        eodds[ti] = LARGE_VAL;
+                        break;
+                    }
+                }
+            }
+        }
+
+        mo->theta = etheta;
+        mo->matchodds = eodds;
+        mo->refxyz = prepared->refxyz;
+        prepared->refxyz = NULL;
+        mo->refxy = v->refxy;
+        v->refxy = NULL;
+        mo->refstarid = v->refstarid;
+        v->refstarid = NULL;
+        mo->testperm = v->testperm;
+        v->testperm = NULL;
+        matchobj_compute_derived(mo);
+    }
+    verify_destroy_prepared_score(score);
+    return 0;
+}
+
+static size_t verify_prepared_add_bytes(size_t total,
+                                        size_t count,
+                                        size_t element_size) {
+    size_t bytes;
+
+    if (count > SIZE_MAX / element_size) {
+        return SIZE_MAX;
+    }
+    bytes = count * element_size;
+    if (total > SIZE_MAX - bytes) {
+        return SIZE_MAX;
+    }
+    return total + bytes;
+}
+
+size_t verify_prepared_hit_bytes(const verify_prepared_hit_t* prepared) {
+    const verify_t* v;
+    size_t total;
+
+    if (!prepared) {
+        return 0U;
+    }
+    v = &prepared->verify;
+    total = sizeof(*prepared);
+    total = verify_prepared_add_bytes(
+        total, (size_t)v->NRall, 3U * sizeof(double));
+    total = verify_prepared_add_bytes(
+        total, (size_t)v->NRall, 2U * sizeof(double));
+    total = verify_prepared_add_bytes(
+        total, (size_t)v->NRall, sizeof(int));
+    total = verify_prepared_add_bytes(
+        total, (size_t)v->NRall, sizeof(int));
+    total = verify_prepared_add_bytes(
+        total, (size_t)v->NTall, sizeof(double));
+    total = verify_prepared_add_bytes(
+        total, (size_t)v->NTall, sizeof(int));
+    return total;
+}
+
+size_t verify_prepared_hit_peak_bytes(
+    const verify_prepared_hit_t* prepared) {
+    const verify_t* v;
+    size_t total;
+
+    if (!prepared) {
+        return 0U;
+    }
+    v = &prepared->verify;
+    total = verify_prepared_hit_bytes(prepared);
+
+    /*
+     * Include score arrays, temporary conflict storage, and a conservative
+     * allowance for the flat-grid or KD nearest-neighbor workspace. This is
+     * an admission estimate, not an ownership size.
+     */
+    total = verify_prepared_add_bytes(
+        total, (size_t)v->NT, sizeof(double) + sizeof(int));
+    total = verify_prepared_add_bytes(
+        total, (size_t)v->NR,
+        6U * sizeof(int) + 2U * sizeof(int64_t) +
+            2U * sizeof(double));
+    total = verify_prepared_add_bytes(
+        total, (size_t)v->NTall,
+        sizeof(int) + sizeof(double));
+    return total;
+}
+
+unsigned long long
+verify_prepared_hit_work_units(const verify_prepared_hit_t* prepared) {
+    unsigned long long nr;
+    unsigned long long nt;
+
+    if (!prepared || prepared->state != VERIFY_PREPARED_READY) {
+        return 0U;
+    }
+    nr = (unsigned long long)prepared->verify.NR;
+    nt = (unsigned long long)prepared->verify.NT;
+    if (nr && nt > ULLONG_MAX / nr) {
+        return ULLONG_MAX;
+    }
+    return nr * nt;
+}
+
+void verify_destroy_prepared_score(verify_prepared_score_t* score) {
+    if (!score) {
+        return;
+    }
+    free(score->allodds);
+    free(score->theta);
+    memset(score, 0, sizeof(*score));
+}
+
+void verify_destroy_prepared_hit(verify_prepared_hit_t* prepared) {
+    verify_t* v;
+
+    if (!prepared) {
+        return;
+    }
+    v = &prepared->verify;
+    free(prepared->refxyz);
+    free(v->testperm);
+    free(v->testsigma);
+    free(v->tbadguys);
+    free(v->refperm);
+    free(v->refxy);
+    free(v->refstarid);
+    free(v->badguys);
+    memset(prepared, 0, sizeof(*prepared));
+    free(prepared);
+}
+
+void verify_hit(const startree_t* skdt, int index_cutnside, MatchObj* mo,
+                const sip_t* sip, const verify_field_t* vf,
+                double pix2, double distractors,
+                double fieldW, double fieldH,
+                double logbail, double logaccept, double logstoplooking,
+                anbool do_gamma, anbool fake_match) {
+    double fieldr2;
+
+    fieldr2 = square(mo->radius);
+    debug("Field center %g,%g,%g, radius2 %g\n",
+          mo->center[0], mo->center[1], mo->center[2], fieldr2);
+    if (log_get_level() >= LOG_VERB) {
+        double ra;
+        double dec;
+        double r;
+
+        xyzarr2radecdeg(mo->center, &ra, &dec);
+        r = distsq2deg(fieldr2);
+        debug("Field center RA,Dec %g,%g, radius %g deg\n",
+              ra, dec, r);
+    }
+
+    verify_hit_original(skdt, index_cutnside, mo, sip, vf,
+                        pix2, distractors, fieldW, fieldH,
+                        logbail, logaccept, logstoplooking,
+                        do_gamma, fake_match);
 }
 
 // Free the things we added to this mo.
@@ -1761,7 +2924,6 @@ double verify_star_lists_ror(double* refxys, int NR,
 
     free(v.badguys);
     free(v.tbadguys);
-	
+
     return X;
 }
-

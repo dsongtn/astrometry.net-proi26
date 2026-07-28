@@ -7,8 +7,6 @@
 #include "astrometry/bl.h"
 #include "astrometry/index.h"
 #include "astrometry/index_shard.h"
-#include "kdtree_executor_internal.h"
-#include "kdtree_prefetch_internal.h"
 /*
  * Terminal status and ownership contract.
  *
@@ -53,11 +51,20 @@ typedef enum index_shard_solve_status {
 
 typedef struct index_shard_hooks {
   index_t *(*get_index)(onefield_t *bp, size_t index_order);
-  void (*done_with_index)(onefield_t *bp,
-                          size_t index_order,
-                          index_t *index);
-  const char *(*get_index_name)(onefield_t *bp,
-                                size_t index_order);
+  const char *(*get_index_identity)(onefield_t *bp,
+                                    size_t index_order);
+  int (*done_with_index)(onefield_t *bp,
+                         size_t index_order,
+                         index_t *index);
+
+  /*
+   * Report the one reducer-owned solution only after the pass is quiescent
+   * and its terminal status is known to be successful.
+   */
+  int (*report_committed_solution)(onefield_t *bp,
+                                   size_t index_order,
+                                   int fieldnum,
+                                   double best_logodds);
 
   /*
    * Worker-local context lifecycle.
@@ -91,6 +98,118 @@ typedef struct index_shard_hooks {
 
 anbool index_shard_trace_enabled(void);
 
+/* True only while the calling thread is executing a shard worker task. */
+anbool index_shard_worker_context_active(void);
+
+/* Focused unit seam for the retained-index lease state machine. */
+int onefield_job_index_cache_test_release_state(void);
+
+/*
+ * Lock-free cooperative-stop check for hot solver boundaries.
+ * This is meaningful only while the calling thread owns a shard task.
+ */
+anbool index_shard_worker_stop_requested(void);
+
+/*
+ * Generic bounded helper work.
+ *
+ * Input bytes are immutable until index_shard_helper_run() returns. Output
+ * ranges are pairwise disjoint, do not alias any input, and are invalid when
+ * the group returns TASK_FAILED or STOPPED. Inputs may point into explicitly
+ * immutable, index-free package arenas whose lifetime covers the group. No
+ * range may point to mutable owner state, an index, a FITS mapping, a solver,
+ * a callback, or a reducer. execute() must be reentrant and thread-safe and
+ * must not mutate global state or retain either byte-range pointer after it
+ * returns.
+ */
+typedef enum index_shard_helper_run_status {
+  INDEX_SHARD_HELPER_FATAL = -3,
+  INDEX_SHARD_HELPER_TASK_FAILED = -2,
+  INDEX_SHARD_HELPER_STOPPED = -1,
+  INDEX_SHARD_HELPER_OK = 0,
+  INDEX_SHARD_HELPER_UNAVAILABLE = 1
+} index_shard_helper_run_status_t;
+
+typedef enum index_shard_helper_task_status {
+  INDEX_SHARD_HELPER_TASK_ERROR = -1,
+  INDEX_SHARD_HELPER_TASK_OK = 0,
+  INDEX_SHARD_HELPER_TASK_STOPPED = 1
+} index_shard_helper_task_status_t;
+
+#define INDEX_SHARD_HELPER_MAX_TASKS 64U
+
+typedef index_shard_helper_task_status_t
+(*index_shard_helper_execute_fn)(
+    const void *input,
+    size_t input_bytes,
+    void *output,
+    size_t output_bytes);
+
+typedef struct index_shard_helper_ops {
+  const char *name;
+  index_shard_helper_execute_fn execute;
+} index_shard_helper_ops_t;
+
+typedef struct index_shard_helper_task {
+  const void *input;
+  size_t input_bytes;
+  void *output;
+  size_t output_bytes;
+  unsigned long long work_units;
+
+  /* Scheduler-owned while index_shard_helper_run() is active. */
+  unsigned char scheduler_state;
+  int execute_status;
+} index_shard_helper_task_t;
+
+typedef struct index_shard_helper_run_stats {
+  size_t owner_tasks;
+  size_t foreign_tasks;
+  size_t max_concurrent_tasks;
+  unsigned long long owner_work_units;
+  unsigned long long foreign_work_units;
+} index_shard_helper_run_stats_t;
+
+/*
+ * Return an advisory count of workers that are outer-idle. The value may
+ * become stale immediately after return and must never be used as a
+ * correctness predicate.
+ */
+size_t index_shard_helper_available_workers(void);
+
+/*
+ * Acquire an owner-local preparation permit before constructing an expensive
+ * helper package. The returned worker count is an admission snapshot, not a
+ * worker reservation. A successful permit is consumed by helper_run() or
+ * must be released explicitly on every native-fallback path.
+ */
+size_t index_shard_helper_prepare_reserve(void);
+void index_shard_helper_prepare_cancel(void);
+
+/*
+ * Publish one synchronous, fixed helper group from the current outer owner.
+ * Task zero is reserved for that owner. The call returns only after every
+ * task has completed and the stack-backed group is no longer published.
+ * Foreign admission reservations remain pool-accounted until claimed,
+ * cancelled, yielded to the owner, or released at group quiescence.
+ * UNAVAILABLE publishes nothing and permits the native inline path. STOPPED
+ * and TASK_FAILED invalidate every output. FATAL has already requested pool
+ * fatal state and must be propagated by the caller.
+ */
+index_shard_helper_run_status_t
+index_shard_helper_run(
+    const index_shard_helper_ops_t *ops,
+    index_shard_helper_task_t *tasks,
+    size_t task_count,
+    index_shard_helper_run_stats_t *stats);
+
+/*
+ * Publish a speculative worker-local solution. It narrows the claim ceiling
+ * without cancelling earlier canonical indexes; only the reducer may commit
+ * the winner and stop the pool.
+ */
+void index_shard_worker_publish_solution_candidate(void);
+
 index_shard_solve_status_t
 index_shard_solve(onefield_t *bp,
                   solver_t *base_sp,
@@ -98,86 +217,35 @@ index_shard_solve(onefield_t *bp,
                   const index_shard_hooks_t *hooks);
 
 /*
- * Private auxiliary executor contract.
- *
- * Groups own completion accounting for one Product-KD fork/join operation.
- * The shared index-shard worker pool owns accepted auxiliary tasks.
+ * Dormant compatibility executor retained for focused solver seams. The
+ * production affinity-owner scheduler never creates, binds, or joins it.
  */
-typedef void (*index_shard_aux_task_fn)(void *userdata);
-
-typedef struct index_shard_aux_group index_shard_aux_group_t;
-
-index_shard_aux_group_t *index_shard_aux_group_new(void);
-void index_shard_aux_group_free(index_shard_aux_group_t *group);
-
-int index_shard_kdtree_executor_init(kdtree_task_executor_t *executor,
-                                     index_shard_aux_group_t *group);
-
-int index_shard_aux_available(void);
+solver_ab_executor_t* solver_ab_executor_create(int worker_count);
+void solver_ab_executor_destroy(solver_ab_executor_t* executor);
+int solver_ab_executor_set_lending_callbacks(
+    solver_ab_executor_t* executor,
+    void (*work_notify)(void*),
+    int (*available_lenders)(void*),
+    void* opaque);
+int solver_ab_executor_bind(solver_ab_executor_t* executor,
+                            solver_t* owner,
+                            index_t* index);
+int solver_ab_executor_try_join(solver_ab_executor_t* executor,
+                                int* worker_id);
+int solver_ab_executor_run_joined(solver_ab_executor_t* executor,
+                                  int worker_id);
+int solver_ab_executor_quiesce(solver_ab_executor_t* executor);
+int solver_ab_executor_finish(solver_ab_executor_t* executor);
+void solver_ab_executor_abort(solver_ab_executor_t* executor);
 
 /*
- * Snapshot helper capacity for the current shard worker. Suggested subtasks
- * excludes the caller and represents either naturally spare configured
- * workers or, for a sufficiently large hypothesis wave, one worker eligible
- * to help at its next outer-task boundary. The group-aware executor performs
- * the final atomic reservation before dispatch.
+ * Apply reducer-owned traversal deltas atomically. A signed counter boundary
+ * is a deterministic execution failure; no counter is partially updated.
  */
-int index_shard_aux_capacity(kdtree_task_capacity_t *capacity);
-/*
- * One batch-local session connecting a solver worker to the pool-shared
- * prefetch coordinator.
- *
- * pool is deliberately opaque outside index_shard.c.
- */
-#define INDEX_SHARD_PREFETCH_LOCAL_PAGE_CAPACITY 64
-
-typedef struct index_shard_prefetch_local_page {
-  void *mapping;
-  const void *map_base;
-
-  uintptr_t page;
-  size_t page_size;
-
-  unsigned int priority;
-  kdtree_prefetch_array_kind_t kind;
-} index_shard_prefetch_local_page_t;
-
-/*
- * Batch-local staging area.
- *
- * KD hint generation writes here without taking the shared coordinator
- * mutex. The batch is published to the pool coordinator only at the normal
- * sink-flush boundary.
- */
-typedef struct index_shard_prefetch_session {
-  void *pool;
-  unsigned long generation;
-
-  index_shard_prefetch_local_page_t
-      pages[INDEX_SHARD_PREFETCH_LOCAL_PAGE_CAPACITY];
-
-  size_t page_count;
-
-  /*
-   * Sticky across local publication. Cleared only after the coordinator gets
-   * an opportunity to process the accumulated threshold.
-   */
-  int issue_requested;
-
-  unsigned long long hints_emitted;
-  unsigned long long hints_stale;
-  unsigned long long hints_unmapped;
-
-  unsigned long long pages_raw;
-  unsigned long long pages_local_duplicate;
-} index_shard_prefetch_session_t;
-/*
- * Initializes a generic libkd prefetch sink backed by the current shard pool.
- *
- * Returns -1 when called outside an active shard worker or pass.
- */
-int index_shard_kdtree_prefetch_sink_init(
-    kdtree_prefetch_sink_t *sink,
-    index_shard_prefetch_session_t *session);
+int solver_ab_checked_counter_delta(
+    solver_t* solver,
+    unsigned long long numtries,
+    unsigned long long cxdx,
+    unsigned long long meanx);
 
 #endif

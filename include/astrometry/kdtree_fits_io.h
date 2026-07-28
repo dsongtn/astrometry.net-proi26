@@ -71,6 +71,15 @@ fitsbin_t* kdtree_fits_get_fitsbin(kdtree_fits_t* io);
 kdtree_t* kdtree_fits_read_tree(kdtree_fits_t* io, const char* treename,
                                 qfits_header** p_hdr);
 
+/*
+ * Reads and validates only a tree's FITS header.  The returned kdtree_t
+ * contains dimensions, counts, type and name, but none of the payload
+ * arrays.  Close it with kdtree_fits_close().
+ */
+kdtree_t* kdtree_fits_read_tree_header(kdtree_fits_t* io,
+                                       const char* treename,
+                                       qfits_header** p_hdr);
+
 int kdtree_fits_read_chunk(kdtree_fits_t* io, fitsbin_chunk_t* chunk);
 
 qfits_header* kdtree_fits_get_primary_header(kdtree_fits_t* io);

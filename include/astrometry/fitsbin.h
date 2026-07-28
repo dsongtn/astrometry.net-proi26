@@ -7,6 +7,7 @@
 #define FITSBIN_H
 
 #include <stdio.h>
+#include <sys/stat.h>
 
 #include "astrometry/anqfits.h"
 #include "astrometry/bl.h"
@@ -85,6 +86,18 @@ typedef enum fitsbin_mmap_advice {
     FITSBIN_MMAP_ADVICE_RANDOM = 1
 } fitsbin_mmap_advice_t;
 
+/*
+ * Index mappings have two materially different access patterns.
+ *
+ * Payload is the default so zero-initialized third-party chunks preserve the
+ * pass-level policy. Parallel index payload uses RANDOM while traversal
+ * topology and serial callers retain NORMAL.
+ */
+typedef enum fitsbin_mmap_region {
+    FITSBIN_MMAP_REGION_PAYLOAD = 0,
+    FITSBIN_MMAP_REGION_TOPOLOGY = 1
+} fitsbin_mmap_region_t;
+
 
 struct fitsbin_chunk_t {
     char* tablename;
@@ -122,6 +135,17 @@ struct fitsbin_chunk_t {
     char* map;
     // The mmap'ed size.
     size_t mapsize;
+
+    // Access-pattern class used when applying mmap advice.
+    fitsbin_mmap_region_t mmap_region;
+
+    /*
+     * Exact file interval occupied by the table payload.  Unlike map/mapsize,
+     * this excludes mmap alignment and FITS padding.  V20 uses it to translate
+     * proven mapped addresses into bounded pread() requests.
+     */
+    off_t data_file_offset;
+    size_t data_file_size;
 };
 typedef struct fitsbin_chunk_t fitsbin_chunk_t;
 
@@ -162,9 +186,44 @@ struct fitsbin_t {
     // Cached system page size for bounded mmap prefetch requests.
     size_t mmap_page_size;
 
-    // Enables bounded, caller-directed prefetch within random mappings.
+    // Enables bounded, caller-directed population of mapped payload pages.
     anbool mmap_prefetch_enabled;
     anbool mmap_prefetch_failed;
+
+    /*
+     * A separately opened buffered-I/O description for exact payload reads.
+     * It receives POSIX_FADV_RANDOM but never backs a compute mapping, so its
+     * file-description advice cannot change the mmap VMA policy.
+     */
+    int payload_fd;
+    anbool payload_fd_initialized;
+    anbool payload_fd_failed;
+
+    /* Lock-free, per-file payload-I/O telemetry. */
+    unsigned long long payload_read_calls;
+    unsigned long long payload_read_batches;
+    unsigned long long payload_read_logical_bytes;
+    unsigned long long payload_read_pages;
+    unsigned long long payload_read_bytes;
+    unsigned long long payload_read_nanoseconds;
+    unsigned long long payload_warm_calls;
+    unsigned long long payload_warm_ranges;
+    unsigned long long payload_warm_bytes;
+    unsigned long long payload_warm_nanoseconds;
+    unsigned long long payload_cache_hits;
+    unsigned long long payload_cache_misses;
+    unsigned long long payload_cache_evictions;
+    unsigned long long payload_cache_allocations;
+    unsigned long long payload_wait_nanoseconds;
+    unsigned long long payload_failures;
+
+    /*
+     * Immutable identity captured from the descriptor that backs read-time
+     * mappings. It remains valid after fitsbin_close_fd() so mapped data can
+     * be identified without reopening a pathname or touching a closed FILE*.
+     */
+    anbool open_file_stat_valid;
+    struct stat open_file_stat;
 };
 typedef struct fitsbin_t fitsbin_t;
 
@@ -199,19 +258,168 @@ int fitsbin_close_fd(fitsbin_t* fb);
 /**
  Configures the mmap policy for solver index data.
 
- The production default uses random mmap advice when supported and disables
- explicit prefetching. Developer overrides may temporarily select alternate
- policies for diagnostics and controlled performance comparisons.
+ A shard worker supplies the parallel payload policy before mapping. Traversal
+ topology always remains NORMAL, while a caller without shard-local policy
+ retains the original serial NORMAL behavior. Bounded exact page population is
+ advisory and does not change either policy.
  */
 int fitsbin_configure_index_mmap(fitsbin_t* fb);
 
 /**
  Requests population of the mapped pages covering this data range.
 
- The request is a no-op unless random advice and mmap prefetching are both
- enabled for the fitsbin.
+ The request is a no-op unless bounded mmap population is enabled for the
+ fitsbin.
  */
 int fitsbin_prefetch_data(fitsbin_t* fb, const void* data, size_t size);
+
+typedef struct fitsbin_prefetch_range {
+    const void* data;
+    size_t size;
+} fitsbin_prefetch_range_t;
+
+typedef struct fitsbin_payload_io_stats {
+    unsigned long long read_calls;
+    unsigned long long read_batches;
+    unsigned long long read_logical_bytes;
+    unsigned long long read_pages;
+    unsigned long long read_bytes;
+    unsigned long long read_nanoseconds;
+    unsigned long long warm_calls;
+    unsigned long long warm_ranges;
+    unsigned long long warm_bytes;
+    unsigned long long warm_nanoseconds;
+    unsigned long long cache_hits;
+    unsigned long long cache_misses;
+    unsigned long long cache_evictions;
+    unsigned long long cache_allocations;
+    unsigned long long wait_nanoseconds;
+    unsigned long long failures;
+} fitsbin_payload_io_stats_t;
+
+/*
+ * Configure the process-wide I/O admission width. Production mapped-page
+ * population and focused buffered-read tests share this bounded mechanism.
+ */
+void fitsbin_payload_io_configure_workers(int worker_count);
+
+/*
+ * Cheap advisory predicate for optional work that may compete with payload
+ * demand. It is nonzero while all reader credits are occupied or any demand
+ * reader is waiting. A zero result grants no credit and may become stale
+ * immediately; speculative callers must remain optional and bounded.
+ */
+int fitsbin_payload_io_demand_busy(void);
+
+/*
+ * Optional compatibility callback used only while a buffered demand reader
+ * has no payload credit. Production mmap reads do not install this callback.
+ */
+typedef int (*fitsbin_payload_io_wait_helper_fn)(void* opaque);
+
+int fitsbin_payload_io_set_thread_wait_helper(
+    fitsbin_payload_io_wait_helper_fn helper,
+    void* opaque);
+void fitsbin_payload_io_clear_thread_wait_helper(void);
+
+/*
+ * Compatibility bridge for buffered-read tests. Only payload-credit waiters
+ * with a worker-local callback are counted.
+ */
+size_t fitsbin_payload_io_wait_helper_count(void);
+void fitsbin_payload_io_notify_wait_helpers(void);
+
+/*
+ * Delimit a compatibility helper window. Nested windows share one reserved
+ * buffered-reader slot.
+ */
+void fitsbin_payload_io_begin_helper_window(void);
+void fitsbin_payload_io_end_helper_window(void);
+
+typedef struct fitsbin_pread_range {
+    const void* data;
+    size_t size;
+    size_t logical_size;
+    void* destination;
+} fitsbin_pread_range_t;
+
+#define FITSBIN_PREAD_RANGE_LIMIT 16U
+
+/*
+ * Resolve the file-page covering interval for one exact mapped request.
+ * Alignment is calculated from immutable file offsets and clipped to the
+ * containing FITS payload. The returned mapped address and file offset name
+ * the same cover; the mapped address is only a token and is never
+ * dereferenced or faulted by this function.
+ */
+int fitsbin_mapped_range_page_cover(
+    fitsbin_t* fb,
+    const void* data,
+    size_t size,
+    const void** cover_data,
+    size_t* cover_size,
+    off_t* cover_file_offset,
+    size_t* exact_offset);
+
+/*
+ * Read one through FITSBIN_PREAD_RANGE_LIMIT fully validated mapped ranges
+ * under one demand-I/O credit. All ranges are resolved before I/O begins. A
+ * failure invalidates the whole batch from the caller's perspective.
+ */
+int fitsbin_pread_mapped_ranges(
+    fitsbin_t* fb,
+    const fitsbin_pread_range_t* ranges,
+    size_t range_count);
+
+/*
+ * Read the exact mapped payload bytes through the dedicated buffered-I/O
+ * description.  The mapped address is used only to resolve the immutable file
+ * offset; bytes are returned in caller storage.
+ *
+ * Return 0 on success and -1 on identity, range, allocation, or I/O failure.
+ */
+int fitsbin_pread_mapped_range(
+    fitsbin_t* fb,
+    const void* data,
+    size_t size,
+    void* destination);
+
+/*
+ * Warm a bounded group of upcoming mapped ranges through exact buffered
+ * reads.  Input order selects the lead window; accepted ranges are then page
+ * aligned, sorted, deduplicated, and merged only when overlapping/adjacent.
+ * Correctness never depends on this advisory operation.
+ */
+int fitsbin_prefetch_ranges(
+    fitsbin_t* fb,
+    const fitsbin_prefetch_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget);
+
+/*
+ * Populate every page-aligned mapped range without copying payload bytes.
+ * Ranges are sorted, deduplicated, and merged within each mapping. The whole
+ * aligned plan is preflighted against byte_budget and the process-wide byte
+ * ceiling before any page is touched. This operation never changes the base
+ * mapping advice. Refusal or failure therefore leaves the caller's NORMAL or
+ * RANDOM payload policy intact.
+ *
+ * Return the number of fully populated spans, zero when the complete plan is
+ * not applicable, or -1 on invalid input or kernel failure.
+ */
+int fitsbin_advise_mapped_ranges(
+    fitsbin_t* fb,
+    const fitsbin_prefetch_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget);
+
+/* Close only the dedicated payload reader; compute mappings remain valid. */
+int fitsbin_close_payload_fd(fitsbin_t* fb);
+
+/* Atomically take and reset this fitsbin's payload-I/O counters. */
+void fitsbin_take_payload_io_stats(
+    fitsbin_t* fb,
+    fitsbin_payload_io_stats_t* stats);
 
 /**
  Resolves a requested data range to the actual mmap region containing it.
@@ -233,6 +441,22 @@ int fitsbin_resolve_mapped_range(fitsbin_t* fb,
                                  size_t* map_size,
                                  const void** range_start,
                                  size_t* range_size);
+
+/*
+ * Apply advice only to the page-aligned mapped interval containing the
+ * requested data. This is used for access phases whose intent is narrower
+ * than the containing FITS payload chunk, such as a sequential PERM sweep.
+ *
+ * Return:
+ *   1  advice applied
+ *   0  range is not mmap-backed
+ *  -1  invalid input or kernel rejection
+ */
+int fitsbin_set_mmap_range_advice(
+    fitsbin_t* fb,
+    const void* data,
+    size_t size,
+    fitsbin_mmap_advice_t advice);
 
 int fitsbin_switch_to_reading(fitsbin_t* fb);
 
@@ -258,7 +482,24 @@ fitsbin_chunk_t* fitsbin_add_chunk(fitsbin_t* fb, fitsbin_chunk_t* chunk);
  */
 int fitsbin_read_chunk(fitsbin_t* fb, fitsbin_chunk_t* chunk);
 
+/*
+ * Reads and validates a chunk's FITS/table headers without mapping or
+ * copying its payload.  The chunk is not added to fb.
+ */
+int fitsbin_read_chunk_header(fitsbin_t* fb, fitsbin_chunk_t* chunk);
+
 FILE* fitsbin_get_fid(fitsbin_t* fb);
+
+int fitsbin_get_open_file_stat(
+    const fitsbin_t* fb,
+    struct stat* file_stat);
+
+void fitsbin_stat_times(
+    const struct stat* file_stat,
+    time_t* mtime_seconds,
+    long* mtime_nanoseconds,
+    time_t* ctime_seconds,
+    long* ctime_nanoseconds);
 
 int fitsbin_close(fitsbin_t* fb);
 
@@ -303,9 +544,10 @@ int fitsbin_write_chunk_to(fitsbin_t* fb, fitsbin_chunk_t* chunk, FILE* fid);
 /*
  * Index mmap policy.
  *
- * Fixed policies preserve one advice for the complete field. Adaptive begins
- * each field with RANDOM and changes to NORMAL only after one clean,
- * exhaustive, unsolved index-shard pass.
+ * Fixed policies preserve one base payload advice for the complete field.
+ * Parallel production uses FIXED_RANDOM for sparse payload, while topology
+ * and serial callers remain NORMAL. Bounded exact page population is additive
+ * and policy-neutral.
  */
 typedef enum fitsbin_mmap_policy {
     FITSBIN_MMAP_POLICY_FIXED_NORMAL = 0,
@@ -343,6 +585,19 @@ const char* fitsbin_mmap_policy_name(
 const char* fitsbin_mmap_advice_name(
     fitsbin_mmap_advice_t advice);
 
+const char* fitsbin_mmap_region_name(
+    fitsbin_mmap_region_t region);
+
+fitsbin_mmap_advice_t fitsbin_get_mmap_advice(
+    const fitsbin_t* fb);
+
+/*
+ * Topology is always NORMAL; payload follows the pass-level advice.
+ */
+fitsbin_mmap_advice_t fitsbin_get_chunk_mmap_advice(
+    const fitsbin_t* fb,
+    const fitsbin_chunk_t* chunk);
+
 void fitsbin_mmap_advice_state_init(
     fitsbin_mmap_advice_state_t* state,
     fitsbin_mmap_policy_t policy);
@@ -376,6 +631,9 @@ void fitsbin_mmap_set_thread_advice(
 void fitsbin_mmap_clear_thread_advice(void);
 
 fitsbin_mmap_advice_t fitsbin_mmap_current_advice(void);
+
+/* TRUE only while an outer shard worker owns the current index open. */
+anbool fitsbin_mmap_thread_advice_active(void);
 
 /*
  * Changes the logical advice and optionally reapplies it to existing chunks.

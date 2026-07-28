@@ -24,6 +24,9 @@ codetree_t* codetree_open(const char* fn);
 
 codetree_t* codetree_open_fits(anqfits_t* fits);
 
+/* Opens only the CodeKD header; no tree payload is mapped. */
+codetree_t* codetree_open_fits_metadata(anqfits_t* fits);
+
 int codetree_get(codetree_t* s, unsigned int codeid, double* code);
 
 int codetree_N(codetree_t* s);
