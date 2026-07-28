@@ -542,8 +542,8 @@ int quadfile_advise_rows(const quadfile_t* qf,
     byte_budget = accepted * per_range_budget;
 
     /*
-     * Populate only a fixed canonical lookahead. Later rows stay under
-     * NORMAL advice and are consumed by the original loop on demand.
+     * Populate only a fixed canonical lookahead. Later rows retain the base
+     * mapping policy and are consumed by the original loop on demand.
      */
     for (i = 0U; i < accepted; i++) {
         unsigned int quadid = quadids[i];

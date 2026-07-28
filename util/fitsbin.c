@@ -259,10 +259,13 @@ fitsbin_mmap_advice_t fitsbin_get_chunk_mmap_advice(
     }
 
     /*
-     * Region metadata is descriptive only. Every chunk follows the selected
-     * index policy so production RANDOM behavior is complete and predictable.
-     * Genuine full-range operations apply and restore their own local advice.
+     * Compact tree topology has useful traversal locality. Sparse payload
+     * follows the selected index policy; bounded mapped-page population does
+     * not change that stable demand fallback.
      */
+    if (chunk->mmap_region == FITSBIN_MMAP_REGION_TOPOLOGY) {
+        return FITSBIN_MMAP_ADVICE_NORMAL;
+    }
     return fitsbin_get_mmap_advice(fb);
 }
 
@@ -467,6 +470,13 @@ typedef struct fitsbin_file_span {
     off_t end;
 } fitsbin_file_span_t;
 
+typedef struct fitsbin_mapped_span {
+    uintptr_t map_begin;
+    uintptr_t map_end;
+    uintptr_t begin;
+    uintptr_t end;
+} fitsbin_mapped_span_t;
+
 typedef struct fitsbin_prepared_pread_range {
     off_t offset;
     size_t size;
@@ -544,8 +554,9 @@ typedef enum fitsbin_payload_io_ticket_state {
 } fitsbin_payload_io_ticket_state_t;
 
 struct fitsbin_payload_io_ticket {
-    fitsbin_file_span_t spans[FITSBIN_PREFETCH_RANGE_LIMIT];
+    fitsbin_mapped_span_t spans[FITSBIN_PREFETCH_RANGE_LIMIT];
     fitsbin_prepared_pread_range_t* ranges;
+    fitsbin_t* source;
     size_t span_count;
     size_t range_count;
     size_t byte_count;
@@ -1587,6 +1598,33 @@ static int fitsbin_compare_file_span(
     return 0;
 }
 
+static int fitsbin_compare_mapped_span(
+    const void* left,
+    const void* right) {
+    const fitsbin_mapped_span_t* lhs = left;
+    const fitsbin_mapped_span_t* rhs = right;
+
+    if (lhs->map_begin < rhs->map_begin) {
+        return -1;
+    }
+    if (lhs->map_begin > rhs->map_begin) {
+        return 1;
+    }
+    if (lhs->begin < rhs->begin) {
+        return -1;
+    }
+    if (lhs->begin > rhs->begin) {
+        return 1;
+    }
+    if (lhs->end < rhs->end) {
+        return -1;
+    }
+    if (lhs->end > rhs->end) {
+        return 1;
+    }
+    return 0;
+}
+
 static int fitsbin_prepare_prefetch_spans(
     fitsbin_t* fb,
     const fitsbin_prefetch_range_t* ranges,
@@ -1725,6 +1763,164 @@ static int fitsbin_prepare_prefetch_spans(
     }
     *span_count = merged;
     *byte_count = actual_bytes;
+    return 0;
+}
+
+static int fitsbin_prepare_mapped_spans(
+    fitsbin_t* fb,
+    const fitsbin_prefetch_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget,
+    fitsbin_mapped_span_t* spans,
+    size_t span_capacity,
+    size_t* span_count,
+    size_t* byte_count,
+    size_t* logical_byte_count,
+    unsigned long long* page_count) {
+    size_t accepted = 0U;
+    size_t merged = 0U;
+    size_t aligned_bytes = 0U;
+    size_t logical_bytes = 0U;
+    unsigned long long pages = 0ULL;
+    size_t page_size;
+    size_t i;
+
+    if (!span_count || !byte_count || !logical_byte_count ||
+        !page_count) {
+        errno = EINVAL;
+        return -1;
+    }
+    *span_count = 0U;
+    *byte_count = 0U;
+    *logical_byte_count = 0U;
+    *page_count = 0ULL;
+    if (!fb || !ranges || !range_count || !byte_budget ||
+        !spans || range_count > span_capacity) {
+        errno = range_count > span_capacity ? E2BIG : EINVAL;
+        return -1;
+    }
+    page_size = fb->mmap_page_size;
+    if (!page_size) {
+        long detected = sysconf(_SC_PAGESIZE);
+
+        if (detected <= 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        page_size = (size_t)detected;
+    }
+
+    for (i = 0U; i < range_count; i++) {
+        const void* map_base;
+        const void* range_start;
+        size_t map_size;
+        size_t range_size;
+        uintptr_t map_begin;
+        uintptr_t map_end;
+        uintptr_t begin;
+        uintptr_t end;
+        uintptr_t remainder;
+        int resolved;
+
+        if (!ranges[i].data || !ranges[i].size ||
+            ranges[i].size > SIZE_MAX - logical_bytes) {
+            errno = ranges[i].data && ranges[i].size
+                ? EOVERFLOW
+                : EINVAL;
+            return -1;
+        }
+        resolved = fitsbin_resolve_mapped_range(
+            fb,
+            ranges[i].data,
+            ranges[i].size,
+            &map_base,
+            &map_size,
+            &range_start,
+            &range_size);
+        if (resolved != 1 || range_size != ranges[i].size) {
+            if (!resolved) {
+                errno = ERANGE;
+            }
+            return -1;
+        }
+        map_begin = (uintptr_t)map_base;
+        if (map_size > UINTPTR_MAX - map_begin) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        map_end = map_begin + map_size;
+        begin = (uintptr_t)range_start;
+        if (range_size > UINTPTR_MAX - begin) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        end = begin + range_size;
+        begin -= begin % (uintptr_t)page_size;
+        if (begin < map_begin) {
+            begin = map_begin;
+        }
+        remainder = end % (uintptr_t)page_size;
+        if (remainder) {
+            uintptr_t padding =
+                (uintptr_t)page_size - remainder;
+
+            end = padding > map_end - end
+                ? map_end
+                : end + padding;
+        }
+        if (end > map_end) {
+            end = map_end;
+        }
+        if (end <= begin) {
+            errno = ERANGE;
+            return -1;
+        }
+        spans[accepted].map_begin = map_begin;
+        spans[accepted].map_end = map_end;
+        spans[accepted].begin = begin;
+        spans[accepted].end = end;
+        accepted++;
+        logical_bytes += ranges[i].size;
+    }
+
+    qsort(
+        spans,
+        accepted,
+        sizeof(spans[0]),
+        fitsbin_compare_mapped_span);
+    for (i = 0U; i < accepted; i++) {
+        if (merged &&
+            spans[i].map_begin == spans[merged - 1U].map_begin &&
+            spans[i].map_end == spans[merged - 1U].map_end &&
+            spans[i].begin <= spans[merged - 1U].end) {
+            if (spans[i].end > spans[merged - 1U].end) {
+                spans[merged - 1U].end = spans[i].end;
+            }
+            continue;
+        }
+        spans[merged++] = spans[i];
+    }
+    for (i = 0U; i < merged; i++) {
+        size_t span_bytes =
+            (size_t)(spans[i].end - spans[i].begin);
+        size_t span_pages = span_bytes / page_size;
+
+        if (span_bytes % page_size) {
+            span_pages++;
+        }
+        if (aligned_bytes > byte_budget ||
+            span_bytes > byte_budget - aligned_bytes ||
+            (unsigned long long)span_pages > ULLONG_MAX - pages) {
+            errno = E2BIG;
+            return -1;
+        }
+        aligned_bytes += span_bytes;
+        pages += (unsigned long long)span_pages;
+    }
+    *span_count = merged;
+    *byte_count = aligned_bytes;
+    *logical_byte_count = logical_bytes;
+    *page_count = pages;
     return 0;
 }
 
@@ -1903,8 +2099,6 @@ static void fitsbin_payload_io_ticket_free_storage(
 }
 
 static void* fitsbin_payload_io_service_worker(void* opaque) {
-    unsigned char scratch[FITSBIN_PREFETCH_COPY_CHUNK];
-
     (void)opaque;
     while (1) {
         fitsbin_payload_io_ticket_t* ticket;
@@ -1998,37 +2192,47 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
                     __ATOMIC_ACQUIRE);
             }
         } else {
+#if defined(MADV_POPULATE_READ)
+            if (!ticket->source ||
+                !ticket->source->mmap_prefetch_enabled ||
+                __atomic_load_n(
+                    &ticket->source->mmap_prefetch_failed,
+                    __ATOMIC_ACQUIRE)) {
+                saved_errno = ENOTSUP;
+                status = -1;
+            }
             for (work_index = 0U;
-                 work_index < ticket->span_count && !cancelled;
+                 !status && work_index < ticket->span_count &&
+                     !cancelled;
                  work_index++) {
-                off_t cursor = ticket->spans[work_index].begin;
+                fitsbin_mapped_span_t* span =
+                    &ticket->spans[work_index];
+                size_t span_bytes =
+                    (size_t)(span->end - span->begin);
 
-                while (cursor < ticket->spans[work_index].end) {
-                    size_t remaining = (size_t)(
-                        ticket->spans[work_index].end - cursor);
-                    size_t request = MIN(remaining, sizeof(scratch));
-
-                    if (fitsbin_pread_all(
-                            ticket->fd,
-                            scratch,
-                            request,
-                            cursor)) {
-                        saved_errno = errno ? errno : EIO;
-                        status = -1;
-                        break;
+                if (!span_bytes ||
+                    madvise(
+                        (void*)span->begin,
+                        span_bytes,
+                        MADV_POPULATE_READ)) {
+                    saved_errno = errno ? errno : EIO;
+                    status = -1;
+                    if (ticket->source) {
+                        __atomic_store_n(
+                            &ticket->source->mmap_prefetch_failed,
+                            TRUE,
+                            __ATOMIC_RELEASE);
                     }
-                    cursor += (off_t)request;
-                    cancelled = __atomic_load_n(
-                        &ticket->cancel_requested,
-                        __ATOMIC_ACQUIRE);
-                    if (cancelled) {
-                        break;
-                    }
-                }
-                if (status) {
                     break;
                 }
+                cancelled = __atomic_load_n(
+                    &ticket->cancel_requested,
+                    __ATOMIC_ACQUIRE);
             }
+#else
+            saved_errno = ENOTSUP;
+            status = -1;
+#endif
         }
         if (measured &&
             clock_gettime(CLOCK_MONOTONIC, &read_finish) == 0) {
@@ -2297,8 +2501,6 @@ int fitsbin_prefetch_ranges_submit(
     size_t byte_budget,
     fitsbin_payload_io_ticket_t** ticket_out) {
     fitsbin_payload_io_ticket_t* ticket;
-    int fd;
-    int duplicate;
 
     if (!ticket_out) {
         errno = EINVAL;
@@ -2314,6 +2516,12 @@ int fitsbin_prefetch_ranges_submit(
         return -1;
     }
     if (fitsbin_payload_is_fully_resident(fb)) {
+        return 0;
+    }
+    if (!fb->mmap_prefetch_enabled ||
+        __atomic_load_n(
+            &fb->mmap_prefetch_failed,
+            __ATOMIC_ACQUIRE)) {
         return 0;
     }
     pthread_mutex_lock(&fitsbin_payload_io_mutex);
@@ -2332,32 +2540,26 @@ int fitsbin_prefetch_ranges_submit(
     ticket->state = FITSBIN_PAYLOAD_IO_PLANNED;
     ticket->kind = FITSBIN_PAYLOAD_IO_TICKET_PREFETCH;
     ticket->priority = FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT;
-    if (fitsbin_prepare_prefetch_spans(
+    ticket->source = fb;
+    if (fitsbin_prepare_mapped_spans(
             fb,
             ranges,
             range_count,
             byte_budget,
             ticket->spans,
+            FITSBIN_PREFETCH_RANGE_LIMIT,
             &ticket->span_count,
-            &ticket->byte_count)) {
+            &ticket->byte_count,
+            &ticket->logical_byte_count,
+            &ticket->page_count)) {
         fitsbin_payload_io_ticket_free_storage(ticket);
         return -1;
     }
+    ticket->range_count = range_count;
     if (!ticket->span_count) {
         fitsbin_payload_io_ticket_free_storage(ticket);
         return 0;
     }
-    fd = fitsbin_payload_fd_get(fb);
-    if (fd < 0) {
-        fitsbin_payload_io_ticket_free_storage(ticket);
-        return -1;
-    }
-    duplicate = fitsbin_payload_io_duplicate_fd(fd);
-    if (duplicate < 0) {
-        fitsbin_payload_io_ticket_free_storage(ticket);
-        return -1;
-    }
-    ticket->fd = duplicate;
     return fitsbin_payload_io_submit_ticket(ticket, ticket_out);
 }
 
@@ -2381,7 +2583,9 @@ static int fitsbin_payload_io_ticket_wait_internal(
     fitsbin_payload_io_ticket_state_t state;
     int saved_errno;
 
-    if (!fb || !ticket) {
+    if (!fb || !ticket ||
+        (ticket->kind == FITSBIN_PAYLOAD_IO_TICKET_PREFETCH &&
+         ticket->source != fb)) {
         errno = EINVAL;
         return -1;
     }
@@ -2992,40 +3196,6 @@ static void fitsbin_restore_normal_mmap_advice(
                    strerror(errno));
         }
     }
-}
-
-typedef struct fitsbin_mapped_span {
-    uintptr_t map_begin;
-    uintptr_t map_end;
-    uintptr_t begin;
-    uintptr_t end;
-} fitsbin_mapped_span_t;
-
-static int fitsbin_compare_mapped_span(
-    const void* left,
-    const void* right) {
-    const fitsbin_mapped_span_t* lhs = left;
-    const fitsbin_mapped_span_t* rhs = right;
-
-    if (lhs->map_begin < rhs->map_begin) {
-        return -1;
-    }
-    if (lhs->map_begin > rhs->map_begin) {
-        return 1;
-    }
-    if (lhs->begin < rhs->begin) {
-        return -1;
-    }
-    if (lhs->begin > rhs->begin) {
-        return 1;
-    }
-    if (lhs->end < rhs->end) {
-        return -1;
-    }
-    if (lhs->end > rhs->end) {
-        return 1;
-    }
-    return 0;
 }
 
 static int fitsbin_mapped_population_failure(

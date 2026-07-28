@@ -895,8 +895,8 @@ int startree_advise_rows(startree_t* s,
     fb = s->tree->io;
 
     /*
-     * Populate only a fixed canonical lookahead. Later rows stay under
-     * NORMAL advice and are consumed by the original loop on demand.
+     * Populate only a fixed canonical lookahead. Later rows retain the base
+     * mapping policy and are consumed by the original loop on demand.
      */
     for (i = 0U; i < accepted; i++) {
         unsigned int starid = starids[i];

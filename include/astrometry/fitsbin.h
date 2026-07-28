@@ -89,8 +89,8 @@ typedef enum fitsbin_mmap_advice {
 /*
  * Region metadata distinguishes topology and payload for page planning and
  * telemetry. Payload remains the default so zero-initialized third-party
- * chunks preserve compatibility. The mapping pass policy applies to every
- * chunk; region metadata does not override NORMAL or RANDOM advice.
+ * chunks preserve compatibility. Topology uses NORMAL; payload follows the
+ * file/pass policy.
  */
 typedef enum fitsbin_mmap_region {
     FITSBIN_MMAP_REGION_PAYLOAD = 0,
@@ -140,8 +140,8 @@ struct fitsbin_chunk_t {
 
     /*
      * Exact file interval occupied by the table payload.  Unlike map/mapsize,
-     * this excludes mmap alignment and FITS padding.  V20 uses it to translate
-     * proven mapped addresses into bounded pread() requests.
+     * this excludes mmap alignment and FITS padding. V20 uses it to translate
+     * proven mapped addresses into bounded page intervals and test reads.
      */
     off_t data_file_offset;
     size_t data_file_size;
@@ -458,14 +458,15 @@ int fitsbin_prefetch_ranges(
     size_t byte_budget);
 
 /*
- * Submit one complete current-index page-cache preparation to the bounded
- * loader. The mapped ranges are resolved to immutable file offsets before
- * return; loader threads retain neither mapped pointers nor fitsbin state.
+ * Submit one complete current-index mapped-page population to the bounded
+ * loader. The loader retains validated page-aligned spans and their fitsbin
+ * owner until the ticket reaches a terminal state.
  *
  * Return 1 when queued, zero when the optional service or bounded capacity is
  * unavailable, and -1 for an invalid or failed preparation. The caller must
- * wait (or cancel and wait) before closing the source fitsbin. A fully
- * resident source returns zero without creating a ticket.
+ * keep every source mapping live and wait (or cancel and wait) before closing
+ * the source fitsbin. A fully resident source returns zero without creating a
+ * ticket.
  */
 int fitsbin_prefetch_ranges_submit(
     fitsbin_t* fb,
@@ -686,8 +687,7 @@ fitsbin_mmap_advice_t fitsbin_get_mmap_advice(
     const fitsbin_t* fb);
 
 /*
- * Every mapped chunk follows file/pass advice; region metadata does not
- * override it.
+ * Topology chunks use NORMAL. Payload chunks follow file/pass advice.
  */
 fitsbin_mmap_advice_t fitsbin_get_chunk_mmap_advice(
     const fitsbin_t* fb,

@@ -34,7 +34,6 @@
 #include "errors.h"
 #include "tweak2.h"
 #include "astrometry/fitsbin.h"
-#include "../libkd/kdtree_direct_internal.h"
 #include "../libkd/kdtree_prefetch_internal.h"
 #include "index_shard_internal.h"
 
@@ -43,2540 +42,12 @@
     (64ULL * 1024ULL * 1024ULL)
 #endif
 
-#define SOLVER_CODEKD_DIRECT_MAX_POINTS \
-    KDTREE_DIRECT_DSS_TASK_POINTS
-#define SOLVER_CODEKD_CACHE_ENTRY_LIMIT 2048U
-#define SOLVER_CODEKD_CACHE_HASH_BUCKETS 4096U
-#define SOLVER_CODEKD_CACHE_NONE UINT32_MAX
-#define SOLVER_CODEKD_CACHE_PAGE_PROBE_LIMIT 64U
-#define SOLVER_CODEKD_READ_BATCH_MAX \
-    KDTREE_DIRECT_DSS_WAVE_TASKS
-#define SOLVER_CODEKD_RANGE_CACHE_BYTES \
-    (8U * 1024U * 1024U)
-
-typedef struct solver_codekd_file_segment {
-    dev_t file_device;
-    ino_t file_inode;
-    off_t file_size;
-    time_t file_mtime_seconds;
-    long file_mtime_nanoseconds;
-    time_t file_ctime_seconds;
-    long file_ctime_nanoseconds;
-    size_t page_size;
-    uint32_t protected_entry;
-    size_t entry_count;
-    anbool fallback_reported;
-    struct solver_codekd_file_segment* next;
-} solver_codekd_file_segment_t;
-
-typedef enum solver_codekd_cache_state {
-    SOLVER_CODEKD_CACHE_FREE = 0,
-    SOLVER_CODEKD_CACHE_LOADING = 1,
-    SOLVER_CODEKD_CACHE_VALID = 2
-} solver_codekd_cache_state_t;
-
-typedef enum solver_codekd_cache_class {
-    SOLVER_CODEKD_CACHE_CLASS_NONE = 0,
-    SOLVER_CODEKD_CACHE_CLASS_PROTECTED = 1,
-    SOLVER_CODEKD_CACHE_CLASS_EVICTABLE = 2
-} solver_codekd_cache_class_t;
-
-typedef struct solver_codekd_cache_entry {
-    solver_codekd_file_segment_t* segment;
-    off_t data_file_offset;
-    off_t perm_file_offset;
-    size_t data_size;
-    size_t perm_size;
-    u16* data;
-    u32* perm;
-    size_t data_capacity;
-    size_t perm_capacity;
-    uint32_t hash_bucket;
-    uint32_t hash_next;
-    uint32_t lru_previous;
-    uint32_t lru_next;
-    uint32_t free_next;
-    unsigned int pin_count;
-    unsigned int plan_hold_count;
-    solver_codekd_cache_state_t state;
-    solver_codekd_cache_class_t cache_class;
-    anbool listed;
-    anbool valid;
-} solver_codekd_cache_entry_t;
-
-typedef struct solver_codekd_reader {
-    const kdtree_t* tree;
-    fitsbin_t* fitsbin;
-    solver_codekd_file_segment_t* segments;
-    solver_codekd_file_segment_t* active_segment;
-    solver_codekd_cache_entry_t
-        cache[SOLVER_CODEKD_CACHE_ENTRY_LIMIT];
-    uint32_t hash_buckets[SOLVER_CODEKD_CACHE_HASH_BUCKETS];
-    uint32_t free_head;
-    uint32_t protected_head;
-    uint32_t protected_tail;
-    uint32_t evictable_head;
-    uint32_t evictable_tail;
-    kdtree_direct_dss_task_output_t
-        helper_outputs[KDTREE_DIRECT_DSS_WAVE_TASKS];
-    size_t cache_bytes;
-    size_t total_pins;
-    size_t total_plan_holds;
-    anbool helper_hard_failure;
-} solver_codekd_reader_t;
-
-static pthread_key_t solver_codekd_reader_key;
-static pthread_once_t solver_codekd_reader_once =
-    PTHREAD_ONCE_INIT;
-static int solver_codekd_reader_key_status = EAGAIN;
-
-static void solver_codekd_cache_initialize(
-    solver_codekd_reader_t* reader) {
-    uint32_t index;
-
-    memset(reader->hash_buckets,
-           0xff,
-           sizeof(reader->hash_buckets));
-    reader->free_head = 0U;
-    reader->protected_head = SOLVER_CODEKD_CACHE_NONE;
-    reader->protected_tail = SOLVER_CODEKD_CACHE_NONE;
-    reader->evictable_head = SOLVER_CODEKD_CACHE_NONE;
-    reader->evictable_tail = SOLVER_CODEKD_CACHE_NONE;
-    for (index = 0U;
-         index < SOLVER_CODEKD_CACHE_ENTRY_LIMIT;
-         index++) {
-        solver_codekd_cache_entry_t* entry =
-            &reader->cache[index];
-
-        entry->hash_bucket = SOLVER_CODEKD_CACHE_NONE;
-        entry->hash_next = SOLVER_CODEKD_CACHE_NONE;
-        entry->lru_previous = SOLVER_CODEKD_CACHE_NONE;
-        entry->lru_next = SOLVER_CODEKD_CACHE_NONE;
-        entry->free_next =
-            index + 1U < SOLVER_CODEKD_CACHE_ENTRY_LIMIT
-            ? index + 1U
-            : SOLVER_CODEKD_CACHE_NONE;
-        entry->state = SOLVER_CODEKD_CACHE_FREE;
-        entry->cache_class = SOLVER_CODEKD_CACHE_CLASS_NONE;
-    }
-}
-
-static void solver_codekd_reader_destroy(void* opaque) {
-    solver_codekd_reader_t* reader = opaque;
-    solver_codekd_file_segment_t* segment;
-    size_t i;
-
-    if (!reader) {
-        return;
-    }
-    for (i = 0U;
-         i < SOLVER_CODEKD_CACHE_ENTRY_LIMIT;
-         i++) {
-        if (reader->cache[i].pin_count) {
-            logerr("[solver-codekd-helper] destroying pinned "
-                   "cache entry slot=%zu pins=%u\n",
-                   i,
-                   reader->cache[i].pin_count);
-        }
-        if (reader->cache[i].plan_hold_count) {
-            logerr("[solver-codekd-helper] destroying held "
-                   "cache entry slot=%zu holds=%u\n",
-                   i,
-                   reader->cache[i].plan_hold_count);
-        }
-        free(reader->cache[i].data);
-        free(reader->cache[i].perm);
-    }
-    segment = reader->segments;
-    while (segment) {
-        solver_codekd_file_segment_t* next = segment->next;
-
-        free(segment);
-        segment = next;
-    }
-    free(reader);
-}
-
-static void solver_codekd_reader_make_key(void) {
-    solver_codekd_reader_key_status = pthread_key_create(
-        &solver_codekd_reader_key,
-        solver_codekd_reader_destroy);
-}
-
-static int solver_codekd_reader_prepare(void) {
-    int status = pthread_once(
-        &solver_codekd_reader_once,
-        solver_codekd_reader_make_key);
-
-    if (status) {
-        return status;
-    }
-    return solver_codekd_reader_key_status;
-}
-
-static solver_codekd_reader_t* solver_codekd_reader_get(void) {
-    solver_codekd_reader_t* reader;
-
-    if (solver_codekd_reader_prepare()) {
-        return NULL;
-    }
-    reader = pthread_getspecific(
-        solver_codekd_reader_key);
-    if (reader) {
-        return reader;
-    }
-    reader = calloc(1, sizeof(*reader));
-    if (!reader) {
-        return NULL;
-    }
-    solver_codekd_cache_initialize(reader);
-    if (pthread_setspecific(
-            solver_codekd_reader_key,
-            reader)) {
-        solver_codekd_reader_destroy(reader);
-        return NULL;
-    }
-    return reader;
-}
-
-static anbool solver_codekd_segment_matches(
-    const solver_codekd_file_segment_t* segment,
-    const struct stat* identity,
-    time_t mtime_seconds,
-    long mtime_nanoseconds,
-    time_t ctime_seconds,
-    long ctime_nanoseconds,
-    size_t page_size) {
-    return segment && identity &&
-        segment->file_device == identity->st_dev &&
-        segment->file_inode == identity->st_ino &&
-        segment->file_size == identity->st_size &&
-        segment->file_mtime_seconds == mtime_seconds &&
-        segment->file_mtime_nanoseconds == mtime_nanoseconds &&
-        segment->file_ctime_seconds == ctime_seconds &&
-        segment->file_ctime_nanoseconds == ctime_nanoseconds &&
-        segment->page_size == page_size;
-}
-
-static int solver_codekd_reader_bind(
-    solver_codekd_reader_t* reader,
-    const kdtree_t* tree,
-    fitsbin_t* fb) {
-    const struct stat* identity;
-    solver_codekd_file_segment_t* segment;
-    time_t mtime_seconds;
-    long mtime_nanoseconds;
-    time_t ctime_seconds;
-    long ctime_nanoseconds;
-    size_t page_size;
-
-    if (!reader || !tree || !fb || !fb->open_file_stat_valid) {
-        errno = EINVAL;
-        return -1;
-    }
-    identity = &fb->open_file_stat;
-    page_size = fb->mmap_page_size;
-    if (!page_size) {
-        long detected = sysconf(_SC_PAGESIZE);
-
-        if (detected <= 0) {
-            errno = EINVAL;
-            return -1;
-        }
-        page_size = (size_t)detected;
-    }
-
-    fitsbin_stat_times(
-        identity,
-        &mtime_seconds,
-        &mtime_nanoseconds,
-        &ctime_seconds,
-        &ctime_nanoseconds);
-    segment = reader->active_segment;
-    if (!solver_codekd_segment_matches(
-            segment,
-            identity,
-            mtime_seconds,
-            mtime_nanoseconds,
-            ctime_seconds,
-            ctime_nanoseconds,
-            page_size)) {
-        for (segment = reader->segments;
-             segment;
-             segment = segment->next) {
-            if (solver_codekd_segment_matches(
-                    segment,
-                    identity,
-                    mtime_seconds,
-                    mtime_nanoseconds,
-                    ctime_seconds,
-                    ctime_nanoseconds,
-                    page_size)) {
-                break;
-            }
-        }
-    }
-    if (!segment) {
-        segment = calloc(1, sizeof(*segment));
-        if (!segment) {
-            return -1;
-        }
-        segment->file_device = identity->st_dev;
-        segment->file_inode = identity->st_ino;
-        segment->file_size = identity->st_size;
-        segment->file_mtime_seconds = mtime_seconds;
-        segment->file_mtime_nanoseconds = mtime_nanoseconds;
-        segment->file_ctime_seconds = ctime_seconds;
-        segment->file_ctime_nanoseconds = ctime_nanoseconds;
-        segment->page_size = page_size;
-        segment->protected_entry = SOLVER_CODEKD_CACHE_NONE;
-        segment->next = reader->segments;
-        reader->segments = segment;
-    }
-
-    /*
-     * These pointers are borrowed only for the active direct search. Never
-     * inspect a pointer retained from an index whose lifetime has ended.
-     */
-    reader->tree = tree;
-    reader->fitsbin = fb;
-    reader->active_segment = segment;
-    /*
-     * Only scalar file identity survives an index close. The cached bytes are
-     * private copies, so a deeper affinity pass can reuse them without
-     * retaining an index mapping, fitsbin pointer, or other borrowed state.
-     */
-    return 0;
-}
-
-static void solver_codekd_reader_unbind(
-    solver_codekd_reader_t* reader) {
-    if (!reader) {
-        return;
-    }
-    if (reader->total_pins) {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-    }
-    reader->tree = NULL;
-    reader->fitsbin = NULL;
-}
-
-static uint32_t solver_codekd_cache_index(
-    const solver_codekd_reader_t* reader,
-    const solver_codekd_cache_entry_t* entry) {
-    return (uint32_t)(entry - reader->cache);
-}
-
-static uint64_t solver_codekd_cache_mix(
-    uint64_t hash,
-    uint64_t value) {
-    value ^= value >> 30;
-    value *= UINT64_C(0xbf58476d1ce4e5b9);
-    value ^= value >> 27;
-    value *= UINT64_C(0x94d049bb133111eb);
-    value ^= value >> 31;
-    return hash ^ (value + UINT64_C(0x9e3779b97f4a7c15) +
-                   (hash << 6) + (hash >> 2));
-}
-
-static uint32_t solver_codekd_cache_bucket(
-    const solver_codekd_file_segment_t* segment,
-    uint64_t data_page) {
-    uint64_t hash = UINT64_C(0xcbf29ce484222325);
-
-    hash = solver_codekd_cache_mix(
-        hash, (uint64_t)(uintptr_t)segment);
-    hash = solver_codekd_cache_mix(hash, data_page);
-    return (uint32_t)hash &
-        (SOLVER_CODEKD_CACHE_HASH_BUCKETS - 1U);
-}
-
-static anbool solver_codekd_cache_range_contains(
-    off_t outer_file_offset,
-    size_t outer_size,
-    off_t inner_file_offset,
-    size_t inner_size) {
-    uint64_t outer;
-    uint64_t inner;
-    uint64_t delta;
-
-    if (outer_file_offset < 0 || inner_file_offset < 0 ||
-        inner_file_offset < outer_file_offset) {
-        return FALSE;
-    }
-    outer = (uint64_t)outer_file_offset;
-    inner = (uint64_t)inner_file_offset;
-    delta = inner - outer;
-    return delta <= SIZE_MAX &&
-        (size_t)delta <= outer_size &&
-        inner_size <= outer_size - (size_t)delta;
-}
-
-static anbool solver_codekd_cache_entry_contains(
-    const solver_codekd_cache_entry_t* entry,
-    const solver_codekd_file_segment_t* segment,
-    off_t data_file_offset,
-    size_t data_size,
-    off_t perm_file_offset,
-    size_t perm_size) {
-    return entry && entry->valid &&
-        entry->state == SOLVER_CODEKD_CACHE_VALID &&
-        entry->segment == segment &&
-        solver_codekd_cache_range_contains(
-            entry->data_file_offset,
-            entry->data_size,
-            data_file_offset,
-            data_size) &&
-        ((!perm_size && !entry->perm_size) ||
-         (perm_size && entry->perm_size &&
-          solver_codekd_cache_range_contains(
-              entry->perm_file_offset,
-              entry->perm_size,
-              perm_file_offset,
-              perm_size)));
-}
-
-static size_t solver_codekd_cache_page_probes(
-    const solver_codekd_reader_t* reader,
-    const solver_codekd_file_segment_t* segment) {
-    size_t maximum_bytes;
-    size_t pages;
-
-    if (!reader || !reader->tree || !segment ||
-        !segment->page_size || reader->tree->ndim <= 0 ||
-        KDTREE_DIRECT_DSS_TASK_POINTS >
-            SIZE_MAX / (size_t)reader->tree->ndim ||
-        KDTREE_DIRECT_DSS_TASK_POINTS *
-                (size_t)reader->tree->ndim >
-            SIZE_MAX / sizeof(u16)) {
-        return SOLVER_CODEKD_CACHE_PAGE_PROBE_LIMIT;
-    }
-    maximum_bytes = KDTREE_DIRECT_DSS_TASK_POINTS *
-        (size_t)reader->tree->ndim * sizeof(u16);
-    pages = maximum_bytes / segment->page_size;
-    if (maximum_bytes % segment->page_size) {
-        pages++;
-    }
-    if (pages > SOLVER_CODEKD_CACHE_PAGE_PROBE_LIMIT - 2U) {
-        return SOLVER_CODEKD_CACHE_PAGE_PROBE_LIMIT;
-    }
-    return pages + 2U;
-}
-
-static solver_codekd_cache_entry_t* solver_codekd_cache_find(
-    solver_codekd_reader_t* reader,
-    solver_codekd_file_segment_t* segment,
-    off_t data_file_offset,
-    size_t data_size,
-    off_t perm_file_offset,
-    size_t perm_size) {
-    uint64_t data_page;
-    size_t probes;
-    size_t probe;
-
-    if (!reader || !segment || !segment->page_size ||
-        data_file_offset < 0 || !data_size) {
-        if (reader) {
-            reader->helper_hard_failure = TRUE;
-        }
-        errno = EPROTO;
-        return NULL;
-    }
-    data_page = (uint64_t)data_file_offset /
-        (uint64_t)segment->page_size;
-    probes = solver_codekd_cache_page_probes(reader, segment);
-    for (probe = 0U;
-         probe < probes && (uint64_t)probe <= data_page;
-         probe++) {
-        uint32_t bucket = solver_codekd_cache_bucket(
-            segment, data_page - (uint64_t)probe);
-        uint32_t index = reader->hash_buckets[bucket];
-        size_t visited = 0U;
-
-        while (index != SOLVER_CODEKD_CACHE_NONE) {
-            solver_codekd_cache_entry_t* entry;
-
-            if (index >= SOLVER_CODEKD_CACHE_ENTRY_LIMIT ||
-                visited++ >= SOLVER_CODEKD_CACHE_ENTRY_LIMIT) {
-                reader->helper_hard_failure = TRUE;
-                errno = EPROTO;
-                return NULL;
-            }
-            entry = &reader->cache[index];
-            if (entry->hash_bucket != bucket) {
-                reader->helper_hard_failure = TRUE;
-                errno = EPROTO;
-                return NULL;
-            }
-            if (solver_codekd_cache_entry_contains(
-                    entry,
-                    segment,
-                    data_file_offset,
-                    data_size,
-                    perm_file_offset,
-                    perm_size)) {
-                return entry;
-            }
-            index = entry->hash_next;
-        }
-    }
-    return NULL;
-}
-
-static void solver_codekd_cache_list_remove(
-    solver_codekd_reader_t* reader,
-    solver_codekd_cache_entry_t* entry) {
-    uint32_t* head;
-    uint32_t* tail;
-    uint32_t index;
-
-    if (!entry->listed) {
-        return;
-    }
-    if (entry->cache_class ==
-            SOLVER_CODEKD_CACHE_CLASS_PROTECTED) {
-        head = &reader->protected_head;
-        tail = &reader->protected_tail;
-    } else if (entry->cache_class ==
-                   SOLVER_CODEKD_CACHE_CLASS_EVICTABLE) {
-        head = &reader->evictable_head;
-        tail = &reader->evictable_tail;
-    } else {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return;
-    }
-    index = solver_codekd_cache_index(reader, entry);
-    if (entry->lru_previous == SOLVER_CODEKD_CACHE_NONE) {
-        *head = entry->lru_next;
-    } else {
-        reader->cache[entry->lru_previous].lru_next =
-            entry->lru_next;
-    }
-    if (entry->lru_next == SOLVER_CODEKD_CACHE_NONE) {
-        *tail = entry->lru_previous;
-    } else {
-        reader->cache[entry->lru_next].lru_previous =
-            entry->lru_previous;
-    }
-    entry->lru_previous = SOLVER_CODEKD_CACHE_NONE;
-    entry->lru_next = SOLVER_CODEKD_CACHE_NONE;
-    entry->listed = FALSE;
-    (void)index;
-}
-
-static void solver_codekd_cache_list_push_mru(
-    solver_codekd_reader_t* reader,
-    solver_codekd_cache_entry_t* entry) {
-    uint32_t* head;
-    uint32_t* tail;
-    uint32_t index = solver_codekd_cache_index(reader, entry);
-
-    if (entry->listed || entry->pin_count ||
-        entry->plan_hold_count || !entry->valid) {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return;
-    }
-    if (entry->cache_class ==
-            SOLVER_CODEKD_CACHE_CLASS_PROTECTED) {
-        head = &reader->protected_head;
-        tail = &reader->protected_tail;
-    } else if (entry->cache_class ==
-                   SOLVER_CODEKD_CACHE_CLASS_EVICTABLE) {
-        head = &reader->evictable_head;
-        tail = &reader->evictable_tail;
-    } else {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return;
-    }
-    entry->lru_previous = SOLVER_CODEKD_CACHE_NONE;
-    entry->lru_next = *head;
-    if (*head != SOLVER_CODEKD_CACHE_NONE) {
-        reader->cache[*head].lru_previous = index;
-    } else {
-        *tail = index;
-    }
-    *head = index;
-    entry->listed = TRUE;
-}
-
-static void solver_codekd_cache_promote(
-    solver_codekd_reader_t* reader,
-    solver_codekd_cache_entry_t* entry) {
-    solver_codekd_file_segment_t* segment = entry->segment;
-    uint32_t index = solver_codekd_cache_index(reader, entry);
-    uint32_t previous = segment->protected_entry;
-
-    if (previous != SOLVER_CODEKD_CACHE_NONE &&
-        previous != index) {
-        solver_codekd_cache_entry_t* old =
-            &reader->cache[previous];
-
-        if (old->listed) {
-            solver_codekd_cache_list_remove(reader, old);
-        }
-        old->cache_class = SOLVER_CODEKD_CACHE_CLASS_EVICTABLE;
-        if (!old->pin_count && !old->plan_hold_count) {
-            solver_codekd_cache_list_push_mru(reader, old);
-        }
-    }
-    if (entry->listed) {
-        solver_codekd_cache_list_remove(reader, entry);
-    }
-    entry->cache_class = SOLVER_CODEKD_CACHE_CLASS_PROTECTED;
-    segment->protected_entry = index;
-    if (!entry->pin_count && !entry->plan_hold_count) {
-        solver_codekd_cache_list_push_mru(reader, entry);
-    }
-}
-
-static void solver_codekd_cache_hash_remove(
-    solver_codekd_reader_t* reader,
-    solver_codekd_cache_entry_t* entry) {
-    uint32_t bucket = entry->hash_bucket;
-    uint32_t* link;
-    uint32_t index = solver_codekd_cache_index(reader, entry);
-    size_t visited = 0U;
-
-    if (bucket >= SOLVER_CODEKD_CACHE_HASH_BUCKETS) {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return;
-    }
-    link = &reader->hash_buckets[bucket];
-    while (*link != SOLVER_CODEKD_CACHE_NONE &&
-           visited++ < SOLVER_CODEKD_CACHE_ENTRY_LIMIT) {
-        solver_codekd_cache_entry_t* current;
-
-        if (*link >= SOLVER_CODEKD_CACHE_ENTRY_LIMIT) {
-            break;
-        }
-        current = &reader->cache[*link];
-        if (*link == index) {
-            *link = current->hash_next;
-            entry->hash_bucket = SOLVER_CODEKD_CACHE_NONE;
-            entry->hash_next = SOLVER_CODEKD_CACHE_NONE;
-            return;
-        }
-        link = &current->hash_next;
-    }
-    reader->helper_hard_failure = TRUE;
-    errno = EPROTO;
-}
-
-static void solver_codekd_cache_detach(
-    solver_codekd_reader_t* reader,
-    solver_codekd_cache_entry_t* entry) {
-    uint32_t index;
-
-    if (!entry->valid ||
-        entry->state != SOLVER_CODEKD_CACHE_VALID) {
-        return;
-    }
-    if (entry->pin_count || entry->plan_hold_count) {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return;
-    }
-    index = solver_codekd_cache_index(reader, entry);
-    solver_codekd_cache_hash_remove(reader, entry);
-    if (entry->listed) {
-        solver_codekd_cache_list_remove(reader, entry);
-    }
-    if (entry->segment->protected_entry == index) {
-        entry->segment->protected_entry = SOLVER_CODEKD_CACHE_NONE;
-    }
-    if (entry->segment->entry_count) {
-        entry->segment->entry_count--;
-    } else {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-    }
-    entry->segment = NULL;
-    entry->data_file_offset = 0;
-    entry->perm_file_offset = 0;
-    entry->data_size = 0U;
-    entry->perm_size = 0U;
-    entry->state = SOLVER_CODEKD_CACHE_LOADING;
-    entry->cache_class = SOLVER_CODEKD_CACHE_CLASS_NONE;
-    entry->valid = FALSE;
-    if (reader->fitsbin) {
-        __atomic_add_fetch(
-            &reader->fitsbin->payload_cache_evictions,
-            1ULL,
-            __ATOMIC_RELAXED);
-    }
-}
-
-static void solver_codekd_cache_release_storage(
-    solver_codekd_reader_t* reader,
-    solver_codekd_cache_entry_t* entry) {
-    size_t retained =
-        entry->data_capacity + entry->perm_capacity;
-
-    reader->cache_bytes -= MIN(reader->cache_bytes, retained);
-    free(entry->data);
-    free(entry->perm);
-    entry->data = NULL;
-    entry->perm = NULL;
-    entry->data_capacity = 0U;
-    entry->perm_capacity = 0U;
-}
-
-static void solver_codekd_cache_free_push(
-    solver_codekd_reader_t* reader,
-    solver_codekd_cache_entry_t* entry) {
-    uint32_t index = solver_codekd_cache_index(reader, entry);
-
-    entry->segment = NULL;
-    entry->hash_bucket = SOLVER_CODEKD_CACHE_NONE;
-    entry->hash_next = SOLVER_CODEKD_CACHE_NONE;
-    entry->lru_previous = SOLVER_CODEKD_CACHE_NONE;
-    entry->lru_next = SOLVER_CODEKD_CACHE_NONE;
-    entry->pin_count = 0U;
-    entry->plan_hold_count = 0U;
-    entry->state = SOLVER_CODEKD_CACHE_FREE;
-    entry->cache_class = SOLVER_CODEKD_CACHE_CLASS_NONE;
-    entry->listed = FALSE;
-    entry->valid = FALSE;
-    entry->free_next = reader->free_head;
-    reader->free_head = index;
-}
-
-static solver_codekd_cache_entry_t* solver_codekd_cache_take(
-    solver_codekd_reader_t* reader) {
-    solver_codekd_cache_entry_t* entry;
-    uint32_t index;
-
-    if (reader->free_head != SOLVER_CODEKD_CACHE_NONE) {
-        index = reader->free_head;
-        entry = &reader->cache[index];
-        reader->free_head = entry->free_next;
-        entry->free_next = SOLVER_CODEKD_CACHE_NONE;
-        entry->state = SOLVER_CODEKD_CACHE_LOADING;
-        return entry;
-    }
-    index = reader->evictable_tail != SOLVER_CODEKD_CACHE_NONE
-        ? reader->evictable_tail
-        : reader->protected_tail;
-    if (index == SOLVER_CODEKD_CACHE_NONE) {
-        errno = ENOMEM;
-        return NULL;
-    }
-    entry = &reader->cache[index];
-    solver_codekd_cache_detach(reader, entry);
-    if (reader->helper_hard_failure) {
-        return NULL;
-    }
-    return entry;
-}
-
-static int solver_codekd_cache_reclaim_storage(
-    solver_codekd_reader_t* reader) {
-    uint32_t index =
-        reader->evictable_tail != SOLVER_CODEKD_CACHE_NONE
-        ? reader->evictable_tail
-        : reader->protected_tail;
-    solver_codekd_cache_entry_t* entry;
-
-    if (index == SOLVER_CODEKD_CACHE_NONE) {
-        errno = ENOMEM;
-        return -1;
-    }
-    entry = &reader->cache[index];
-    solver_codekd_cache_detach(reader, entry);
-    if (reader->helper_hard_failure) {
-        return -1;
-    }
-    solver_codekd_cache_release_storage(reader, entry);
-    solver_codekd_cache_free_push(reader, entry);
-    return 0;
-}
-
-static int solver_codekd_cache_reserve(
-    solver_codekd_reader_t* reader,
-    solver_codekd_cache_entry_t* entry,
-    size_t data_bytes,
-    size_t perm_bytes) {
-    size_t data_growth;
-    size_t perm_growth;
-    size_t growth;
-
-    if (!reader || !entry || entry->pin_count ||
-        entry->plan_hold_count) {
-        if (reader) {
-            reader->helper_hard_failure = TRUE;
-        }
-        errno = EPROTO;
-        return -1;
-    }
-    data_growth =
-        data_bytes > entry->data_capacity
-        ? data_bytes - entry->data_capacity
-        : 0U;
-    perm_growth =
-        perm_bytes > entry->perm_capacity
-        ? perm_bytes - entry->perm_capacity
-        : 0U;
-
-    if (data_growth > SIZE_MAX - perm_growth) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    growth = data_growth + perm_growth;
-    if (growth > SOLVER_CODEKD_RANGE_CACHE_BYTES) {
-        errno = ENOMEM;
-        return -1;
-    }
-    while (reader->cache_bytes >
-           SOLVER_CODEKD_RANGE_CACHE_BYTES - growth) {
-        if (solver_codekd_cache_reclaim_storage(reader)) {
-            return -1;
-        }
-    }
-    if (data_bytes > entry->data_capacity) {
-        u16* grown = realloc(entry->data, data_bytes);
-
-        if (!grown) {
-            return -1;
-        }
-        reader->cache_bytes +=
-            data_bytes - entry->data_capacity;
-        entry->data = grown;
-        entry->data_capacity = data_bytes;
-        __atomic_add_fetch(
-            &reader->fitsbin->payload_cache_allocations,
-            1ULL,
-            __ATOMIC_RELAXED);
-    }
-    if (perm_bytes > entry->perm_capacity) {
-        u32* grown = realloc(entry->perm, perm_bytes);
-
-        if (!grown) {
-            return -1;
-        }
-        reader->cache_bytes +=
-            perm_bytes - entry->perm_capacity;
-        entry->perm = grown;
-        entry->perm_capacity = perm_bytes;
-        __atomic_add_fetch(
-            &reader->fitsbin->payload_cache_allocations,
-            1ULL,
-            __ATOMIC_RELAXED);
-    }
-    return 0;
-}
-
-static void solver_codekd_cache_publish(
-    solver_codekd_reader_t* reader,
-    solver_codekd_cache_entry_t* entry,
-    solver_codekd_file_segment_t* segment,
-    off_t data_file_offset,
-    size_t data_size,
-    off_t perm_file_offset,
-    size_t perm_size) {
-    uint64_t data_page;
-    uint32_t bucket;
-
-    if (!segment || !segment->page_size || data_file_offset < 0) {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return;
-    }
-    data_page = (uint64_t)data_file_offset /
-        (uint64_t)segment->page_size;
-    bucket = solver_codekd_cache_bucket(segment, data_page);
-    entry->data_file_offset = data_file_offset;
-    entry->perm_file_offset = perm_file_offset;
-    entry->data_size = data_size;
-    entry->perm_size = perm_size;
-    entry->segment = segment;
-    entry->state = SOLVER_CODEKD_CACHE_VALID;
-    entry->valid = TRUE;
-    entry->hash_bucket = bucket;
-    entry->hash_next = reader->hash_buckets[bucket];
-    reader->hash_buckets[bucket] =
-        solver_codekd_cache_index(reader, entry);
-    segment->entry_count++;
-    solver_codekd_cache_promote(reader, entry);
-}
-
-#if defined(TESTING)
-int solver_test_codekd_cache_churn(void) {
-    solver_codekd_reader_t* reader;
-    solver_codekd_file_segment_t* segment;
-    fitsbin_t fitsbin;
-    size_t i;
-    int rc = -1;
-
-    reader = calloc(1, sizeof(*reader));
-    if (!reader) {
-        return -1;
-    }
-    segment = calloc(1, sizeof(*segment));
-    if (!segment) {
-        free(reader);
-        return -1;
-    }
-    memset(&fitsbin, 0, sizeof(fitsbin));
-    solver_codekd_cache_initialize(reader);
-    segment->page_size = 4096U;
-    segment->protected_entry = SOLVER_CODEKD_CACHE_NONE;
-    reader->segments = segment;
-    reader->active_segment = segment;
-    reader->fitsbin = &fitsbin;
-    for (i = 0U;
-         i < SOLVER_CODEKD_CACHE_ENTRY_LIMIT + 64U;
-         i++) {
-        solver_codekd_cache_entry_t* entry =
-            solver_codekd_cache_take(reader);
-
-        if (!entry) {
-            goto cleanup;
-        }
-        if (solver_codekd_cache_reserve(
-                reader,
-                entry,
-                4U * 1024U,
-                4U * 1024U)) {
-            goto cleanup;
-        }
-        solver_codekd_cache_publish(
-            reader,
-            entry,
-            segment,
-            (off_t)(i * 8192U),
-            4U * 1024U,
-            (off_t)(i * 8192U + 4096U),
-            4U * 1024U);
-        if (reader->cache_bytes >
-            SOLVER_CODEKD_RANGE_CACHE_BYTES) {
-            goto cleanup;
-        }
-    }
-    i--;
-    if (!solver_codekd_cache_find(
-            reader,
-            segment,
-            (off_t)(i * 8192U),
-            4U * 1024U,
-            (off_t)(i * 8192U + 4096U),
-            4U * 1024U) ||
-        segment->protected_entry == SOLVER_CODEKD_CACHE_NONE ||
-        !fitsbin.payload_cache_evictions) {
-        goto cleanup;
-    }
-    rc = 0;
-
-cleanup:
-    solver_codekd_reader_destroy(reader);
-    return rc;
-}
-#endif
-
-static int solver_codekd_pin_range(
-    solver_codekd_reader_t* reader,
-    solver_codekd_cache_entry_t* entry,
-    kdtree_direct_range_t* range) {
-    if (!reader || !entry || !range || !entry->valid ||
-        entry->state != SOLVER_CODEKD_CACHE_VALID ||
-        entry->pin_count == UINT_MAX ||
-        reader->total_pins == SIZE_MAX) {
-        if (reader) {
-            reader->helper_hard_failure = TRUE;
-        }
-        errno = EPROTO;
-        return -1;
-    }
-    if (!entry->pin_count && entry->listed) {
-        solver_codekd_cache_list_remove(reader, entry);
-    }
-    entry->pin_count++;
-    reader->total_pins++;
-    range->lease = entry;
-    return 0;
-}
-
-static int solver_codekd_hold_entry(
-    solver_codekd_reader_t* reader,
-    solver_codekd_cache_entry_t* entry) {
-    if (!reader || !entry ||
-        entry->state == SOLVER_CODEKD_CACHE_FREE ||
-        entry->plan_hold_count == UINT_MAX ||
-        reader->total_plan_holds == SIZE_MAX) {
-        if (reader) {
-            reader->helper_hard_failure = TRUE;
-        }
-        errno = EPROTO;
-        return -1;
-    }
-    if (!entry->plan_hold_count && entry->listed) {
-        solver_codekd_cache_list_remove(reader, entry);
-        if (reader->helper_hard_failure) {
-            errno = EPROTO;
-            return -1;
-        }
-    }
-    entry->plan_hold_count++;
-    reader->total_plan_holds++;
-    return 0;
-}
-
-static void solver_codekd_release_entry_hold(
-    solver_codekd_reader_t* reader,
-    solver_codekd_cache_entry_t* entry) {
-    if (!reader || !entry || !entry->plan_hold_count ||
-        !reader->total_plan_holds) {
-        if (reader) {
-            reader->helper_hard_failure = TRUE;
-        }
-        errno = EPROTO;
-        return;
-    }
-    entry->plan_hold_count--;
-    reader->total_plan_holds--;
-    if (entry->plan_hold_count || entry->pin_count ||
-        entry->state != SOLVER_CODEKD_CACHE_VALID ||
-        !entry->valid) {
-        return;
-    }
-    if (!entry->segment) {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return;
-    }
-    if (entry->segment->protected_entry ==
-        SOLVER_CODEKD_CACHE_NONE) {
-        solver_codekd_cache_promote(reader, entry);
-    } else {
-        solver_codekd_cache_list_push_mru(reader, entry);
-    }
-}
-
-typedef struct solver_codekd_range_plan {
-    const void* data_cover_source;
-    const void* perm_cover_source;
-    off_t data_cover_file_offset;
-    off_t perm_cover_file_offset;
-    size_t data_cover_size;
-    size_t perm_cover_size;
-    size_t data_exact_offset;
-    size_t perm_exact_offset;
-    size_t data_logical_size;
-    size_t perm_logical_size;
-    solver_codekd_cache_entry_t* entry;
-    anbool owns_loading;
-} solver_codekd_range_plan_t;
-
-static int solver_codekd_prepare_range_plan(
-    solver_codekd_reader_t* reader,
-    const kdtree_direct_range_request_t* request,
-    solver_codekd_range_plan_t* plan) {
-    const void* exact_data_source;
-    const void* exact_perm_source = NULL;
-    size_t first_data_element;
-    size_t data_elements;
-
-    memset(plan, 0, sizeof(*plan));
-    if (!reader || !reader->tree || !reader->fitsbin ||
-        !reader->active_segment || !request ||
-        request->first < 0 || request->count <= 0 ||
-        reader->tree->ndata <= 0 ||
-        request->count > reader->tree->ndata ||
-        request->first > reader->tree->ndata - request->count ||
-        reader->tree->ndim <= 0 ||
-        (size_t)request->count >
-            SIZE_MAX / (size_t)reader->tree->ndim ||
-        (size_t)request->first >
-            SIZE_MAX / (size_t)reader->tree->ndim) {
-        errno = EINVAL;
-        return -1;
-    }
-    data_elements =
-        (size_t)request->count * (size_t)reader->tree->ndim;
-    first_data_element =
-        (size_t)request->first * (size_t)reader->tree->ndim;
-    if (data_elements > SIZE_MAX / sizeof(u16)) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    plan->data_logical_size = data_elements * sizeof(u16);
-    exact_data_source =
-        reader->tree->data.s + first_data_element;
-    if (reader->tree->perm) {
-        if ((size_t)request->count > SIZE_MAX / sizeof(u32)) {
-            errno = EOVERFLOW;
-            return -1;
-        }
-        plan->perm_logical_size =
-            (size_t)request->count * sizeof(u32);
-        exact_perm_source =
-            reader->tree->perm + request->first;
-    }
-    if (fitsbin_mapped_range_page_cover(
-            reader->fitsbin,
-            exact_data_source,
-            plan->data_logical_size,
-            &plan->data_cover_source,
-            &plan->data_cover_size,
-            &plan->data_cover_file_offset,
-            &plan->data_exact_offset)) {
-        return -1;
-    }
-    if (plan->data_exact_offset % sizeof(u16) ||
-        plan->data_exact_offset > plan->data_cover_size ||
-        plan->data_logical_size >
-            plan->data_cover_size - plan->data_exact_offset) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (exact_perm_source) {
-        if (fitsbin_mapped_range_page_cover(
-                reader->fitsbin,
-                exact_perm_source,
-                plan->perm_logical_size,
-                &plan->perm_cover_source,
-                &plan->perm_cover_size,
-                &plan->perm_cover_file_offset,
-                &plan->perm_exact_offset)) {
-            return -1;
-        }
-        if (plan->perm_exact_offset % sizeof(u32) ||
-            plan->perm_exact_offset > plan->perm_cover_size ||
-            plan->perm_logical_size >
-                plan->perm_cover_size - plan->perm_exact_offset) {
-            errno = EINVAL;
-            return -1;
-        }
-    }
-    if (plan->data_cover_size >
-            SIZE_MAX - plan->perm_cover_size ||
-        plan->data_cover_size + plan->perm_cover_size >
-            SOLVER_CODEKD_RANGE_CACHE_BYTES) {
-        errno = E2BIG;
-        return -1;
-    }
-    return 0;
-}
-
-static anbool solver_codekd_plan_contains(
-    const solver_codekd_range_plan_t* outer,
-    const solver_codekd_range_plan_t* inner) {
-    return solver_codekd_cache_range_contains(
-               outer->data_cover_file_offset,
-               outer->data_cover_size,
-               inner->data_cover_file_offset,
-               inner->data_cover_size) &&
-        ((!inner->perm_cover_size && !outer->perm_cover_size) ||
-         (inner->perm_cover_size && outer->perm_cover_size &&
-          solver_codekd_cache_range_contains(
-              outer->perm_cover_file_offset,
-              outer->perm_cover_size,
-              inner->perm_cover_file_offset,
-              inner->perm_cover_size)));
-}
-
-#define SOLVER_CODEKD_DELIVERY_ENTRY_LIMIT \
-    (FITSBIN_PREAD_ASYNC_RANGE_LIMIT / 2U)
-
-typedef struct solver_codekd_delivery_item {
-    solver_codekd_cache_entry_t* entry;
-    off_t data_file_offset;
-    off_t perm_file_offset;
-    size_t data_size;
-    size_t perm_size;
-    anbool owns_loading;
-} solver_codekd_delivery_item_t;
-
-typedef struct solver_codekd_delivery {
-    solver_codekd_reader_t* reader;
-    solver_codekd_file_segment_t* segment;
-    fitsbin_t* fitsbin;
-    fitsbin_payload_io_ticket_t* ticket;
-    solver_codekd_delivery_item_t
-        items[SOLVER_CODEKD_DELIVERY_ENTRY_LIMIT];
-    fitsbin_pread_range_t
-        io_ranges[FITSBIN_PREAD_ASYNC_RANGE_LIMIT];
-    size_t item_count;
-    size_t io_count;
-    size_t io_bytes;
-    anbool reader_bound;
-    anbool owns_reader_binding;
-    anbool completed;
-} solver_codekd_delivery_t;
-
-static solver_codekd_delivery_item_t*
-solver_codekd_delivery_find_item(
-    solver_codekd_delivery_t* delivery,
-    solver_codekd_cache_entry_t* entry) {
-    size_t i;
-
-    if (!delivery || !entry) {
-        return NULL;
-    }
-    for (i = 0U; i < delivery->item_count; i++) {
-        if (delivery->items[i].entry == entry) {
-            return &delivery->items[i];
-        }
-    }
-    return NULL;
-}
-
-static solver_codekd_delivery_item_t*
-solver_codekd_delivery_find_loading_cover(
-    solver_codekd_delivery_t* delivery,
-    const solver_codekd_range_plan_t* plan) {
-    size_t i;
-
-    if (!delivery || !plan) {
-        return NULL;
-    }
-    for (i = 0U; i < delivery->item_count; i++) {
-        solver_codekd_delivery_item_t* item =
-            &delivery->items[i];
-
-        if (!item->owns_loading || !item->entry ||
-            item->entry->state != SOLVER_CODEKD_CACHE_LOADING) {
-            continue;
-        }
-        if (solver_codekd_cache_range_contains(
-                item->data_file_offset,
-                item->data_size,
-                plan->data_cover_file_offset,
-                plan->data_cover_size) &&
-            ((!plan->perm_cover_size && !item->perm_size) ||
-             (plan->perm_cover_size && item->perm_size &&
-              solver_codekd_cache_range_contains(
-                  item->perm_file_offset,
-                  item->perm_size,
-                  plan->perm_cover_file_offset,
-                  plan->perm_cover_size)))) {
-            return item;
-        }
-    }
-    return NULL;
-}
-
-static int solver_codekd_delivery_hold_valid(
-    solver_codekd_delivery_t* delivery,
-    solver_codekd_cache_entry_t* entry) {
-    solver_codekd_delivery_item_t* item;
-
-    if (solver_codekd_delivery_find_item(delivery, entry)) {
-        return 0;
-    }
-    if (delivery->item_count >=
-        SOLVER_CODEKD_DELIVERY_ENTRY_LIMIT) {
-        errno = E2BIG;
-        return -1;
-    }
-    if (solver_codekd_hold_entry(delivery->reader, entry)) {
-        return -1;
-    }
-    item = &delivery->items[delivery->item_count++];
-    memset(item, 0, sizeof(*item));
-    item->entry = entry;
-    return 0;
-}
-
-static int solver_codekd_delivery_add_loading(
-    solver_codekd_delivery_t* delivery,
-    const solver_codekd_range_plan_t* plan) {
-    solver_codekd_delivery_item_t* item;
-    solver_codekd_cache_entry_t* entry;
-    size_t added_ranges = plan->perm_cover_size ? 2U : 1U;
-
-    if (delivery->item_count >=
-            SOLVER_CODEKD_DELIVERY_ENTRY_LIMIT ||
-        added_ranges >
-            FITSBIN_PREAD_ASYNC_RANGE_LIMIT - delivery->io_count ||
-        plan->data_cover_size > SIZE_MAX - plan->perm_cover_size ||
-        plan->data_cover_size + plan->perm_cover_size >
-            SIZE_MAX - delivery->io_bytes ||
-        plan->data_cover_size + plan->perm_cover_size >
-            SOLVER_CODEKD_RANGE_CACHE_BYTES / 2U -
-                MIN(delivery->io_bytes,
-                    SOLVER_CODEKD_RANGE_CACHE_BYTES / 2U)) {
-        errno = E2BIG;
-        return -1;
-    }
-    entry = solver_codekd_cache_take(delivery->reader);
-    if (!entry) {
-        return -1;
-    }
-    if (solver_codekd_cache_reserve(
-            delivery->reader,
-            entry,
-            plan->data_cover_size,
-            plan->perm_cover_size)) {
-        solver_codekd_cache_release_storage(
-            delivery->reader, entry);
-        solver_codekd_cache_free_push(delivery->reader, entry);
-        return -1;
-    }
-    if (solver_codekd_hold_entry(delivery->reader, entry)) {
-        solver_codekd_cache_release_storage(
-            delivery->reader, entry);
-        solver_codekd_cache_free_push(delivery->reader, entry);
-        return -1;
-    }
-
-    item = &delivery->items[delivery->item_count++];
-    memset(item, 0, sizeof(*item));
-    item->entry = entry;
-    item->data_file_offset = plan->data_cover_file_offset;
-    item->perm_file_offset = plan->perm_cover_file_offset;
-    item->data_size = plan->data_cover_size;
-    item->perm_size = plan->perm_cover_size;
-    item->owns_loading = TRUE;
-
-    delivery->io_ranges[delivery->io_count].data =
-        plan->data_cover_source;
-    delivery->io_ranges[delivery->io_count].size =
-        plan->data_cover_size;
-    delivery->io_ranges[delivery->io_count].logical_size =
-        plan->data_logical_size;
-    delivery->io_ranges[delivery->io_count].destination =
-        entry->data;
-    delivery->io_count++;
-    if (plan->perm_cover_size) {
-        delivery->io_ranges[delivery->io_count].data =
-            plan->perm_cover_source;
-        delivery->io_ranges[delivery->io_count].size =
-            plan->perm_cover_size;
-        delivery->io_ranges[delivery->io_count].logical_size =
-            plan->perm_logical_size;
-        delivery->io_ranges[delivery->io_count].destination =
-            entry->perm;
-        delivery->io_count++;
-    }
-    delivery->io_bytes +=
-        plan->data_cover_size + plan->perm_cover_size;
-    return 0;
-}
-
-static int solver_codekd_delivery_plan_ranges(
-    void* opaque,
-    const kdtree_direct_range_request_t* requests,
-    size_t nrequests) {
-    solver_codekd_delivery_t* delivery = opaque;
-    size_t request_index;
-
-    if (!delivery || !delivery->reader || !requests || !nrequests ||
-        nrequests > KDTREE_DIRECT_DSS_WAVE_TASKS) {
-        errno = EINVAL;
-        return -1;
-    }
-    for (request_index = 0U;
-         request_index < nrequests;
-         request_index++) {
-        solver_codekd_range_plan_t plan;
-        solver_codekd_cache_entry_t* entry;
-
-        if (solver_codekd_prepare_range_plan(
-                delivery->reader,
-                &requests[request_index],
-                &plan)) {
-            return -1;
-        }
-        entry = solver_codekd_cache_find(
-            delivery->reader,
-            delivery->segment,
-            plan.data_cover_file_offset,
-            plan.data_cover_size,
-            plan.perm_cover_file_offset,
-            plan.perm_cover_size);
-        if (delivery->reader->helper_hard_failure) {
-            errno = EPROTO;
-            return -1;
-        }
-        if (entry) {
-            if (solver_codekd_delivery_hold_valid(
-                    delivery, entry)) {
-                return -1;
-            }
-            continue;
-        }
-        if (solver_codekd_delivery_find_loading_cover(
-                delivery, &plan)) {
-            continue;
-        }
-        if (solver_codekd_delivery_add_loading(
-                delivery, &plan)) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static int solver_codekd_plan_entry_offsets(
-    const solver_codekd_cache_entry_t* entry,
-    const solver_codekd_range_plan_t* plan,
-    size_t* data_offset,
-    size_t* perm_offset) {
-    uint64_t data_cover_delta;
-
-    if (!entry || !plan || !data_offset || !perm_offset ||
-        !solver_codekd_cache_entry_contains(
-            entry,
-            entry->segment,
-            plan->data_cover_file_offset,
-            plan->data_cover_size,
-            plan->perm_cover_file_offset,
-            plan->perm_cover_size)) {
-        errno = EPROTO;
-        return -1;
-    }
-    data_cover_delta =
-        (uint64_t)plan->data_cover_file_offset -
-        (uint64_t)entry->data_file_offset;
-    if (data_cover_delta > SIZE_MAX ||
-        plan->data_exact_offset >
-            SIZE_MAX - (size_t)data_cover_delta) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    *data_offset =
-        (size_t)data_cover_delta + plan->data_exact_offset;
-    if (*data_offset % sizeof(u16) ||
-        *data_offset > entry->data_size ||
-        plan->data_logical_size >
-            entry->data_size - *data_offset) {
-        errno = EPROTO;
-        return -1;
-    }
-    *perm_offset = 0U;
-    if (plan->perm_cover_size) {
-        uint64_t perm_cover_delta =
-            (uint64_t)plan->perm_cover_file_offset -
-            (uint64_t)entry->perm_file_offset;
-
-        if (perm_cover_delta > SIZE_MAX ||
-            plan->perm_exact_offset >
-                SIZE_MAX - (size_t)perm_cover_delta) {
-            errno = EOVERFLOW;
-            return -1;
-        }
-        *perm_offset =
-            (size_t)perm_cover_delta + plan->perm_exact_offset;
-        if (*perm_offset % sizeof(u32) ||
-            *perm_offset > entry->perm_size ||
-            plan->perm_logical_size >
-                entry->perm_size - *perm_offset) {
-            errno = EPROTO;
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static int solver_codekd_assign_range(
-    solver_codekd_reader_t* reader,
-    const solver_codekd_range_plan_t* plan,
-    kdtree_direct_range_t* range) {
-    size_t data_offset;
-    size_t perm_offset;
-
-    if (solver_codekd_plan_entry_offsets(
-            plan->entry,
-            plan,
-            &data_offset,
-            &perm_offset)) {
-        reader->helper_hard_failure = TRUE;
-        return -1;
-    }
-    range->data = (const u16*)(
-        (const unsigned char*)plan->entry->data + data_offset);
-    range->perm = plan->perm_cover_size
-        ? (const u32*)(
-              (const unsigned char*)plan->entry->perm + perm_offset)
-        : NULL;
-    return solver_codekd_pin_range(
-        reader, plan->entry, range);
-}
-
-static void solver_codekd_rollback_loading_plans(
-    solver_codekd_reader_t* reader,
-    solver_codekd_range_plan_t* plans,
-    size_t nplans) {
-    size_t plan_index;
-
-    for (plan_index = 0U; plan_index < nplans; plan_index++) {
-        solver_codekd_cache_entry_t* entry =
-            plans[plan_index].entry;
-
-        if (!plans[plan_index].owns_loading || !entry ||
-            entry->state != SOLVER_CODEKD_CACHE_LOADING) {
-            continue;
-        }
-        solver_codekd_cache_release_storage(reader, entry);
-        solver_codekd_cache_free_push(reader, entry);
-    }
-}
-
-static int solver_codekd_read_leased_ranges(
-    void* opaque,
-    const kdtree_direct_range_request_t* requests,
-    size_t nrequests,
-    kdtree_direct_range_t* ranges) {
-    solver_codekd_reader_t* reader = opaque;
-    solver_codekd_range_plan_t plans[SOLVER_CODEKD_READ_BATCH_MAX];
-    fitsbin_pread_range_t
-        io_ranges[2U * SOLVER_CODEKD_READ_BATCH_MAX];
-    size_t io_count = 0U;
-    size_t request_index;
-    int saved_errno;
-
-    if (!reader || !requests || !ranges || !nrequests ||
-        nrequests > SOLVER_CODEKD_READ_BATCH_MAX ||
-        2U * nrequests > FITSBIN_PREAD_RANGE_LIMIT) {
-        errno = EINVAL;
-        return -1;
-    }
-    memset(ranges, 0, nrequests * sizeof(*ranges));
-    memset(plans, 0, sizeof(plans));
-    memset(io_ranges, 0, sizeof(io_ranges));
-
-    for (request_index = 0U;
-         request_index < nrequests;
-         request_index++) {
-        solver_codekd_range_plan_t* plan = &plans[request_index];
-        solver_codekd_cache_entry_t* entry;
-        size_t previous;
-
-        if (solver_codekd_prepare_range_plan(
-                reader,
-                &requests[request_index],
-                plan)) {
-            goto fail;
-        }
-        entry = solver_codekd_cache_find(
-            reader,
-            reader->active_segment,
-            plan->data_cover_file_offset,
-            plan->data_cover_size,
-            plan->perm_cover_file_offset,
-            plan->perm_cover_size);
-        if (reader->helper_hard_failure) {
-            errno = EPROTO;
-            goto fail;
-        }
-        if (entry) {
-            plan->entry = entry;
-            solver_codekd_cache_promote(reader, entry);
-            __atomic_add_fetch(
-                &reader->fitsbin->payload_cache_hits,
-                1ULL,
-                __ATOMIC_RELAXED);
-            if (solver_codekd_assign_range(
-                    reader, plan, &ranges[request_index])) {
-                goto fail;
-            }
-            continue;
-        }
-        __atomic_add_fetch(
-            &reader->fitsbin->payload_cache_misses,
-            1ULL,
-            __ATOMIC_RELAXED);
-
-        for (previous = 0U; previous < request_index; previous++) {
-            if (plans[previous].owns_loading &&
-                plans[previous].entry &&
-                plans[previous].entry->state ==
-                    SOLVER_CODEKD_CACHE_LOADING &&
-                solver_codekd_plan_contains(
-                    &plans[previous], plan)) {
-                entry = plans[previous].entry;
-                break;
-            }
-        }
-        if (previous < request_index) {
-            plan->entry = entry;
-            continue;
-        }
-
-        entry = solver_codekd_cache_take(reader);
-        if (!entry) {
-            goto fail;
-        }
-        plan->entry = entry;
-        plan->owns_loading = TRUE;
-        if (solver_codekd_cache_reserve(
-                reader,
-                entry,
-                plan->data_cover_size,
-                plan->perm_cover_size)) {
-            goto fail;
-        }
-        io_ranges[io_count].data = plan->data_cover_source;
-        io_ranges[io_count].size = plan->data_cover_size;
-        io_ranges[io_count].logical_size =
-            plan->data_logical_size;
-        io_ranges[io_count].destination = entry->data;
-        io_count++;
-        if (plan->perm_cover_size) {
-            io_ranges[io_count].data = plan->perm_cover_source;
-            io_ranges[io_count].size = plan->perm_cover_size;
-            io_ranges[io_count].logical_size =
-                plan->perm_logical_size;
-            io_ranges[io_count].destination = entry->perm;
-            io_count++;
-        }
-    }
-
-    if (io_count && fitsbin_pread_mapped_ranges(
-            reader->fitsbin,
-            io_ranges,
-            io_count)) {
-        goto fail;
-    }
-    for (request_index = 0U;
-         request_index < nrequests;
-         request_index++) {
-        solver_codekd_range_plan_t* plan = &plans[request_index];
-
-        if (!plan->owns_loading) {
-            continue;
-        }
-        solver_codekd_cache_publish(
-            reader,
-            plan->entry,
-            reader->active_segment,
-            plan->data_cover_file_offset,
-            plan->data_cover_size,
-            plan->perm_cover_file_offset,
-            plan->perm_cover_size);
-        if (reader->helper_hard_failure) {
-            errno = EPROTO;
-            goto fail;
-        }
-    }
-    for (request_index = 0U;
-         request_index < nrequests;
-         request_index++) {
-        solver_codekd_range_plan_t* plan = &plans[request_index];
-
-        if (ranges[request_index].lease) {
-            continue;
-        }
-        if (solver_codekd_assign_range(
-                reader, plan, &ranges[request_index])) {
-            goto fail;
-        }
-    }
-    return 0;
-
-fail:
-    saved_errno = errno ? errno : EIO;
-    solver_codekd_rollback_loading_plans(
-        reader, plans, nrequests);
-    errno = saved_errno;
-    return -1;
-}
-
-static void solver_codekd_release_range(
-    void* opaque,
-    void* lease) {
-    solver_codekd_reader_t* reader = opaque;
-    solver_codekd_cache_entry_t* entry;
-    uintptr_t cache_begin;
-    uintptr_t lease_address;
-    size_t offset;
-
-    if (!reader || !lease) {
-        if (reader) {
-            reader->helper_hard_failure = TRUE;
-        }
-        errno = EPROTO;
-        return;
-    }
-    cache_begin = (uintptr_t)&reader->cache[0];
-    lease_address = (uintptr_t)lease;
-    if (lease_address < cache_begin ||
-        lease_address - cache_begin >= sizeof(reader->cache)) {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return;
-    }
-    offset = (size_t)(lease_address - cache_begin);
-    if (offset % sizeof(reader->cache[0])) {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return;
-    }
-    entry = &reader->cache[
-        offset / sizeof(reader->cache[0])];
-    if (entry != lease || !entry->pin_count ||
-        !reader->total_pins || !entry->valid ||
-        entry->state != SOLVER_CODEKD_CACHE_VALID) {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return;
-    }
-    entry->pin_count--;
-    reader->total_pins--;
-    if (entry->pin_count) {
-        return;
-    }
-    if (entry->plan_hold_count) {
-        return;
-    }
-    if (entry->segment->protected_entry ==
-        SOLVER_CODEKD_CACHE_NONE) {
-        solver_codekd_cache_promote(reader, entry);
-    } else {
-        solver_codekd_cache_list_push_mru(reader, entry);
-    }
-}
-
-static index_shard_helper_task_status_t
-solver_codekd_helper_execute(
-    const void* input,
-    size_t input_bytes,
-    void* output,
-    size_t output_bytes) {
-    if (!input ||
-        input_bytes != sizeof(kdtree_direct_dss_task_input_t) ||
-        !output ||
-        output_bytes != sizeof(kdtree_direct_dss_task_output_t)) {
-        return INDEX_SHARD_HELPER_TASK_ERROR;
-    }
-    return kdtree_direct_dss_task_execute(input, output)
-        ? INDEX_SHARD_HELPER_TASK_ERROR
-        : INDEX_SHARD_HELPER_TASK_OK;
-}
-
-static const index_shard_helper_ops_t solver_codekd_helper_ops = {
-    "codekd-leaf",
-    solver_codekd_helper_execute
-};
-
-static size_t solver_codekd_helper_available(void* opaque) {
-    /*
-     * The leaf wave is too fine-grained for foreign scheduling. Keep the
-     * direct reader and its batched page delivery, but reduce CodeKD leaves
-     * on their owner until a coarse, index-free package replaces this seam.
-     */
-    (void)opaque;
-    return 0U;
-}
-
-static int solver_codekd_helper_run(
-    void* opaque,
-    const kdtree_direct_dss_task_input_t* inputs,
-    size_t ntasks,
-    const kdtree_direct_dss_task_output_t** outputs) {
-    solver_codekd_reader_t* reader = opaque;
-    index_shard_helper_task_t tasks[KDTREE_DIRECT_DSS_WAVE_TASKS];
-    index_shard_helper_run_status_t run_status;
-    size_t task_index;
-
-    if (outputs) {
-        *outputs = NULL;
-    }
-    if (!reader || !inputs || !outputs ||
-        ntasks < KDTREE_DIRECT_DSS_WAVE_MIN_TASKS ||
-        ntasks > KDTREE_DIRECT_DSS_WAVE_TASKS ||
-        !index_shard_worker_context_active()) {
-        goto hard_failure;
-    }
-    memset(tasks, 0, sizeof(tasks));
-    for (task_index = 0U; task_index < ntasks; task_index++) {
-        const kdtree_direct_dss_task_input_t* input =
-            &inputs[task_index];
-        unsigned long long points = 0ULL;
-        size_t span_index;
-
-        if (!input->data || !input->nspans ||
-            input->nspans > KDTREE_DIRECT_DSS_TASK_SPANS ||
-            !input->cover_points ||
-            input->cover_points > KDTREE_DIRECT_DSS_TASK_POINTS) {
-            goto hard_failure;
-        }
-        for (span_index = 0U;
-             span_index < input->nspans;
-             span_index++) {
-            u16 first = input->span_first[span_index];
-            u16 last = input->span_last[span_index];
-
-            if (first > last || (u32)last >= input->cover_points) {
-                goto hard_failure;
-            }
-            points += (unsigned long long)(last - first) + 1ULL;
-        }
-        if (!points || points > KDTREE_DIRECT_DSS_TASK_POINTS) {
-            goto hard_failure;
-        }
-        tasks[task_index].input = input;
-        tasks[task_index].input_bytes = sizeof(*input);
-        tasks[task_index].output = &reader->helper_outputs[task_index];
-        tasks[task_index].output_bytes =
-            sizeof(reader->helper_outputs[task_index]);
-        tasks[task_index].work_units = points * 4ULL;
-    }
-
-    run_status = index_shard_helper_run(
-        &solver_codekd_helper_ops, tasks, ntasks, NULL);
-    if (run_status == INDEX_SHARD_HELPER_UNAVAILABLE ||
-        run_status == INDEX_SHARD_HELPER_STOPPED) {
-        return 1;
-    }
-    if (run_status != INDEX_SHARD_HELPER_OK) {
-        goto hard_failure;
-    }
-    for (task_index = 0U; task_index < ntasks; task_index++) {
-        if (tasks[task_index].execute_status !=
-                INDEX_SHARD_HELPER_TASK_OK ||
-            reader->helper_outputs[task_index].status) {
-            goto hard_failure;
-        }
-    }
-    *outputs = reader->helper_outputs;
-    return 0;
-
-hard_failure:
-    if (reader) {
-        reader->helper_hard_failure = TRUE;
-    }
-    errno = EPROTO;
-    return -1;
-}
-
-static anbool solver_codekd_direct_capable(
-    const kdtree_t* tree) {
-    fitsbin_t* fb;
-    const void* map_base;
-    const void* range_start;
-    size_t map_size;
-    size_t range_size;
-    size_t data_elements;
-    size_t data_bytes;
-    size_t perm_bytes;
-
-    if (!tree || !tree->io || !tree->io_is_fitsbin ||
-        tree->treetype != KDTT_DSS ||
-        tree->ndata <= 0 || tree->ndim <= 0 ||
-        (size_t)tree->ndata >
-            SIZE_MAX / (size_t)tree->ndim) {
-        return FALSE;
-    }
-    data_elements =
-        (size_t)tree->ndata * (size_t)tree->ndim;
-    if (data_elements > SIZE_MAX / sizeof(u16)) {
-        return FALSE;
-    }
-    data_bytes = data_elements * sizeof(u16);
-    fb = tree->io;
-    if (!fb->payload_fd_initialized ||
-        !fb->open_file_stat_valid) {
-        return FALSE;
-    }
-    if (fitsbin_resolve_mapped_range(
-            fb,
-            tree->data.s,
-            data_bytes,
-            &map_base,
-            &map_size,
-            &range_start,
-            &range_size) != 1 ||
-        range_start != (const void*)tree->data.s ||
-        range_size != data_bytes) {
-        return FALSE;
-    }
-    if (!tree->perm) {
-        return TRUE;
-    }
-    if ((size_t)tree->ndata >
-        SIZE_MAX / sizeof(u32)) {
-        return FALSE;
-    }
-    perm_bytes =
-        (size_t)tree->ndata * sizeof(u32);
-    return fitsbin_resolve_mapped_range(
-               fb,
-               tree->perm,
-               perm_bytes,
-               &map_base,
-               &map_size,
-               &range_start,
-               &range_size) == 1 &&
-        range_start == (const void*)tree->perm &&
-        range_size == perm_bytes;
-}
-
-static void solver_codekd_delivery_unbind(
-    solver_codekd_delivery_t* delivery) {
-    if (!delivery || !delivery->reader_bound) {
-        return;
-    }
-    if (delivery->owns_reader_binding) {
-        solver_codekd_reader_unbind(delivery->reader);
-    }
-    delivery->reader_bound = FALSE;
-}
-
-static int solver_codekd_delivery_discard(
-    solver_codekd_delivery_t* delivery) {
-    size_t i;
-    int failed;
-
-    if (!delivery) {
-        return 0;
-    }
-    if (delivery->ticket) {
-        (void)fitsbin_payload_io_ticket_cancel_and_wait(
-            delivery->fitsbin, delivery->ticket);
-        fitsbin_payload_io_ticket_destroy(delivery->ticket);
-        delivery->ticket = NULL;
-    }
-    solver_codekd_delivery_unbind(delivery);
-    for (i = delivery->item_count; i > 0U; i--) {
-        solver_codekd_delivery_item_t* item =
-            &delivery->items[i - 1U];
-
-        if (!item->entry) {
-            continue;
-        }
-        solver_codekd_release_entry_hold(
-            delivery->reader, item->entry);
-        if (item->owns_loading &&
-            item->entry->state == SOLVER_CODEKD_CACHE_LOADING) {
-            solver_codekd_cache_release_storage(
-                delivery->reader, item->entry);
-            solver_codekd_cache_free_push(
-                delivery->reader, item->entry);
-        }
-    }
-    failed = delivery->reader &&
-        delivery->reader->helper_hard_failure;
-    free(delivery);
-    return failed ? -1 : 0;
-}
-
-static solver_codekd_delivery_t* solver_codekd_delivery_begin(
-    const kdtree_t* tree) {
-    solver_codekd_delivery_t* delivery;
-    solver_codekd_reader_t* reader;
-    fitsbin_t* fitsbin;
-
-    if (!solver_codekd_direct_capable(tree)) {
-        return NULL;
-    }
-    fitsbin = (fitsbin_t*)tree->io;
-    if (fitsbin_payload_is_fully_resident(fitsbin)) {
-        return NULL;
-    }
-    reader = solver_codekd_reader_get();
-    if (!reader) {
-        return NULL;
-    }
-    if (reader->helper_hard_failure) {
-        errno = EPROTO;
-        return NULL;
-    }
-    delivery = calloc(1, sizeof(*delivery));
-    if (!delivery) {
-        return NULL;
-    }
-    if (solver_codekd_reader_bind(reader, tree, fitsbin)) {
-        free(delivery);
-        return NULL;
-    }
-    delivery->reader = reader;
-    delivery->segment = reader->active_segment;
-    delivery->fitsbin = fitsbin;
-    delivery->reader_bound = TRUE;
-    delivery->owns_reader_binding = TRUE;
-    return delivery;
-}
-
-static solver_codekd_delivery_t*
-solver_codekd_delivery_begin_bound(
-    solver_codekd_reader_t* reader) {
-    solver_codekd_delivery_t* delivery;
-
-    if (!reader || !reader->tree || !reader->fitsbin ||
-        !reader->active_segment || reader->helper_hard_failure) {
-        errno = reader && reader->helper_hard_failure
-            ? EPROTO
-            : EINVAL;
-        return NULL;
-    }
-    delivery = calloc(1, sizeof(*delivery));
-    if (!delivery) {
-        return NULL;
-    }
-    delivery->reader = reader;
-    delivery->segment = reader->active_segment;
-    delivery->fitsbin = reader->fitsbin;
-    delivery->reader_bound = TRUE;
-    return delivery;
-}
-
-static int solver_codekd_delivery_rollback_query(
-    solver_codekd_delivery_t* delivery,
-    size_t item_count,
-    size_t io_count,
-    size_t io_bytes) {
-    if (!delivery || item_count > delivery->item_count ||
-        io_count > delivery->io_count ||
-        io_bytes > delivery->io_bytes) {
-        if (delivery && delivery->reader) {
-            delivery->reader->helper_hard_failure = TRUE;
-        }
-        errno = EPROTO;
-        return -1;
-    }
-    while (delivery->item_count > item_count) {
-        solver_codekd_delivery_item_t* item =
-            &delivery->items[delivery->item_count - 1U];
-
-        if (!item->entry) {
-            delivery->reader->helper_hard_failure = TRUE;
-            errno = EPROTO;
-        } else {
-            solver_codekd_release_entry_hold(
-                delivery->reader, item->entry);
-            if (item->owns_loading) {
-                if (item->entry->state !=
-                    SOLVER_CODEKD_CACHE_LOADING) {
-                    delivery->reader->helper_hard_failure = TRUE;
-                    errno = EPROTO;
-                } else {
-                    solver_codekd_cache_release_storage(
-                        delivery->reader, item->entry);
-                    solver_codekd_cache_free_push(
-                        delivery->reader, item->entry);
-                }
-            }
-        }
-        memset(item, 0, sizeof(*item));
-        delivery->item_count--;
-    }
-    delivery->io_count = io_count;
-    delivery->io_bytes = io_bytes;
-    return delivery->reader->helper_hard_failure ? -1 : 0;
-}
-
-static int solver_codekd_delivery_add_query(
-    solver_codekd_delivery_t* delivery,
-    const double* query,
-    double maxd2,
-    int options) {
-    size_t item_count;
-    size_t io_count;
-    size_t io_bytes;
-    int status;
-    int saved_errno;
-
-    if (!delivery || !delivery->reader_bound || !query) {
-        errno = EINVAL;
-        return -1;
-    }
-    item_count = delivery->item_count;
-    io_count = delivery->io_count;
-    io_bytes = delivery->io_bytes;
-    status = kdtree_rangesearch_direct_dss_plan(
-        delivery->reader->tree,
-        query,
-        maxd2,
-        options,
-        SOLVER_CODEKD_DIRECT_MAX_POINTS,
-        0U,
-        solver_codekd_delivery_plan_ranges,
-        delivery);
-    if (!status) {
-        return 0;
-    }
-    saved_errno = errno;
-    if (saved_errno == EPROTO) {
-        delivery->reader->helper_hard_failure = TRUE;
-    }
-    if (solver_codekd_delivery_rollback_query(
-            delivery,
-            item_count,
-            io_count,
-            io_bytes)) {
-        return -1;
-    }
-    errno = saved_errno;
-    return -1;
-}
-
-static int solver_codekd_delivery_submit(
-    solver_codekd_delivery_t* delivery) {
-    int status;
-
-    if (!delivery || !delivery->reader_bound ||
-        !delivery->item_count) {
-        return 0;
-    }
-    if (!delivery->io_count) {
-        delivery->completed = TRUE;
-        solver_codekd_delivery_unbind(delivery);
-        return 1;
-    }
-    status = fitsbin_pread_mapped_ranges_submit(
-        delivery->fitsbin,
-        delivery->io_ranges,
-        delivery->io_count,
-        delivery->io_bytes,
-        FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
-        &delivery->ticket);
-    solver_codekd_delivery_unbind(delivery);
-    if (status < 0) {
-        return -1;
-    }
-    if (status > 0 && !delivery->ticket) {
-        delivery->reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return -1;
-    }
-    return status > 0 ? 1 : 0;
-}
-
-static int solver_codekd_delivery_wait(
-    solver_codekd_delivery_t* delivery) {
-    size_t i;
-    int status;
-
-    if (!delivery || delivery->completed) {
-        return delivery ? 1 : 0;
-    }
-    if (!delivery->ticket) {
-        return 0;
-    }
-    status = fitsbin_payload_io_ticket_wait(
-        delivery->fitsbin, delivery->ticket);
-    fitsbin_payload_io_ticket_destroy(delivery->ticket);
-    delivery->ticket = NULL;
-    if (status <= 0) {
-        return 0;
-    }
-    if (!delivery->segment || !delivery->segment->page_size) {
-        errno = EPROTO;
-        return -1;
-    }
-    for (i = 0U; i < delivery->item_count; i++) {
-        solver_codekd_delivery_item_t* item =
-            &delivery->items[i];
-
-        if (item->owns_loading &&
-            (!item->entry ||
-             item->entry->state != SOLVER_CODEKD_CACHE_LOADING ||
-             !item->entry->plan_hold_count)) {
-            errno = EPROTO;
-            return -1;
-        }
-    }
-    for (i = 0U; i < delivery->item_count; i++) {
-        solver_codekd_delivery_item_t* item =
-            &delivery->items[i];
-
-        if (!item->owns_loading) {
-            continue;
-        }
-        solver_codekd_cache_publish(
-            delivery->reader,
-            item->entry,
-            delivery->segment,
-            item->data_file_offset,
-            item->data_size,
-            item->perm_file_offset,
-            item->perm_size);
-        if (delivery->reader->helper_hard_failure) {
-            errno = EPROTO;
-            return -1;
-        }
-    }
-    delivery->completed = TRUE;
-    return 1;
-}
-
-static int solver_codekd_delivery_release(
-    solver_codekd_delivery_t* delivery) {
-    size_t i;
-    int failed;
-
-    if (!delivery) {
-        return 0;
-    }
-    if (!delivery->completed) {
-        return solver_codekd_delivery_discard(delivery);
-    }
-    for (i = delivery->item_count; i > 0U; i--) {
-        solver_codekd_release_entry_hold(
-            delivery->reader,
-            delivery->items[i - 1U].entry);
-    }
-    failed = delivery->reader &&
-        delivery->reader->helper_hard_failure;
-    free(delivery);
-    return failed ? -1 : 0;
-}
-
-static void solver_codekd_release_assigned_ranges(
-    solver_codekd_reader_t* reader,
-    kdtree_direct_range_t* ranges,
-    size_t nrequests) {
-    size_t request_index;
-
-    if (!reader || !ranges) {
-        return;
-    }
-    for (request_index = 0U;
-         request_index < nrequests;
-         request_index++) {
-        if (ranges[request_index].lease) {
-            solver_codekd_release_range(
-                reader, ranges[request_index].lease);
-        }
-        memset(&ranges[request_index],
-               0,
-               sizeof(ranges[request_index]));
-    }
-}
-
-static int solver_codekd_assign_cached_ranges(
-    solver_codekd_reader_t* reader,
-    const kdtree_direct_range_request_t* requests,
-    size_t nrequests,
-    kdtree_direct_range_t* ranges) {
-    size_t request_index;
-
-    if (!reader || !requests || !ranges || !nrequests ||
-        nrequests > SOLVER_CODEKD_READ_BATCH_MAX) {
-        if (reader) {
-            reader->helper_hard_failure = TRUE;
-        }
-        errno = EPROTO;
-        return -1;
-    }
-    memset(ranges, 0, nrequests * sizeof(*ranges));
-    for (request_index = 0U;
-         request_index < nrequests;
-         request_index++) {
-        solver_codekd_range_plan_t plan;
-        solver_codekd_cache_entry_t* entry;
-
-        if (solver_codekd_prepare_range_plan(
-                reader, &requests[request_index], &plan)) {
-            goto hard_failure;
-        }
-        entry = solver_codekd_cache_find(
-            reader,
-            reader->active_segment,
-            plan.data_cover_file_offset,
-            plan.data_cover_size,
-            plan.perm_cover_file_offset,
-            plan.perm_cover_size);
-        if (!entry || reader->helper_hard_failure) {
-            goto hard_failure;
-        }
-        plan.entry = entry;
-        solver_codekd_cache_promote(reader, entry);
-        if (reader->helper_hard_failure ||
-            solver_codekd_assign_range(
-                reader, &plan, &ranges[request_index])) {
-            goto hard_failure;
-        }
-        __atomic_add_fetch(
-            &reader->fitsbin->payload_cache_hits,
-            1ULL,
-            __ATOMIC_RELAXED);
-    }
-    return 0;
-
-hard_failure:
-    reader->helper_hard_failure = TRUE;
-    solver_codekd_release_assigned_ranges(
-        reader, ranges, nrequests);
-    errno = EPROTO;
-    return -1;
-}
-
-static int solver_codekd_lookahead_submit(
-    void* opaque,
-    const kdtree_direct_range_request_t* requests,
-    size_t nrequests,
-    void** handle) {
-    solver_codekd_reader_t* reader = opaque;
-    solver_codekd_delivery_t* delivery;
-    int saved_errno = errno;
-    int status;
-    int discard_status;
-    anbool hard_failure;
-
-    if (!handle) {
-        errno = EPROTO;
-        return -1;
-    }
-    *handle = NULL;
-    if (!reader || !requests || !nrequests ||
-        nrequests > SOLVER_CODEKD_READ_BATCH_MAX) {
-        if (reader) {
-            reader->helper_hard_failure = TRUE;
-        }
-        errno = EPROTO;
-        return -1;
-    }
-    delivery = solver_codekd_delivery_begin_bound(reader);
-    if (!delivery) {
-        if (reader->helper_hard_failure || errno == EPROTO) {
-            errno = EPROTO;
-            return -1;
-        }
-        errno = saved_errno;
-        return 0;
-    }
-    status = solver_codekd_delivery_plan_ranges(
-        delivery, requests, nrequests);
-    if (status || !delivery->item_count || !delivery->io_count) {
-        int operation_errno = errno;
-
-        hard_failure = reader->helper_hard_failure ||
-            operation_errno == EPROTO;
-        discard_status = solver_codekd_delivery_discard(delivery);
-        if (hard_failure || discard_status) {
-            reader->helper_hard_failure = TRUE;
-            errno = EPROTO;
-            return -1;
-        }
-        errno = saved_errno;
-        return 0;
-    }
-    status = solver_codekd_delivery_submit(delivery);
-    if (status > 0 && delivery->ticket && !delivery->completed) {
-        *handle = delivery;
-        return 1;
-    }
-    hard_failure = reader->helper_hard_failure || errno == EPROTO;
-    discard_status = solver_codekd_delivery_discard(delivery);
-    if (hard_failure || discard_status) {
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return -1;
-    }
-    errno = saved_errno;
-    return 0;
-}
-
-static int solver_codekd_lookahead_finish(
-    void* opaque,
-    void* handle,
-    const kdtree_direct_range_request_t* requests,
-    size_t nrequests,
-    kdtree_direct_range_t* ranges) {
-    solver_codekd_reader_t* reader = opaque;
-    solver_codekd_delivery_t* delivery = handle;
-    int saved_errno = errno;
-    int status;
-    int cleanup_status;
-    anbool hard_failure;
-
-    if (!reader || !delivery || delivery->reader != reader ||
-        !requests || !ranges || !nrequests ||
-        nrequests > SOLVER_CODEKD_READ_BATCH_MAX) {
-        if (reader) {
-            reader->helper_hard_failure = TRUE;
-        }
-        if (delivery) {
-            (void)solver_codekd_delivery_discard(delivery);
-        }
-        errno = EPROTO;
-        return -1;
-    }
-    memset(ranges, 0, nrequests * sizeof(*ranges));
-    status = solver_codekd_delivery_wait(delivery);
-    if (status <= 0) {
-        int operation_errno = errno;
-        anbool cancelled = operation_errno == ECANCELED;
-
-        hard_failure = reader->helper_hard_failure ||
-            operation_errno == EPROTO;
-        cleanup_status = solver_codekd_delivery_discard(delivery);
-        if (hard_failure || cleanup_status) {
-            reader->helper_hard_failure = TRUE;
-            errno = EPROTO;
-            return -1;
-        }
-        if (cancelled) {
-            errno = ECANCELED;
-            return -1;
-        }
-        errno = saved_errno;
-        return 0;
-    }
-    if (solver_codekd_assign_cached_ranges(
-            reader, requests, nrequests, ranges)) {
-        (void)solver_codekd_delivery_release(delivery);
-        errno = EPROTO;
-        return -1;
-    }
-    if (solver_codekd_delivery_release(delivery)) {
-        solver_codekd_release_assigned_ranges(
-            reader, ranges, nrequests);
-        reader->helper_hard_failure = TRUE;
-        errno = EPROTO;
-        return -1;
-    }
-    return 1;
-}
-
-static void solver_codekd_lookahead_cancel(
-    void* opaque,
-    void* handle) {
-    solver_codekd_reader_t* reader = opaque;
-    solver_codekd_delivery_t* delivery = handle;
-    int saved_errno = errno;
-
-    if (!delivery) {
-        return;
-    }
-    if (!reader || delivery->reader != reader ||
-        solver_codekd_delivery_discard(delivery)) {
-        if (reader) {
-            reader->helper_hard_failure = TRUE;
-        }
-        errno = EPROTO;
-        return;
-    }
-    errno = saved_errno;
-}
-
 static kdtree_qres_t* solver_codekd_rangesearch(
     const kdtree_t* tree,
     kdtree_qres_t* result,
     const double* query,
     double maxd2,
     int options) {
-    solver_codekd_reader_t* reader;
-    kdtree_qres_t* direct;
-    kdtree_direct_dss_executor_t executor;
-    kdtree_direct_dss_lookahead_t lookahead;
-    const kdtree_direct_dss_lookahead_t* active_lookahead = NULL;
-    anbool direct_owned = result == NULL;
-    int direct_errno;
-
-    if (!index_shard_worker_context_active()) {
-        /*
-         * Serial and W1 solving retain the original mapped traversal.
-         * Parallel shard workers use bounded delivery below when supported.
-         */
-        return kdtree_rangesearch_options_reuse(
-            tree,
-            result,
-            query,
-            maxd2,
-            options);
-    }
-    if (tree->io && tree->io_is_fitsbin &&
-        fitsbin_payload_is_fully_resident(
-            (const fitsbin_t*)tree->io)) {
-        return kdtree_rangesearch_options_reuse(
-            tree,
-            result,
-            query,
-            maxd2,
-            options);
-    }
-    if (!solver_codekd_direct_capable(tree)) {
-        return kdtree_rangesearch_options_reuse(
-            tree,
-            result,
-            query,
-            maxd2,
-            options);
-    }
-    reader = solver_codekd_reader_get();
-    if (!reader) {
-        return kdtree_rangesearch_options_reuse(
-            tree,
-            result,
-            query,
-            maxd2,
-            options);
-    }
-    if (reader->helper_hard_failure) {
-        logerr("[solver-codekd-io] persistent cache failure\n");
-        errno = EPROTO;
-        return NULL;
-    }
-    if (solver_codekd_reader_bind(
-            reader,
-            tree,
-            (fitsbin_t*)tree->io)) {
-        return kdtree_rangesearch_options_reuse(
-            tree,
-            result,
-            query,
-            maxd2,
-            options);
-    }
-    executor.opaque = reader;
-    executor.available = solver_codekd_helper_available;
-    executor.run = solver_codekd_helper_run;
-    if (!reader->total_plan_holds) {
-        lookahead.opaque = reader;
-        lookahead.submit = solver_codekd_lookahead_submit;
-        lookahead.finish = solver_codekd_lookahead_finish;
-        lookahead.cancel = solver_codekd_lookahead_cancel;
-        active_lookahead = &lookahead;
-    }
-    errno = 0;
-    direct = kdtree_rangesearch_direct_dss_leased(
-        tree,
-        result,
-        query,
-        maxd2,
-        options,
-        SOLVER_CODEKD_DIRECT_MAX_POINTS,
-        0U,
-        solver_codekd_read_leased_ranges,
-        solver_codekd_release_range,
-        reader,
-        &executor,
-        active_lookahead);
-    direct_errno = errno;
-    solver_codekd_reader_unbind(reader);
-    if (!direct && direct_errno == ECANCELED) {
-        if (!direct_owned) {
-            kdtree_free_query(result);
-        }
-        errno = ECANCELED;
-        return NULL;
-    }
-    if (reader->helper_hard_failure ||
-        (!direct && direct_errno == EPROTO)) {
-        if (direct_owned) {
-            if (direct) {
-                kdtree_free_query(direct);
-            }
-        } else {
-            kdtree_free_query(result);
-        }
-        logerr("[solver-codekd-io] hard direct-range failure "
-               "index=%s\n",
-               tree->name ? tree->name : "(unnamed)");
-        errno = EPROTO;
-        return NULL;
-    }
-    if (direct) {
-        return direct;
-    }
-    errno = direct_errno;
-    if (!reader->active_segment->fallback_reported) {
-        logverb(
-            "[solver-codekd-io] mode=mmap-fallback "
-            "index=%s errno=%i reason=%s\n",
-            tree->name ? tree->name : "(unnamed)",
-            errno,
-            strerror(errno));
-        reader->active_segment->fallback_reported = TRUE;
-    }
     return kdtree_rangesearch_options_reuse(
         tree,
         result,
@@ -7444,13 +4915,114 @@ static int solver_payload_page_plan_deliver_chunk(
                 return 0;
             }
         }
+        return status;
     }
-    status = fitsbin_prefetch_ranges(
+    status = fitsbin_advise_mapped_ranges(
         plan->fitsbin,
         ranges,
         range_count,
         byte_budget);
     return status > 0 ? 1 : status;
+}
+
+typedef struct solver_payload_page_delivery {
+    fitsbin_t* fitsbin;
+    fitsbin_payload_io_ticket_t* ticket;
+    anbool ready;
+} solver_payload_page_delivery_t;
+
+static int solver_payload_page_plan_coalesce(
+    solver_payload_page_plan_t* plan);
+
+static int solver_payload_page_plan_submit(
+    solver_payload_page_plan_t* plan,
+    solver_payload_page_delivery_t* delivery) {
+    fitsbin_prefetch_range_t
+        ranges[FITSBIN_PREAD_ASYNC_RANGE_LIMIT];
+    size_t byte_budget = 0U;
+    size_t range_count;
+    int status;
+
+    if (!plan || !delivery || plan->failed) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(delivery, 0, sizeof(*delivery));
+    if (!plan->range_count) {
+        delivery->ready = TRUE;
+        return 1;
+    }
+    if (!plan->fitsbin ||
+        solver_payload_page_plan_coalesce(plan)) {
+        return -1;
+    }
+    delivery->fitsbin = plan->fitsbin;
+    if (fitsbin_payload_is_fully_resident(plan->fitsbin)) {
+        delivery->ready = TRUE;
+        return 1;
+    }
+    range_count = solver_payload_page_plan_chunk(
+        plan, 0U, ranges, &byte_budget);
+    if (!range_count || range_count != plan->range_count) {
+        return 0;
+    }
+    status = fitsbin_prefetch_ranges_submit(
+        plan->fitsbin,
+        ranges,
+        range_count,
+        byte_budget,
+        &delivery->ticket);
+    if (status <= 0 || !delivery->ticket) {
+        delivery->ticket = NULL;
+        return status < 0 ? -1 : 0;
+    }
+    return 1;
+}
+
+static int solver_payload_page_delivery_wait(
+    solver_payload_page_delivery_t* delivery) {
+    fitsbin_payload_io_ticket_t* ticket;
+    int status;
+
+    if (!delivery) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (delivery->ready) {
+        return 1;
+    }
+    if (!delivery->fitsbin || !delivery->ticket) {
+        return 0;
+    }
+    ticket = delivery->ticket;
+    delivery->ticket = NULL;
+    status = fitsbin_payload_io_ticket_wait(
+        delivery->fitsbin, ticket);
+    {
+        int saved_errno = errno;
+
+        fitsbin_payload_io_ticket_destroy(ticket);
+        errno = saved_errno;
+    }
+    if (status > 0) {
+        delivery->ready = TRUE;
+        return 1;
+    }
+    return status;
+}
+
+static void solver_payload_page_delivery_cancel(
+    solver_payload_page_delivery_t* delivery) {
+    fitsbin_payload_io_ticket_t* ticket;
+
+    if (!delivery || !delivery->ticket || !delivery->fitsbin) {
+        return;
+    }
+    ticket = delivery->ticket;
+    delivery->ticket = NULL;
+    (void)fitsbin_payload_io_ticket_cancel_and_wait(
+        delivery->fitsbin, ticket);
+    fitsbin_payload_io_ticket_destroy(ticket);
 }
 
 static int solver_payload_page_plan_deliver(
@@ -7779,14 +5351,6 @@ static size_t solver_payload_prepare_candidate_rows(
         if (solver_poll_worker_stop(solver)) {
             return 0U;
         }
-        if (!quad_ready) {
-            status = quadfile_prepare_stars(
-                quads, quadids, (int)count);
-            quad_ready = status > 0;
-            if (solver_poll_worker_stop(solver)) {
-                return 0U;
-            }
-        }
     }
     if (!quad_ready) {
         return 0U;
@@ -7818,16 +5382,198 @@ static size_t solver_payload_prepare_candidate_rows(
         if (solver_poll_worker_stop(solver)) {
             return 0U;
         }
-        if (!star_ready) {
-            status = startree_prepare_stars(
-                starkd, starids, (int)star_count);
-            star_ready = status > 0;
-            if (solver_poll_worker_stop(solver)) {
-                return 0U;
-            }
-        }
     }
     return quad_ready && star_ready ? count : 0U;
+}
+
+typedef enum solver_payload_candidate_window_state {
+    SOLVER_PAYLOAD_CANDIDATE_EMPTY = 0,
+    SOLVER_PAYLOAD_CANDIDATE_QUAD_PENDING,
+    SOLVER_PAYLOAD_CANDIDATE_QUAD_READY,
+    SOLVER_PAYLOAD_CANDIDATE_STAR_PENDING,
+    SOLVER_PAYLOAD_CANDIDATE_READY,
+    SOLVER_PAYLOAD_CANDIDATE_FAILED
+} solver_payload_candidate_window_state_t;
+
+typedef struct solver_payload_candidate_window {
+    fitsbin_payload_io_ticket_t* quad_ticket;
+    fitsbin_payload_io_ticket_t* star_ticket;
+    quadfile_t* quads;
+    startree_t* starkd;
+    unsigned int quadids[SOLVER_PAYLOAD_CANDIDATE_BATCH];
+    unsigned int starids[
+        SOLVER_PAYLOAD_CANDIDATE_BATCH * DQMAX];
+    size_t first;
+    size_t end;
+    size_t count;
+    size_t star_count;
+    int dimquads;
+    solver_payload_candidate_window_state_t state;
+} solver_payload_candidate_window_t;
+
+static void solver_payload_candidate_window_cancel(
+    solver_payload_candidate_window_t* window) {
+    if (!window) {
+        return;
+    }
+    if (window->quad_ticket && window->quads) {
+        (void)fitsbin_payload_io_ticket_cancel_and_wait(
+            window->quads->fb, window->quad_ticket);
+        fitsbin_payload_io_ticket_destroy(window->quad_ticket);
+        window->quad_ticket = NULL;
+    }
+    if (window->star_ticket && window->starkd &&
+        window->starkd->tree && window->starkd->tree->io) {
+        (void)fitsbin_payload_io_ticket_cancel_and_wait(
+            window->starkd->tree->io, window->star_ticket);
+        fitsbin_payload_io_ticket_destroy(window->star_ticket);
+        window->star_ticket = NULL;
+    }
+    memset(window, 0, sizeof(*window));
+}
+
+static int solver_payload_candidate_window_begin(
+    solver_payload_candidate_window_t* window,
+    const kdtree_qres_t* result,
+    size_t first,
+    size_t end,
+    int dimquads,
+    solver_t* solver) {
+    size_t i;
+    int status;
+
+    if (!window || !result || !solver || !solver->index ||
+        !solver->index->quads || !solver->index->starkd ||
+        !solver->index->quads->fb ||
+        !solver->index->starkd->tree ||
+        !solver->index->starkd->tree->io ||
+        !solver->index->starkd->tree->io_is_fitsbin ||
+        first >= end || end > (size_t)result->nres ||
+        end - first > SOLVER_PAYLOAD_CANDIDATE_BATCH ||
+        dimquads <= 0 || dimquads > DQMAX) {
+        return 0;
+    }
+    memset(window, 0, sizeof(*window));
+    window->quads = solver->index->quads;
+    window->starkd = solver->index->starkd;
+    window->first = first;
+    window->end = end;
+    window->count = end - first;
+    window->dimquads = dimquads;
+    for (i = 0U; i < window->count; i++) {
+        int quadid = result->inds[first + i];
+
+        if (quadid < 0 ||
+            (unsigned int)quadid >= window->quads->numquads) {
+            window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
+            return 0;
+        }
+        window->quadids[i] = (unsigned int)quadid;
+    }
+    if (fitsbin_payload_is_fully_resident(window->quads->fb)) {
+        window->state = SOLVER_PAYLOAD_CANDIDATE_QUAD_READY;
+        return 1;
+    }
+    status = quadfile_prefetch_stars_submit(
+        window->quads,
+        window->quadids,
+        (int)window->count,
+        &window->quad_ticket);
+    if (status <= 0 || !window->quad_ticket) {
+        window->quad_ticket = NULL;
+        window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
+        return 0;
+    }
+    window->state = SOLVER_PAYLOAD_CANDIDATE_QUAD_PENDING;
+    return 1;
+}
+
+static int solver_payload_candidate_window_submit_stars(
+    solver_payload_candidate_window_t* window,
+    solver_t* solver) {
+    unsigned int stars[DQMAX];
+    size_t i;
+    int status;
+
+    if (!window || !solver ||
+        (window->state != SOLVER_PAYLOAD_CANDIDATE_QUAD_PENDING &&
+         window->state != SOLVER_PAYLOAD_CANDIDATE_QUAD_READY)) {
+        return 0;
+    }
+    if (window->state == SOLVER_PAYLOAD_CANDIDATE_QUAD_PENDING) {
+        status = solver_payload_wait_advisory_ticket(
+            window->quads->fb, &window->quad_ticket);
+        if (status <= 0 || solver_poll_worker_stop(solver)) {
+            window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
+            return 0;
+        }
+        window->state = SOLVER_PAYLOAD_CANDIDATE_QUAD_READY;
+    }
+    for (i = 0U; i < window->count; i++) {
+        int star_index;
+
+        if (quadfile_get_stars(
+                window->quads, window->quadids[i], stars)) {
+            window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
+            return 0;
+        }
+        for (star_index = 0;
+             star_index < window->dimquads;
+             star_index++) {
+            if (window->star_count >=
+                sizeof(window->starids) /
+                    sizeof(window->starids[0])) {
+                window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
+                return 0;
+            }
+            window->starids[window->star_count++] =
+                stars[star_index];
+        }
+    }
+    if (fitsbin_payload_is_fully_resident(
+            (fitsbin_t*)window->starkd->tree->io)) {
+        window->state = SOLVER_PAYLOAD_CANDIDATE_READY;
+        return 1;
+    }
+    status = startree_prefetch_stars_submit(
+        window->starkd,
+        window->starids,
+        (int)window->star_count,
+        &window->star_ticket);
+    if (status <= 0 || !window->star_ticket) {
+        window->star_ticket = NULL;
+        window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
+        return 0;
+    }
+    window->state = SOLVER_PAYLOAD_CANDIDATE_STAR_PENDING;
+    return 1;
+}
+
+static int solver_payload_candidate_window_wait(
+    solver_payload_candidate_window_t* window,
+    solver_t* solver) {
+    int status;
+
+    if (!window || !solver) {
+        return 0;
+    }
+    if ((window->state == SOLVER_PAYLOAD_CANDIDATE_QUAD_PENDING ||
+         window->state == SOLVER_PAYLOAD_CANDIDATE_QUAD_READY) &&
+        !solver_payload_candidate_window_submit_stars(
+            window, solver)) {
+        return 0;
+    }
+    if (window->state == SOLVER_PAYLOAD_CANDIDATE_STAR_PENDING) {
+        status = solver_payload_wait_advisory_ticket(
+            window->starkd->tree->io,
+            &window->star_ticket);
+        if (status <= 0 || solver_poll_worker_stop(solver)) {
+            window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
+            return 0;
+        }
+        window->state = SOLVER_PAYLOAD_CANDIDATE_READY;
+    }
+    return window->state == SOLVER_PAYLOAD_CANDIDATE_READY;
 }
 
 typedef struct solver_verification_score_slot {
@@ -7988,7 +5734,9 @@ static int solver_ab_try_verification_wave(
         return 0;
     }
     candidate_count = (size_t)(candidate_end - candidate_first);
-    if (payload_prepared) {
+    if (payload_prepared &&
+        (*payload_prepared < (size_t)candidate_first ||
+         *payload_prepared > (size_t)candidate_end)) {
         *payload_prepared = (size_t)candidate_first;
     }
 
@@ -8041,7 +5789,9 @@ static int solver_ab_try_verification_wave(
             &packet.candidates[packet_index];
 
         if (!((candidate_index - candidate_first) %
-              (int)SOLVER_PAYLOAD_CANDIDATE_BATCH)) {
+              (int)SOLVER_PAYLOAD_CANDIDATE_BATCH) &&
+            (!payload_prepared ||
+             *payload_prepared <= (size_t)candidate_index)) {
             size_t expected = MIN(
                 (size_t)candidate_end -
                     (size_t)candidate_index,
@@ -8721,7 +6471,7 @@ typedef enum solver_ab_io_batch_state {
 } solver_ab_io_batch_state_t;
 
 typedef struct solver_ab_io_batch {
-    solver_codekd_delivery_t* delivery;
+    solver_payload_page_delivery_t delivery;
     size_t first;
     size_t count;
     size_t io_count;
@@ -8732,10 +6482,6 @@ typedef struct solver_ab_io_batch {
     anbool io_ready;
     solver_ab_io_batch_state_t state;
 } solver_ab_io_batch_t;
-
-static anbool solver_ab_io_submit_invariant(int error) {
-    return error == EPROTO;
-}
 
 static void solver_ab_io_batch_prepare_ready(
     const solver_ab_descriptor_output_t* output,
@@ -8762,15 +6508,15 @@ static int solver_ab_io_batch_prepare(
     solver_ab_io_batch_t* batch) {
     const kdtree_t* tree;
     size_t target_count;
-    size_t planned_count = 0U;
     size_t end;
     size_t descriptor_index;
+    solver_payload_page_plan_t plan;
     int options =
         KD_OPTIONS_SMALL_RADIUS |
         KD_OPTIONS_COMPUTE_DISTS |
         KD_OPTIONS_NO_RESIZE_RESULTS |
         KD_OPTIONS_USE_SPLIT;
-    int submitted;
+    int submitted = 0;
 
     memset(batch, 0, sizeof(*batch));
     batch->state = SOLVER_AB_IO_BATCH_PLANNED;
@@ -8791,13 +6537,7 @@ static int solver_ab_io_batch_prepare(
         return 0;
     }
     tree = solver->index->codekd->tree;
-    errno = 0;
-    batch->delivery = solver_codekd_delivery_begin(tree);
-    if (!batch->delivery) {
-        batch->plan_probed = TRUE;
-        batch->state = SOLVER_AB_IO_BATCH_READY;
-        return errno == EPROTO ? -1 : 0;
-    }
+    solver_payload_page_plan_init_async(&plan, solver);
     end = first + target_count;
 
     for (descriptor_index = first;
@@ -8806,73 +6546,34 @@ static int solver_ab_io_batch_prepare(
         const solver_ab_descriptor_t* descriptor =
             &output->descriptors[descriptor_index];
 
-        if (solver_codekd_delivery_add_query(
-                batch->delivery,
+        if (solver_payload_page_plan_add_query(
+                &plan,
+                tree,
                 descriptor->code,
                 descriptor->tol2,
                 options)) {
-            if (batch->delivery->reader->helper_hard_failure) {
-                (void)solver_codekd_delivery_discard(
-                    batch->delivery);
-                batch->delivery = NULL;
-                return -1;
-            }
-            break;
-        }
-        planned_count++;
-        if (batch->delivery->io_bytes >=
-            SOLVER_CODEKD_RANGE_CACHE_BYTES / 2U) {
             break;
         }
     }
     batch->plan_probed = TRUE;
-    if (!planned_count) {
-        int discard_status =
-            solver_codekd_delivery_discard(batch->delivery);
-
-        batch->delivery = NULL;
-        batch->count = 1U;
-        batch->state = SOLVER_AB_IO_BATCH_READY;
-        return discard_status ? -1 : 0;
+    if (!plan.failed) {
+        submitted = solver_payload_page_plan_submit(
+            &plan, &batch->delivery);
     }
-    batch->count = planned_count;
+    batch->io_count = plan.range_count;
+    solver_payload_page_plan_destroy(&plan);
+    if (submitted <= 0) {
+        solver_payload_page_delivery_cancel(&batch->delivery);
+        memset(&batch->delivery, 0, sizeof(batch->delivery));
+        batch->state = SOLVER_AB_IO_BATCH_READY;
+        return 0;
+    }
     batch->plan_usable = TRUE;
-    batch->io_count = batch->delivery->io_count;
-    submitted =
-        solver_codekd_delivery_submit(batch->delivery);
-    if (submitted < 0) {
-        int saved_errno = errno;
-        anbool invariant =
-            solver_ab_io_submit_invariant(saved_errno);
-        int discard_status;
-
-        if (invariant) {
-            batch->delivery->reader->helper_hard_failure = TRUE;
-        }
-        discard_status =
-            solver_codekd_delivery_discard(batch->delivery);
-        batch->delivery = NULL;
-        batch->plan_usable = FALSE;
-        batch->state = SOLVER_AB_IO_BATCH_READY;
-        errno = saved_errno;
-        return invariant || discard_status ? -1 : 0;
-    }
-    if (submitted > 0 && !batch->delivery->completed) {
-        batch->io_submitted = TRUE;
-        batch->state = SOLVER_AB_IO_BATCH_SUBMITTED;
-    } else if (submitted > 0) {
-        batch->state = SOLVER_AB_IO_BATCH_READY;
-    } else {
-        int discard_status =
-            solver_codekd_delivery_discard(batch->delivery);
-
-        batch->delivery = NULL;
-        batch->plan_usable = FALSE;
-        batch->state = SOLVER_AB_IO_BATCH_READY;
-        if (discard_status) {
-            return -1;
-        }
-    }
+    batch->io_submitted = batch->delivery.ticket != NULL;
+    batch->io_ready = batch->delivery.ready;
+    batch->state = batch->delivery.ready
+        ? SOLVER_AB_IO_BATCH_READY
+        : SOLVER_AB_IO_BATCH_SUBMITTED;
     return 0;
 }
 
@@ -8881,18 +6582,17 @@ static int solver_ab_io_batch_wait(
     int wait_status;
 
     if (!batch ||
-        batch->state != SOLVER_AB_IO_BATCH_SUBMITTED ||
-        !batch->delivery) {
+        batch->state != SOLVER_AB_IO_BATCH_SUBMITTED) {
         return 0;
     }
-    wait_status = solver_codekd_delivery_wait(batch->delivery);
+    wait_status = solver_payload_page_delivery_wait(
+        &batch->delivery);
     if (wait_status <= 0) {
-        int release_status =
-            solver_codekd_delivery_release(batch->delivery);
-
-        batch->delivery = NULL;
+        solver_payload_page_delivery_cancel(&batch->delivery);
+        memset(&batch->delivery, 0, sizeof(batch->delivery));
+        batch->plan_usable = FALSE;
         batch->state = SOLVER_AB_IO_BATCH_READY;
-        return wait_status < 0 || release_status ? -1 : 0;
+        return 0;
     }
     batch->io_ready = TRUE;
     batch->state = SOLVER_AB_IO_BATCH_READY;
@@ -8901,28 +6601,24 @@ static int solver_ab_io_batch_wait(
 
 static int solver_ab_io_batch_retire(
     solver_ab_io_batch_t* batch) {
-    int status;
-
     if (!batch) {
         return 0;
     }
-    status = solver_codekd_delivery_release(batch->delivery);
-    batch->delivery = NULL;
+    solver_payload_page_delivery_cancel(&batch->delivery);
+    memset(&batch->delivery, 0, sizeof(batch->delivery));
     batch->state = SOLVER_AB_IO_BATCH_RETIRED;
-    return status;
+    return 0;
 }
 
 static int solver_ab_io_batch_cancel(
     solver_ab_io_batch_t* batch) {
-    int status;
-
     if (!batch) {
         return 0;
     }
-    status = solver_codekd_delivery_release(batch->delivery);
-    batch->delivery = NULL;
+    solver_payload_page_delivery_cancel(&batch->delivery);
+    memset(&batch->delivery, 0, sizeof(batch->delivery));
     batch->state = SOLVER_AB_IO_BATCH_CANCELLED;
-    return status;
+    return 0;
 }
 
 static int solver_ab_descriptor_reduce_range(
@@ -8987,10 +6683,12 @@ static int solver_ab_descriptor_reduce_output(
     solver_ab_io_batch_t batches[SOLVER_AB_IO_BATCH_SLOTS];
     size_t next = 0U;
     size_t current = 0U;
+    size_t retired = 0U;
     size_t planning_limit =
         SOLVER_AB_IO_PROBE_DESCRIPTORS;
     size_t slot;
     unsigned long long sequence = 0ULL;
+    unsigned long long expected_sequence = 0ULL;
     anbool planning_enabled = TRUE;
     int status = 0;
 
@@ -9014,6 +6712,11 @@ static int solver_ab_descriptor_reduce_output(
         size_t next_slot =
             (current + 1U) % SOLVER_AB_IO_BATCH_SLOTS;
 
+        if (!batch->count || batch->first != retired ||
+            batch->sequence != expected_sequence) {
+            status = -1;
+            break;
+        }
         status = solver_ab_io_batch_wait(batch);
         if (batch->state != SOLVER_AB_IO_BATCH_READY) {
             status = -1;
@@ -9075,6 +6778,8 @@ static int solver_ab_descriptor_reduce_output(
         if (status) {
             break;
         }
+        retired += batch->count;
+        expected_sequence++;
         current = next_slot;
     }
 
@@ -12751,7 +10456,9 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
                             solver_t* solver, anbool current_parity) {
     // "field_xy" contains the xy pixel coordinates of stars A,B,C,D forming the quad
     //    [x_A,y_A, x_B,y_B, x_C,y_C, ...]
-    int window_first;
+    solver_payload_candidate_window_t windows[2];
+    size_t window_first;
+    size_t current_slot = 0U;
 
     assert(krez);
     assert(dimquads > 0);
@@ -12776,15 +10483,54 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
         }
     }
 
-    window_first = 0;
-    while (window_first < krez->nres) {
-        int window_end = MIN(
-            krez->nres,
+    memset(windows, 0, sizeof(windows));
+    window_first = 0U;
+    while (window_first < (size_t)krez->nres) {
+        solver_payload_candidate_window_t* current =
+            &windows[current_slot];
+        size_t next_slot = (current_slot + 1U) % 2U;
+        solver_payload_candidate_window_t* next =
+            &windows[next_slot];
+        size_t window_end = MIN(
+            (size_t)krez->nres,
             window_first +
-                (int)SOLVER_VERIFICATION_WINDOW_CANDIDATES);
-        size_t payload_prepared = (size_t)window_first;
+                (size_t)SOLVER_PAYLOAD_CANDIDATE_BATCH);
+        size_t next_end = MIN(
+            (size_t)krez->nres,
+            window_end +
+                (size_t)SOLVER_PAYLOAD_CANDIDATE_BATCH);
+        size_t payload_prepared = window_end;
+        anbool payload_ready = FALSE;
+        int handled = 0;
 
-        if (solver_ab_try_verification_wave(
+        if (current->state == SOLVER_PAYLOAD_CANDIDATE_EMPTY) {
+            (void)solver_payload_candidate_window_begin(
+                current,
+                krez,
+                window_first,
+                window_end,
+                dimquads,
+                solver);
+        }
+        if (current->state != SOLVER_PAYLOAD_CANDIDATE_FAILED &&
+            solver_payload_candidate_window_submit_stars(
+                current, solver)) {
+            if (window_end < (size_t)krez->nres &&
+                next->state == SOLVER_PAYLOAD_CANDIDATE_EMPTY) {
+                (void)solver_payload_candidate_window_begin(
+                    next,
+                    krez,
+                    window_end,
+                    next_end,
+                    dimquads,
+                    solver);
+            }
+            payload_ready =
+                solver_payload_candidate_window_wait(
+                    current, solver);
+        }
+        if (payload_ready) {
+            handled = solver_ab_try_verification_wave(
                 krez,
                 field_xy,
                 fieldstars,
@@ -12792,32 +10538,39 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
                 quads_tried,
                 solver,
                 current_parity,
-                window_first,
-                window_end,
-                &payload_prepared)) {
+                (int)window_first,
+                (int)window_end,
+                &payload_prepared);
+        }
+        if (handled) {
             if (solver->quit_now ||
                 solver_poll_worker_stop(solver)) {
-                return;
+                goto cleanup;
             }
-            window_first = window_end;
-            continue;
+        } else {
+            resolve_matches_native_range(
+                krez,
+                field_xy,
+                fieldstars,
+                dimquads,
+                quads_tried,
+                solver,
+                current_parity,
+                (int)window_first,
+                (int)window_end,
+                window_end);
         }
-        resolve_matches_native_range(
-            krez,
-            field_xy,
-            fieldstars,
-            dimquads,
-            quads_tried,
-            solver,
-            current_parity,
-            window_first,
-            window_end,
-            payload_prepared);
+        solver_payload_candidate_window_cancel(current);
         if (solver->quit_now || solver_poll_worker_stop(solver)) {
-            return;
+            goto cleanup;
         }
         window_first = window_end;
+        current_slot = next_slot;
     }
+
+cleanup:
+    solver_payload_candidate_window_cancel(&windows[0]);
+    solver_payload_candidate_window_cancel(&windows[1]);
 }
 
 void solver_inject_match(solver_t* solver, MatchObj* mo, sip_t* sip) {
