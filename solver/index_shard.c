@@ -4,7 +4,7 @@
  * pthread index-sharding for onefield_run()
  *
  * This module executes one candidate index as one outer shard task.  An outer
- * owner may also publish bounded, index-free helper tasks.  It does not split
+ * owner may also publish bounded immutable helper tasks.  It does not split
  * the image, xylist, field stars, quads, or verification math.
  *
  * Ownership model:
@@ -65,22 +65,39 @@ typedef enum index_shard_failure_class {
   INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY
 } index_shard_failure_class_t;
 
+/*
+ * The first non-fatal terminal event is the pass linearization point.
+ * A later global-integrity failure remains terminal and invalidates an
+ * elected-but-uncommitted winner.
+ */
+typedef enum index_shard_terminal_cause {
+  INDEX_SHARD_TERMINAL_NONE = 0,
+  INDEX_SHARD_TERMINAL_WINNER,
+  INDEX_SHARD_TERMINAL_WALL_LIMIT,
+  INDEX_SHARD_TERMINAL_CPU_LIMIT,
+  INDEX_SHARD_TERMINAL_CANCELLED,
+  INDEX_SHARD_TERMINAL_GLOBAL_INTEGRITY
+} index_shard_terminal_cause_t;
+
 // ANCHOR INDEX-SHARD: result-state
 /*
  * Result produced by exactly one shard task.
  *
- * The worker owns this object until completed[index_order] is published.
- * The reducer may then transfer MatchObj payloads into master bp->solutions.
+ * The worker owns all mutable state until completed[index_order] is published.
+ * candidate_ready freezes solutions, solved state, best-match metadata and
+ * candidate identity for election before index cleanup. The reducer still
+ * waits for full task completion and pass quiescence before transferring the
+ * selected MatchObj payload into master bp->solutions.
  *
  * Important:
- *   - solutions is worker-local until merge
+ *   - solutions is worker-local and immutable after candidate_ready
  *   - merged prevents double-free / double-merge
  *   - solved means this shard contains an accepted verified MatchObj
  */
 typedef struct index_shard_result {
   bl *solutions; // worker-local MatchObj list for this index
 
-  /* Immutable after task publication; aggregated only after pass quiescence. */
+  /* Fixed before candidate publication; aggregated only after quiescence. */
   solver_profile_t solver_profile;
 
   int failed; // classified failure, not normal "did not solve"
@@ -133,10 +150,13 @@ typedef struct index_shard_result {
   unsigned long long task_voluntary_switches;
 
   anbool hit_total_cpulimit;
+  anbool hit_total_timelimit;
 
   anbool cancelled;
 
   size_t index_order; // original candidate index order in onefield pass
+  anbool candidate_ready;
+  size_t candidate_sequence;
   size_t completion_sequence;
   int merged;         // reducer already consumed/transferred this result
 } index_shard_result_t;
@@ -167,12 +187,14 @@ typedef struct index_shard_thread_state {
   onefield_t *bp;                   // master bp, reducer-owned for writes
   const solver_t *base_sp;          // read-only template for local solvers
   const index_shard_hooks_t *hooks; // bridge back into onefield.c
+  const void *worker_view;          // immutable, pass-owned worker snapshot
 
   size_t nindexes;
   size_t canonical_scan_cursor;
   size_t outer_unclaimed;
   size_t outer_running;
   size_t producer_width;
+  size_t helper_width;
   size_t queue_waiters;
   size_t helper_groups_active;
   size_t helper_preparations_active;
@@ -184,6 +206,7 @@ typedef struct index_shard_thread_state {
   size_t results_reduced;
   size_t next_completion_sequence;
 
+  size_t next_candidate_sequence;
   pthread_mutex_t queue_mutex;
   pthread_cond_t queue_cv;
 
@@ -202,6 +225,7 @@ typedef struct index_shard_thread_state {
   int winner_selected;  // first immutable verified result won the pass
   int solved_published; // reducer committed a valid solved result
   int master_committed;
+  index_shard_terminal_cause_t terminal_cause;
   double first_stop_wall_since_pass;
 
   /*
@@ -212,7 +236,7 @@ typedef struct index_shard_thread_state {
 
   /* First-valid selection identity, immutable after publication. */
   size_t selected_index_order;
-  size_t selected_completion_sequence;
+  size_t selected_candidate_sequence;
 
   /* Reducer-owned identity of the first and only master solution commit. */
   int have_committed_result;
@@ -255,7 +279,9 @@ typedef enum index_shard_helper_task_state {
   INDEX_SHARD_HELPER_TASK_UNUSED = 0,
   INDEX_SHARD_HELPER_TASK_READY = 1,
   INDEX_SHARD_HELPER_TASK_RUNNING = 2,
-  INDEX_SHARD_HELPER_TASK_DONE = 3
+  INDEX_SHARD_HELPER_TASK_DONE = 3,
+  INDEX_SHARD_HELPER_TASK_RETIRING = 4,
+  INDEX_SHARD_HELPER_TASK_RETIRED = 5
 } index_shard_helper_task_state_t;
 
 /*
@@ -266,6 +292,8 @@ struct index_shard_helper_group {
   const index_shard_helper_ops_t *ops;
   index_shard_helper_task_t *tasks;
   size_t task_count;
+  index_shard_helper_retire_fn retire;
+  void *owner_context;
 
   unsigned long generation;
   unsigned long long owner_epoch;
@@ -273,6 +301,7 @@ struct index_shard_helper_group {
   size_t owner_index_order;
 
   size_t next_claim;
+  size_t next_retire;
   size_t ready_count;
   size_t running_count;
   size_t completed_count;
@@ -388,6 +417,7 @@ struct index_shard_pool {
 
   int worker_count;
   size_t producer_width;
+  size_t helper_width;
   pthread_t *threads;
   index_shard_worker_context_t *contexts;
 
@@ -412,6 +442,7 @@ struct index_shard_pool {
   int shutdown;
   int stopping;
   int pass_active;
+  int payload_io_owned;
   int ready_workers;
   int tls_startup_error;
   unsigned long generation; // pass submission counter
@@ -1171,8 +1202,9 @@ typedef struct index_shard_pass_state_snapshot {
   int winner_selected;
   int solved_published;
   int master_committed;
+  index_shard_terminal_cause_t terminal_cause;
   size_t selected_index_order;
-  size_t selected_completion_sequence;
+  size_t selected_candidate_sequence;
   unsigned long long task_local_failures;
   unsigned long long global_integrity_failures;
   double first_stop_wall_since_pass;
@@ -1270,9 +1302,10 @@ static void index_shard_pass_state_snapshot(index_shard_thread_state_t *shared,
   snapshot->winner_selected = shared->winner_selected;
   snapshot->solved_published = shared->solved_published;
   snapshot->master_committed = shared->master_committed;
+  snapshot->terminal_cause = shared->terminal_cause;
   snapshot->selected_index_order = shared->selected_index_order;
-  snapshot->selected_completion_sequence =
-      shared->selected_completion_sequence;
+  snapshot->selected_candidate_sequence =
+      shared->selected_candidate_sequence;
   snapshot->task_local_failures =
       shared->task_local_failures;
   snapshot->global_integrity_failures =
@@ -1786,66 +1819,87 @@ static void index_shard_wake_queue_waiters(
   pthread_mutex_unlock(&shared->queue_mutex);
 }
 
-// ANCHOR INDEX-SHARD: request-stop
-/*
- * Cooperative global stop.
- *
- * Stop means:
- *   - workers should not claim new tasks
- *   - reducer should wake and merge any solved/completed result
- *   - already-running solver calls must exit through callback polling
- *
- * This is intentionally not pthread_cancel.
- */
-static void index_shard_request_stop(index_shard_thread_state_t *shared) {
-  int was_stopped;
-
-  pthread_mutex_lock(&shared->state_mutex);
-  was_stopped = shared->stop_requested;
-  if (!was_stopped) {
-    shared->first_stop_wall_since_pass =
-        monotonic_seconds() - shared->pass_wall_start;
+static const char *index_shard_terminal_cause_name(
+    index_shard_terminal_cause_t cause) {
+  switch (cause) {
+  case INDEX_SHARD_TERMINAL_NONE:
+    return "none";
+  case INDEX_SHARD_TERMINAL_WINNER:
+    return "winner";
+  case INDEX_SHARD_TERMINAL_WALL_LIMIT:
+    return "wall-limit";
+  case INDEX_SHARD_TERMINAL_CPU_LIMIT:
+    return "cpu-limit";
+  case INDEX_SHARD_TERMINAL_CANCELLED:
+    return "cancelled";
+  case INDEX_SHARD_TERMINAL_GLOBAL_INTEGRITY:
+    return "global-integrity";
   }
-  shared->stop_requested = TRUE;
-  pthread_mutex_unlock(&shared->state_mutex);
+  return "invalid";
+}
 
+/* state_mutex must be held. */
+static int index_shard_publish_terminal_locked(
+    index_shard_thread_state_t *shared,
+    index_shard_terminal_cause_t cause) {
+  int changed = FALSE;
+
+  assert(shared);
+  if (cause == INDEX_SHARD_TERMINAL_NONE) {
+    return FALSE;
+  }
+
+  if (cause == INDEX_SHARD_TERMINAL_GLOBAL_INTEGRITY) {
+    changed = !shared->fatal_error ||
+        shared->terminal_cause != cause;
+    if (shared->terminal_cause == INDEX_SHARD_TERMINAL_NONE) {
+      shared->first_stop_wall_since_pass =
+          monotonic_seconds() - shared->pass_wall_start;
+    }
+    shared->terminal_cause = cause;
+    shared->fatal_error = TRUE;
+    shared->stop_requested = TRUE;
+    return changed;
+  }
+
+  if (shared->terminal_cause != INDEX_SHARD_TERMINAL_NONE) {
+    return FALSE;
+  }
+
+  shared->terminal_cause = cause;
+  shared->first_stop_wall_since_pass =
+      monotonic_seconds() - shared->pass_wall_start;
+  shared->stop_requested = TRUE;
+  return TRUE;
+}
+
+static void index_shard_publish_worker_stop(
+    index_shard_thread_state_t *shared) {
   __atomic_store_n(
       &shared->worker_stop_requested,
       TRUE,
       __ATOMIC_RELEASE);
-  fitsbin_payload_io_notify_wait_helpers();
-
-  if (!was_stopped && index_shard_trace_enabled()) {
-    logmsg("[index-shard] stop-request pass_wall=%.6f\n",
-           monotonic_seconds() - shared->pass_wall_start);
-  }
-
   index_shard_wake_pass_waiters(shared);
   index_shard_wake_queue_waiters(shared);
 }
+
 
 // ANCHOR INDEX-SHARD: request-fatal-stop
 /*
  * Publish a hard worker/module failure and stop the current pass.
  */
 static void index_shard_request_fatal_stop(index_shard_thread_state_t *shared) {
+  int stopped;
+
   pthread_mutex_lock(&shared->state_mutex);
-  if (!shared->stop_requested) {
-    shared->first_stop_wall_since_pass =
-        monotonic_seconds() - shared->pass_wall_start;
-  }
-  shared->fatal_error = TRUE;
-  shared->stop_requested = TRUE;
+  (void)index_shard_publish_terminal_locked(
+      shared, INDEX_SHARD_TERMINAL_GLOBAL_INTEGRITY);
+  stopped = shared->stop_requested;
   pthread_mutex_unlock(&shared->state_mutex);
 
-  __atomic_store_n(
-      &shared->worker_stop_requested,
-      TRUE,
-      __ATOMIC_RELEASE);
-  fitsbin_payload_io_notify_wait_helpers();
-
-  index_shard_wake_pass_waiters(shared);
-  index_shard_wake_queue_waiters(shared);
+  if (stopped) {
+    index_shard_publish_worker_stop(shared);
+  }
 }
 
 // ANCHOR INDEX-SHARD: publish-committed-solve
@@ -1857,23 +1911,24 @@ static void index_shard_request_fatal_stop(index_shard_thread_state_t *shared) {
  */
 static void index_shard_publish_committed_solve(
     index_shard_thread_state_t *shared) {
+  int valid;
+
   pthread_mutex_lock(&shared->state_mutex);
-  if (!shared->stop_requested) {
-    shared->first_stop_wall_since_pass =
-        monotonic_seconds() - shared->pass_wall_start;
+  valid = shared->winner_selected &&
+      shared->terminal_cause == INDEX_SHARD_TERMINAL_WINNER &&
+      !shared->fatal_error;
+  if (valid) {
+    shared->solved_published = TRUE;
+  } else {
+    (void)index_shard_publish_terminal_locked(
+        shared, INDEX_SHARD_TERMINAL_GLOBAL_INTEGRITY);
   }
-  shared->solved_published = TRUE;
-  shared->stop_requested = TRUE;
   pthread_mutex_unlock(&shared->state_mutex);
 
-  __atomic_store_n(
-      &shared->worker_stop_requested,
-      TRUE,
-      __ATOMIC_RELEASE);
-  fitsbin_payload_io_notify_wait_helpers();
-
-  index_shard_wake_pass_waiters(shared);
-  index_shard_wake_queue_waiters(shared);
+  index_shard_publish_worker_stop(shared);
+  if (!valid) {
+    logerr("[index-shard] invalid committed-solution terminal state\n");
+  }
 }
 /*
  * Mark the point after which serial fallback is no longer safe.
@@ -1890,9 +1945,11 @@ static void index_shard_mark_master_committed(
 }
 
 // ANCHOR INDEX-SHARD: master-limit-state
-static int index_shard_master_limit_or_cancel_requested(index_shard_thread_state_t *shared,
-                                                        anbool *hit_total_cpulimit,
-                                                        anbool *cancelled) {
+static int index_shard_master_limit_or_cancel_requested(
+    index_shard_thread_state_t *shared,
+    anbool *hit_total_cpulimit,
+    anbool *hit_total_timelimit,
+    anbool *cancelled) {
   onefield_t *bp = shared->bp;
   int stop;
 
@@ -1900,6 +1957,10 @@ static int index_shard_master_limit_or_cancel_requested(index_shard_thread_state
 
   if (hit_total_cpulimit) {
     *hit_total_cpulimit = bp->hit_total_cpulimit;
+  }
+
+  if (hit_total_timelimit) {
+    *hit_total_timelimit = bp->hit_total_timelimit;
   }
 
   if (cancelled) {
@@ -1929,9 +1990,86 @@ static int index_shard_master_stop_requested(index_shard_thread_state_t *shared)
     return TRUE;
   }
 
-  return index_shard_master_limit_or_cancel_requested(shared, NULL, NULL);
+  return index_shard_master_limit_or_cancel_requested(
+      shared, NULL, NULL, NULL);
 }
 
+/* state_mutex and limit_mutex must be held. */
+static index_shard_terminal_cause_t
+index_shard_sample_terminal_locked(
+    index_shard_thread_state_t *shared,
+    const index_shard_result_t *result,
+    double *elapsed,
+    int *report) {
+  onefield_t *bp;
+  index_shard_terminal_cause_t cause =
+      INDEX_SHARD_TERMINAL_NONE;
+
+  assert(shared);
+  bp = shared->bp;
+  assert(bp);
+
+  if (elapsed) {
+    *elapsed = 0.0;
+  }
+  if (report) {
+    *report = FALSE;
+  }
+
+  if (result && result->cancelled) {
+    bp->cancelled = TRUE;
+  }
+  if (result && result->hit_total_timelimit) {
+    bp->hit_total_timelimit = TRUE;
+  }
+  if (result && result->hit_total_cpulimit) {
+    bp->hit_total_cpulimit = TRUE;
+  }
+
+  if (bp->cancelled) {
+    cause = INDEX_SHARD_TERMINAL_CANCELLED;
+  } else if (bp->hit_total_timelimit) {
+    cause = INDEX_SHARD_TERMINAL_WALL_LIMIT;
+  } else if (bp->hit_total_cpulimit) {
+    cause = INDEX_SHARD_TERMINAL_CPU_LIMIT;
+  } else if (bp->total_timelimit > 0.0) {
+    double now = monotonic_seconds();
+    double sampled = now - bp->time_total_start;
+
+    if (elapsed) {
+      *elapsed = sampled;
+    }
+    if (now >= 0.0 && sampled >= bp->total_timelimit) {
+      bp->hit_total_timelimit = TRUE;
+      cause = INDEX_SHARD_TERMINAL_WALL_LIMIT;
+    }
+  }
+
+  if (cause == INDEX_SHARD_TERMINAL_NONE &&
+      bp->total_cpulimit > 0.0) {
+    double sampled =
+        (double)(get_cpu_usage() - bp->cpu_total_start);
+
+    if (elapsed) {
+      *elapsed = sampled;
+    }
+    if (sampled >= bp->total_cpulimit) {
+      bp->hit_total_cpulimit = TRUE;
+      cause = INDEX_SHARD_TERMINAL_CPU_LIMIT;
+    }
+  }
+
+  if ((cause == INDEX_SHARD_TERMINAL_WALL_LIMIT ||
+       cause == INDEX_SHARD_TERMINAL_CPU_LIMIT) &&
+      !shared->limit_reported) {
+    shared->limit_reported = TRUE;
+    if (report) {
+      *report = TRUE;
+    }
+  }
+
+  return cause;
+}
 // ANCHOR INDEX-SHARD: global-limits
 /*
  * Process-wide elapsed-time and CPU-budget checks.
@@ -1942,66 +2080,49 @@ static int index_shard_master_stop_requested(index_shard_thread_state_t *shared)
  */
 static int index_shard_check_global_limits(index_shard_thread_state_t *shared) {
   onefield_t *bp = shared->bp;
-  index_shard_pass_state_snapshot_t state;
-  int hit = FALSE;
+  index_shard_terminal_cause_t cause = INDEX_SHARD_TERMINAL_NONE;
+  double elapsed = 0.0;
+  int report = FALSE;
 
-  index_shard_pass_state_snapshot(shared, &state);
-
-  if (state.stop_requested || state.fatal_error || state.solved_published) {
+  /*
+   * state_mutex is the terminal-event arbiter. Holding it while the master
+   * limit flags are inspected and updated closes the former interval between
+   * deadline publication and cooperative-stop publication.
+   */
+  pthread_mutex_lock(&shared->state_mutex);
+  if (shared->terminal_cause != INDEX_SHARD_TERMINAL_NONE) {
+    pthread_mutex_unlock(&shared->state_mutex);
     return TRUE;
   }
 
   pthread_mutex_lock(&shared->limit_mutex);
-
-  if (bp->cancelled || bp->hit_total_cpulimit || bp->hit_total_timelimit) {
-    hit = TRUE;
-  } else {
-    if (bp->total_timelimit > 0.0) {
-      double now = monotonic_seconds();
-
-      if (now >= 0.0 &&
-          now - bp->time_total_start >= bp->total_timelimit) {
-        bp->hit_total_timelimit = TRUE;
-        hit = TRUE;
-
-        if (!shared->limit_reported) {
-          shared->limit_reported = TRUE;
-          logmsg("Total wall-clock time limit reached!\n");
-          logverb("[index-shard] wall-limit reached total_timelimit=%g "
-                  "elapsed=%.6f\n",
-                  bp->total_timelimit,
-                  now - bp->time_total_start);
-        }
-      }
-    }
-
-    if (!hit && bp->total_cpulimit > 0.0) {
-      float now = get_cpu_usage();
-      double elapsed = (double)(now - bp->cpu_total_start);
-
-      if (elapsed >= bp->total_cpulimit) {
-        bp->hit_total_cpulimit = TRUE;
-        hit = TRUE;
-
-        if (!shared->limit_reported) {
-          shared->limit_reported = TRUE;
-          logmsg("Total CPU time limit reached!\n");
-          logverb("[index-shard] cpu-budget reached total_cpulimit=%g "
-                  "elapsed=%.6f\n",
-                  bp->total_cpulimit,
-                  elapsed);
-        }
-      }
-    }
+  cause = index_shard_sample_terminal_locked(
+      shared, NULL, &elapsed, &report);
+  if (cause != INDEX_SHARD_TERMINAL_NONE) {
+    (void)index_shard_publish_terminal_locked(shared, cause);
   }
-
   pthread_mutex_unlock(&shared->limit_mutex);
+  pthread_mutex_unlock(&shared->state_mutex);
 
-  if (hit) {
-    index_shard_request_stop(shared);
+  if (cause == INDEX_SHARD_TERMINAL_NONE) {
+    return FALSE;
   }
 
-  return hit;
+  index_shard_publish_worker_stop(shared);
+  if (report && cause == INDEX_SHARD_TERMINAL_WALL_LIMIT) {
+    logmsg("Total wall-clock time limit reached!\n");
+    logverb("[index-shard] wall-limit reached total_timelimit=%g "
+            "elapsed=%.6f\n",
+            bp->total_timelimit,
+            elapsed);
+  } else if (report && cause == INDEX_SHARD_TERMINAL_CPU_LIMIT) {
+    logmsg("Total CPU time limit reached!\n");
+    logverb("[index-shard] cpu-budget reached total_cpulimit=%g "
+            "elapsed=%.6f\n",
+            bp->total_cpulimit,
+            elapsed);
+  }
+  return TRUE;
 }
 
 // ANCHOR INDEX-SHARD: callback-poll
@@ -2064,6 +2185,70 @@ static void index_shard_result_fail(
   if (failure_class > result->failure_class) {
     result->failure_class = failure_class;
   }
+}
+
+/*
+ * Map one typed bridge result into task state.
+ *
+ * Return 0 for normal completion, 1 for cooperative terminal observation and
+ * -1 for a classified failure. A solved outcome is accepted only from the
+ * solution-analysis hook.
+ */
+static int index_shard_apply_hook_result(
+    index_shard_result_t *result,
+    index_shard_hook_result_t hook_result,
+    int solved_allowed) {
+  assert(result);
+
+  switch (hook_result.outcome) {
+  case INDEX_SHARD_HOOK_COMPLETED_UNSOLVED:
+    if (!hook_result.error_code) {
+      return 0;
+    }
+    break;
+  case INDEX_SHARD_HOOK_COMPLETED_SOLVED:
+    if (solved_allowed && !hook_result.error_code) {
+      result->solved = TRUE;
+      return 0;
+    }
+    break;
+  case INDEX_SHARD_HOOK_CANCELLED:
+    if (!hook_result.error_code) {
+      result->cancelled = TRUE;
+      return 1;
+    }
+    break;
+  case INDEX_SHARD_HOOK_WALL_LIMIT:
+    if (!hook_result.error_code) {
+      result->hit_total_timelimit = TRUE;
+      return 1;
+    }
+    break;
+  case INDEX_SHARD_HOOK_CPU_LIMIT:
+    if (!hook_result.error_code) {
+      result->hit_total_cpulimit = TRUE;
+      return 1;
+    }
+    break;
+  case INDEX_SHARD_HOOK_TASK_LOCAL_FAILURE:
+    index_shard_result_fail(
+        result,
+        INDEX_SHARD_FAILURE_TASK_LOCAL,
+        hook_result.error_code);
+    return -1;
+  case INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE:
+    index_shard_result_fail(
+        result,
+        INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+        hook_result.error_code);
+    return -1;
+  }
+
+  index_shard_result_fail(
+      result,
+      INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+      hook_result.error_code);
+  return -1;
 }
 
 static void index_shard_result_init(index_shard_result_t *result, size_t index_order) {
@@ -2165,13 +2350,24 @@ static void index_shard_result_finish_task(
  * a winner. Only the reducer may transfer the selected solution into master
  * state.
  */
-static void index_shard_capture_solution_analysis(index_shard_thread_state_t *shared,
-                                                  index_shard_result_t *result) {
-  if (!shared->hooks || !shared->hooks->analyze_solutions)
-    return;
+static int index_shard_capture_solution_analysis(
+    index_shard_thread_state_t *shared,
+    index_shard_result_t *result) {
+  index_shard_hook_result_t hook_result;
 
-  result->solved = shared->hooks->analyze_solutions(shared->bp, result->solutions,
-                                                    &result->best_logodds, &result->best_fieldnum);
+  if (!shared->hooks || !shared->hooks->analyze_solutions) {
+    index_shard_result_fail(
+        result,
+        INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+        -1);
+    return -1;
+  }
+
+  hook_result = shared->hooks->analyze_solutions(
+      shared->bp, result->solutions,
+      &result->best_logodds, &result->best_fieldnum);
+  return index_shard_apply_hook_result(
+      result, hook_result, TRUE);
 }
 // ANCHOR INDEX-SHARD: reduce-one-result
 static void index_shard_reducer_work_account(
@@ -2206,9 +2402,23 @@ static int index_shard_reduce_one_result(index_shard_thread_state_t *shared,
   anbool solved = FALSE;
   double reducer_wall_start;
   int may_mutate_master = FALSE;
+  int losing_result = FALSE;
 
   if (!result || result->merged) {
     return 0;
+  }
+
+
+  pthread_mutex_lock(&shared->state_mutex);
+  losing_result =
+      shared->winner_selected &&
+      result->index_order != shared->selected_index_order;
+  pthread_mutex_unlock(&shared->state_mutex);
+  if (losing_result) {
+    logerr("[index-shard] refusing to merge losing result "
+           "index_order=%zu\n",
+           result->index_order);
+    return -1;
   }
 
   if (shared->have_committed_result) {
@@ -2275,23 +2485,41 @@ static int index_shard_reduce_one_result(index_shard_thread_state_t *shared,
  * No persistent index_t cache here.  Full-index caching caused unacceptable
  * RSS growth because candidate sets can contain hundreds of heavy indexes.
  */
-static index_t *index_shard_worker_get_index(index_shard_worker_context_t *ctx,
-                                             index_shard_thread_state_t *shared,
-                                             size_t index_order) {
-  // original onefield ownership path, released after task
-  index_t *index;
+static index_shard_hook_result_t index_shard_worker_get_index(
+    index_shard_worker_context_t *ctx,
+    index_shard_thread_state_t *shared,
+    size_t index_order,
+    index_t **index_out) {
+  index_shard_hook_result_t hook_result = {
+      INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE, -1};
 
-  if (!shared->hooks || !shared->hooks->get_index)
-    return NULL;
-
-  index = shared->hooks->get_index(shared->bp, index_order);
-
-  if (index_shard_trace_enabled() && index) {
-    logmsg("[index-shard] worker=%i load index_order=%zu index=%s\n", ctx->worker_id, index_order,
-           index->indexname ? index->indexname : "(null)");
+  if (index_out) {
+    *index_out = NULL;
+  }
+  if (!shared || !shared->hooks ||
+      !shared->hooks->get_index || !index_out) {
+    return hook_result;
   }
 
-  return index;
+  hook_result = shared->hooks->get_index(
+      shared->bp, index_order, index_out);
+  if (hook_result.outcome ==
+          INDEX_SHARD_HOOK_COMPLETED_UNSOLVED &&
+      !*index_out) {
+    hook_result.outcome =
+        INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE;
+    hook_result.error_code = -1;
+  }
+
+  if (index_shard_trace_enabled() && *index_out) {
+    logmsg("[index-shard] worker=%i load index_order=%zu index=%s\n",
+           ctx->worker_id, index_order,
+           (*index_out)->indexname
+               ? (*index_out)->indexname
+               : "(null)");
+  }
+
+  return hook_result;
 }
 
 static int index_shard_apply_index_mmap_advice(
@@ -2305,8 +2533,8 @@ static int index_shard_apply_index_mmap_advice(
     }
 
     /*
-     * Apply the pass policy to every chunk of a retained or newly prepared
-     * index component.
+     * Apply the component policy to existing mappings. fitsbin keeps compact
+     * topology NORMAL and applies the pass policy only to sparse payload.
      */
     if (index->codekd &&
         index->codekd->tree &&
@@ -2417,41 +2645,28 @@ static anbool index_shard_helper_outer_claimable_locked(
 static size_t index_shard_helper_idle_workers_locked(
     const index_shard_thread_state_t *shared) {
   size_t available = 0U;
-  size_t wait_helpers;
   size_t limit;
   size_t spare = 0U;
-  anbool outer_claimable;
 
   if (!shared || shared->worker_count < 2) {
     return 0U;
   }
   limit = (size_t)shared->worker_count - 1U;
-  outer_claimable =
-      index_shard_helper_outer_claimable_locked(shared);
-  wait_helpers =
-      fitsbin_payload_io_wait_helper_count();
-  if (!outer_claimable) {
-    if ((size_t)shared->worker_count >
-        shared->outer_running) {
-      spare = (size_t)shared->worker_count -
-          shared->outer_running;
-    }
-    available = shared->queue_waiters;
-    if (!shared->helper_groups_active &&
-        spare > available) {
-      available = spare;
-    }
+  if (index_shard_helper_outer_claimable_locked(shared)) {
+    return 0U;
+  }
+  if ((size_t)shared->worker_count > shared->outer_running) {
+    spare = (size_t)shared->worker_count - shared->outer_running;
+  }
+  available = shared->queue_waiters;
+  if (!shared->helper_groups_active && spare > available) {
+    available = spare;
   }
   available = MIN(available, limit);
-  wait_helpers = MIN(
-      wait_helpers,
-      limit - available);
-  available += wait_helpers;
   if (shared->helper_foreign_reservations >= available) {
     return 0U;
   }
-  available -= shared->helper_foreign_reservations;
-  return available;
+  return available - shared->helper_foreign_reservations;
 }
 
 /* queue_mutex must be held. */
@@ -2765,54 +2980,6 @@ static int index_shard_helper_execute_claim(
   return rc;
 }
 
-static int index_shard_payload_wait_help(void *opaque) {
-  index_shard_worker_context_t *ctx = opaque;
-  index_shard_thread_state_t *shared;
-  index_shard_helper_claim_t claim;
-  int selection;
-
-  if (!ctx || !ctx->pool ||
-      !ctx->current_outer_active) {
-    return 0;
-  }
-  shared = &ctx->pool->shared;
-  memset(&claim, 0, sizeof(claim));
-
-  pthread_mutex_lock(&shared->queue_mutex);
-  if (ctx->generation_seen != ctx->pool->generation) {
-    pthread_mutex_unlock(&shared->queue_mutex);
-    return 0;
-  }
-  selection = index_shard_helper_select_locked(
-      ctx, shared, &claim);
-  pthread_mutex_unlock(&shared->queue_mutex);
-
-  if (selection < 0) {
-    index_shard_request_fatal_stop(shared);
-    return 0;
-  }
-  if (selection > 0) {
-    return 0;
-  }
-  if (index_shard_helper_execute_claim(
-          shared, &claim)) {
-    index_shard_request_fatal_stop(shared);
-    return 0;
-  }
-  return 1;
-}
-
-static int index_shard_payload_wait_stop(void *opaque) {
-  index_shard_worker_context_t *ctx = opaque;
-
-  if (!ctx || !ctx->pool) {
-    return TRUE;
-  }
-  return __atomic_load_n(
-      &ctx->pool->shared.worker_stop_requested,
-      __ATOMIC_ACQUIRE) != 0;
-}
-
 /* queue_mutex must be held. */
 static int index_shard_helper_cancel_for_pool_locked(
     index_shard_thread_state_t *shared,
@@ -2874,6 +3041,77 @@ static int index_shard_helper_owner_claim_locked(
         group, INDEX_SHARD_HELPER_TASK_STOPPED);
   }
   return 1;
+}
+
+/*
+ * Retire at most one completed canonical task. The queue lock publishes the
+ * helper output before the owner callback observes it. The callback runs
+ * without pool locks and may mutate only the owning solver.
+ */
+static int index_shard_helper_retire_one(
+    index_shard_thread_state_t *shared,
+    index_shard_helper_group_t *group) {
+  index_shard_helper_task_t *task;
+  index_shard_helper_retire_status_t status;
+  size_t task_index;
+
+  if (!shared || !group || !group->retire) {
+    return 1;
+  }
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  if (group->next_retire >= group->task_count) {
+    pthread_mutex_unlock(&shared->queue_mutex);
+    return 1;
+  }
+  task_index = group->next_retire;
+  task = &group->tasks[task_index];
+  if (task->scheduler_state != INDEX_SHARD_HELPER_TASK_DONE) {
+    pthread_mutex_unlock(&shared->queue_mutex);
+    return 1;
+  }
+  if (task->execute_status != INDEX_SHARD_HELPER_TASK_OK) {
+    pthread_mutex_unlock(&shared->queue_mutex);
+    return 1;
+  }
+  task->scheduler_state = INDEX_SHARD_HELPER_TASK_RETIRING;
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  status = group->retire(
+      task, task_index, group->owner_context);
+  if (status != INDEX_SHARD_HELPER_RETIRE_OK &&
+      status != INDEX_SHARD_HELPER_RETIRE_STOPPED &&
+      status != INDEX_SHARD_HELPER_RETIRE_ERROR) {
+    status = INDEX_SHARD_HELPER_RETIRE_ERROR;
+  }
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  if (task->scheduler_state !=
+      INDEX_SHARD_HELPER_TASK_RETIRING ||
+      group->next_retire != task_index) {
+    group->internal_error = TRUE;
+    status = INDEX_SHARD_HELPER_RETIRE_ERROR;
+  } else {
+    task->scheduler_state = INDEX_SHARD_HELPER_TASK_RETIRED;
+    group->next_retire++;
+  }
+  if (status == INDEX_SHARD_HELPER_RETIRE_ERROR) {
+    group->task_failed = TRUE;
+    index_shard_helper_cancel_ready_locked(
+        shared,
+        group,
+        INDEX_SHARD_HELPER_TASK_ERROR);
+  } else if (status ==
+             INDEX_SHARD_HELPER_RETIRE_STOPPED) {
+    group->stop_seen = TRUE;
+    index_shard_helper_cancel_ready_locked(
+        shared,
+        group,
+        INDEX_SHARD_HELPER_TASK_STOPPED);
+  }
+  pthread_cond_broadcast(&shared->queue_cv);
+  pthread_mutex_unlock(&shared->queue_mutex);
+  return status == INDEX_SHARD_HELPER_RETIRE_OK ? 0 : -1;
 }
 
 size_t index_shard_helper_available_workers(void) {
@@ -2974,11 +3212,13 @@ void index_shard_helper_prepare_cancel(void) {
   pthread_mutex_unlock(&shared->queue_mutex);
 }
 
-index_shard_helper_run_status_t
-index_shard_helper_run(
+static index_shard_helper_run_status_t
+index_shard_helper_run_internal(
     const index_shard_helper_ops_t *ops,
     index_shard_helper_task_t *tasks,
     size_t task_count,
+    index_shard_helper_retire_fn retire,
+    void *owner_context,
     index_shard_helper_run_stats_t *stats) {
   index_shard_worker_context_t *ctx = index_shard_get_tls();
   index_shard_thread_state_t *shared;
@@ -2991,6 +3231,7 @@ index_shard_helper_run(
   int fatal_requested = FALSE;
   int prepublish_fatal = FALSE;
   int preparation_permit = FALSE;
+  int helper_window_active = FALSE;
 
   if (stats) {
     memset(stats, 0, sizeof(*stats));
@@ -3010,6 +3251,8 @@ index_shard_helper_run(
   group.ops = ops;
   group.tasks = tasks;
   group.task_count = task_count;
+  group.retire = retire;
+  group.owner_context = owner_context;
   group.generation = ctx->generation_seen;
   group.owner_epoch = ++ctx->helper_group_epoch;
   group.owner_worker = ctx->worker_id;
@@ -3132,6 +3375,8 @@ index_shard_helper_run(
   shared->helper_groups_active++;
   shared->helper_groups_published++;
   pthread_mutex_unlock(&shared->state_mutex);
+  fitsbin_payload_io_begin_helper_window();
+  helper_window_active = TRUE;
   pthread_cond_broadcast(&shared->queue_cv);
   pthread_mutex_unlock(&shared->queue_mutex);
   fitsbin_payload_io_notify_wait_helpers();
@@ -3142,6 +3387,11 @@ index_shard_helper_run(
           shared, &claim);
 
       have_claim = FALSE;
+    }
+
+    while (!index_shard_helper_retire_one(
+               shared, &group)) {
+      /* Retire every currently completed canonical packet. */
     }
 
     pthread_mutex_lock(&shared->queue_mutex);
@@ -3238,7 +3488,7 @@ index_shard_helper_run(
             &group, INDEX_SHARD_HELPER_TASK_ERROR);
       } else if (!claim_status) {
         group.owner_claims++;
-        group.owner_work += index_shard_helper_task_work(
+              group.owner_work += index_shard_helper_task_work(
             &group.tasks[claim.task_index]);
         shared->helper_tasks_owner++;
         have_claim = TRUE;
@@ -3263,6 +3513,11 @@ index_shard_helper_run(
   }
   if (group.ready_count || group.running_count ||
       group.completed_count != group.task_count) {
+    group.internal_error = TRUE;
+  }
+  if (group.retire &&
+      !group.task_failed && !group.stop_seen &&
+      group.next_retire != group.task_count) {
     group.internal_error = TRUE;
   }
   {
@@ -3293,6 +3548,10 @@ index_shard_helper_run(
   pthread_cond_broadcast(&shared->queue_cv);
   pthread_mutex_unlock(&shared->queue_mutex);
 
+  if (helper_window_active) {
+    fitsbin_payload_io_end_helper_window();
+    helper_window_active = FALSE;
+  }
   if (stats) {
     stats->owner_tasks = group.owner_claims;
     stats->foreign_tasks = group.foreign_claims;
@@ -3313,6 +3572,37 @@ index_shard_helper_run(
     result = INDEX_SHARD_HELPER_OK;
   }
   return result;
+}
+
+index_shard_helper_run_status_t
+index_shard_helper_run(
+    const index_shard_helper_ops_t *ops,
+    index_shard_helper_task_t *tasks,
+    size_t task_count,
+    index_shard_helper_run_stats_t *stats) {
+  return index_shard_helper_run_internal(
+      ops, tasks, task_count, NULL, NULL, stats);
+}
+
+index_shard_helper_run_status_t
+index_shard_helper_run_ordered(
+    const index_shard_helper_ops_t *ops,
+    index_shard_helper_task_t *tasks,
+    size_t task_count,
+    index_shard_helper_retire_fn retire,
+    void *owner_context,
+    index_shard_helper_run_stats_t *stats) {
+  if (!retire) {
+    index_shard_helper_prepare_cancel();
+    return INDEX_SHARD_HELPER_TASK_FAILED;
+  }
+  return index_shard_helper_run_internal(
+      ops,
+      tasks,
+      task_count,
+      retire,
+      owner_context,
+      stats);
 }
 
 static void index_shard_worker_cleanup_pass(
@@ -3441,7 +3731,7 @@ index_shard_select_work(
       /*
        * No new outer task can become claimable for this worker in the
        * current band. Release its index-local context before it waits for
-       * index-free helper packages from the remaining owners.
+       * helper packages from the remaining owners.
        */
       pthread_mutex_unlock(&shared->queue_mutex);
       index_shard_worker_cleanup_pass(worker, shared);
@@ -3467,13 +3757,132 @@ index_shard_select_work(
 }
 
 /*
- * Publish one immutable outer result and arbitrate pass termination.
+ * Freeze one index-independent scientific result and arbitrate the first
+ * terminal event before index cleanup or producer-slot release.
  *
- * result_mutex orders completed result publication. state_mutex is acquired
- * second so a verified result, an ordinary task failure, cancellation, and a
- * fatal stop cannot pass one another without a defined winner. The first
- * eligible completed result stops the pass immediately; only the reducer may
- * later transfer its private MatchObj payload into master state.
+ * result_mutex -> state_mutex -> limit_mutex is the only lock order used
+ * here. All three are released before queue_mutex can be acquired later by
+ * index_shard_finish_outer_claim(). Result lifecycle metrics may still be
+ * completed by the owner, but solutions, solved state and candidate identity
+ * are immutable after candidate_ready is published.
+ */
+static int index_shard_arbitrate_candidate(
+    index_shard_thread_state_t *shared,
+    size_t index_order) {
+  index_shard_result_t *result;
+  index_shard_terminal_cause_t cause =
+      INDEX_SHARD_TERMINAL_NONE;
+  double elapsed = 0.0;
+  int rc = 0;
+  int report = FALSE;
+  int selected_now = FALSE;
+  int stop_now = FALSE;
+
+  if (!shared || !shared->results ||
+      index_order >= shared->nindexes) {
+    return -1;
+  }
+
+  result = &shared->results[index_order];
+
+  pthread_mutex_lock(&shared->result_mutex);
+  if (result->candidate_ready ||
+      (shared->completed && shared->completed[index_order])) {
+    logerr("[index-shard] duplicate or late candidate publication "
+           "index_order=%zu\n",
+           index_order);
+    rc = -1;
+  } else {
+    if (result->solved &&
+        (result->failed || result->rc ||
+         result->failure_class != INDEX_SHARD_FAILURE_NONE)) {
+      index_shard_result_fail(
+          result,
+          INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+          result->rc);
+    }
+
+    result->candidate_sequence =
+        ++shared->next_candidate_sequence;
+    result->candidate_ready = TRUE;
+
+    pthread_mutex_lock(&shared->state_mutex);
+    if (result->failure_class ==
+        INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY) {
+      (void)index_shard_publish_terminal_locked(
+          shared, INDEX_SHARD_TERMINAL_GLOBAL_INTEGRITY);
+    } else if (shared->terminal_cause ==
+               INDEX_SHARD_TERMINAL_NONE) {
+      pthread_mutex_lock(&shared->limit_mutex);
+      cause = index_shard_sample_terminal_locked(
+          shared, result, &elapsed, &report);
+      if (cause != INDEX_SHARD_TERMINAL_NONE) {
+        (void)index_shard_publish_terminal_locked(
+            shared, cause);
+      } else if (result->solved &&
+                 !result->failed &&
+                 result->rc == 0 &&
+                 result->failure_class ==
+                     INDEX_SHARD_FAILURE_NONE &&
+                 !shared->winner_selected &&
+                 !shared->solved_published) {
+        shared->winner_selected = TRUE;
+        shared->selected_index_order = index_order;
+        shared->selected_candidate_sequence =
+            result->candidate_sequence;
+        selected_now = index_shard_publish_terminal_locked(
+            shared, INDEX_SHARD_TERMINAL_WINNER);
+      }
+      pthread_mutex_unlock(&shared->limit_mutex);
+    }
+    stop_now = shared->stop_requested;
+    pthread_mutex_unlock(&shared->state_mutex);
+  }
+
+  pthread_cond_broadcast(&shared->result_cv);
+  pthread_mutex_unlock(&shared->result_mutex);
+
+  if (stop_now) {
+    index_shard_publish_worker_stop(shared);
+  }
+
+  if (report && cause == INDEX_SHARD_TERMINAL_WALL_LIMIT) {
+    logmsg("Total wall-clock time limit reached!\n");
+    logverb("[index-shard] wall-limit reached total_timelimit=%g "
+            "elapsed=%.6f\n",
+            shared->bp->total_timelimit,
+            elapsed);
+  } else if (report && cause == INDEX_SHARD_TERMINAL_CPU_LIMIT) {
+    logmsg("Total CPU time limit reached!\n");
+    logverb("[index-shard] cpu-budget reached total_cpulimit=%g "
+            "elapsed=%.6f\n",
+            shared->bp->total_cpulimit,
+            elapsed);
+  }
+
+  if (selected_now) {
+    logverb("[index-shard] winner-selected index_order=%zu worker=%i "
+            "candidate_sequence=%zu field=%i best_logodds=%.17g "
+            "pass_wall=%.6f\n",
+            index_order,
+            result->worker_id,
+            result->candidate_sequence,
+            result->best_fieldnum,
+            result->best_logodds,
+            shared->first_stop_wall_since_pass);
+  }
+
+  return rc;
+}
+
+/*
+ * Publish full task completion after candidate arbitration and index cleanup.
+ *
+ * candidate_ready protects the immutable scientific payload. completed[]
+ * protects the remaining owner lifecycle and metrics. A cleanup failure can
+ * still promote an elected-but-uncommitted winner to global-integrity failure,
+ * but this function never performs winner election or releases outer producer
+ * capacity.
  */
 static int index_shard_mark_result_completed(
     index_shard_thread_state_t *shared,
@@ -3482,7 +3891,6 @@ static int index_shard_mark_result_completed(
   int fatal_now = FALSE;
   int late_loser_failure = FALSE;
   int rc = 0;
-  int selected_now = FALSE;
   int stop_now = FALSE;
   int task_local_now = FALSE;
 
@@ -3531,36 +3939,33 @@ static int index_shard_mark_result_completed(
 
     pthread_mutex_lock(&shared->state_mutex);
 
-    if (result->solved &&
-        !result->failed &&
-        result->rc == 0 &&
-        result->failure_class == INDEX_SHARD_FAILURE_NONE &&
-        !result->cancelled &&
-        !result->hit_total_cpulimit &&
-        !shared->stop_requested &&
-        !shared->fatal_error &&
-        !shared->winner_selected &&
-        !shared->solved_published) {
-      shared->winner_selected = TRUE;
-      shared->selected_index_order = index_order;
-      shared->selected_completion_sequence =
-          result->completion_sequence;
-      shared->first_stop_wall_since_pass =
-          monotonic_seconds() - shared->pass_wall_start;
-      shared->stop_requested = TRUE;
-      selected_now = TRUE;
-      stop_now = TRUE;
-    } else if (result->failure_class ==
-               INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY) {
+    if (result->solved && !result->candidate_ready) {
+      index_shard_result_fail(
+          result,
+          INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+          result->rc);
+    }
+    if (shared->winner_selected &&
+        shared->selected_index_order == index_order &&
+        (!result->candidate_ready ||
+         !result->candidate_sequence ||
+         result->candidate_sequence !=
+             shared->selected_candidate_sequence ||
+         result->failed || result->rc ||
+         result->failure_class != INDEX_SHARD_FAILURE_NONE)) {
+      index_shard_result_fail(
+          result,
+          INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+          result->rc);
+    }
+
+    if (result->failure_class ==
+        INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY) {
       shared->global_integrity_failures++;
-      if (!shared->stop_requested) {
-        shared->first_stop_wall_since_pass =
-            monotonic_seconds() - shared->pass_wall_start;
-      }
-      shared->fatal_error = TRUE;
-      shared->stop_requested = TRUE;
+      (void)index_shard_publish_terminal_locked(
+          shared, INDEX_SHARD_TERMINAL_GLOBAL_INTEGRITY);
       fatal_now = TRUE;
-      stop_now = TRUE;
+      stop_now = shared->stop_requested;
     } else if (result->failure_class ==
                INDEX_SHARD_FAILURE_TASK_LOCAL) {
       shared->task_local_failures++;
@@ -3579,25 +3984,10 @@ static int index_shard_mark_result_completed(
   pthread_mutex_unlock(&shared->result_mutex);
 
   if (stop_now) {
-    __atomic_store_n(
-        &shared->worker_stop_requested,
-        TRUE,
-        __ATOMIC_RELEASE);
-    fitsbin_payload_io_notify_wait_helpers();
-    index_shard_wake_queue_waiters(shared);
+    index_shard_publish_worker_stop(shared);
   }
 
-  if (selected_now) {
-    logverb("[index-shard] winner-selected index_order=%zu worker=%i "
-            "completion_sequence=%zu field=%i best_logodds=%.17g "
-            "pass_wall=%.6f\n",
-            index_order,
-            result->worker_id,
-            result->completion_sequence,
-            result->best_fieldnum,
-            result->best_logodds,
-            shared->first_stop_wall_since_pass);
-  } else if (fatal_now) {
+  if (fatal_now) {
     logerr("[index-shard] global integrity failure terminated pass "
            "index_order=%zu completion_sequence=%zu class=%s\n",
            index_order,
@@ -3625,9 +4015,18 @@ static void index_shard_finish_outer_claim(
   int completion_failed;
 
   /*
-   * Publish the terminal owner state before completed[index_order] makes the
-   * immutable result visible to first-valid election and the reducer.
+   * Candidate arbitration has already frozen any scientific result and
+   * published its terminal event. This final limit sample covers tasks that
+   * produced no candidate or crossed a limit during cleanup. Full completion
+   * remains visible before the producer slot becomes claimable.
    */
+  (void)index_shard_check_global_limits(shared);
+  completion_failed = index_shard_mark_result_completed(
+      shared, index_order);
+  if (completion_failed) {
+    index_shard_request_fatal_stop(shared);
+  }
+
   pthread_mutex_lock(&shared->queue_mutex);
   if (!shared->outer_states ||
       index_order >= shared->nindexes ||
@@ -3652,9 +4051,7 @@ static void index_shard_finish_outer_claim(
   }
   pthread_mutex_unlock(&shared->queue_mutex);
 
-  completion_failed = index_shard_mark_result_completed(
-      shared, index_order);
-  if (underflow || completion_failed) {
+  if (underflow) {
     index_shard_request_fatal_stop(shared);
   }
 }
@@ -3684,7 +4081,9 @@ static int index_shard_worker_prepare_pass(index_shard_worker_context_t *ctx,
   if (!shared->hooks || !shared->hooks->prepare_local_context)
     return -1;
 
-  if (shared->hooks->prepare_local_context(&ctx->local_bp, shared->bp, shared->base_sp))
+  if (!shared->worker_view ||
+      shared->hooks->prepare_local_context(
+          &ctx->local_bp, shared->worker_view))
     return -1;
   // hook copies stable master config + opens worker-local xylist
   ctx->local_context_ready = TRUE;
@@ -3711,25 +4110,31 @@ static void index_shard_worker_cleanup_pass(index_shard_worker_context_t *ctx,
   ctx->local_context_generation = 0;
 }
 
-static int index_shard_done_with_index(
+static index_shard_hook_result_t index_shard_done_with_index(
     index_shard_worker_context_t *ctx,
     index_shard_thread_state_t *shared,
     size_t index_order,
     index_t *index,
     index_shard_inverse_lease_t *inverse_lease) {
+  index_shard_hook_result_t hook_result = {
+      INDEX_SHARD_HOOK_COMPLETED_UNSOLVED, 0};
+
   if (!index) {
-    return 0;
+    return hook_result;
   }
+
   index_shard_inverse_cache_release(
       ctx, index, inverse_lease);
-  if (shared && shared->hooks &&
-      shared->hooks->done_with_index) {
-    return shared->hooks->done_with_index(
-        shared->bp,
-        index_order,
-        index);
+  if (!shared || !shared->hooks ||
+      !shared->hooks->done_with_index) {
+    hook_result.outcome =
+        INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE;
+    hook_result.error_code = -1;
+    return hook_result;
   }
-  return 0;
+
+  return shared->hooks->done_with_index(
+      shared->bp, index_order, index);
 }
 
 // ANCHOR INDEX-SHARD: run-one-index
@@ -3756,8 +4161,9 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
   double phase_wall_start;
   double wall_start;
   float cpu_start;
-  int rc = 0;
   index_shard_inverse_lease_t inverse_lease;
+  index_shard_hook_result_t hook_result;
+  int hook_status;
 
   index_shard_result_init(result, index_order);
   memset(&inverse_lease, 0, sizeof(inverse_lease));
@@ -3824,27 +4230,40 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
   fitsbin_mmap_set_thread_advice(
       result->mmap_advice);
 
-  index = index_shard_worker_get_index(
+  hook_result = index_shard_worker_get_index(
       ctx,
       shared,
-      index_order);
+      index_order,
+      &index);
+  hook_status = index_shard_apply_hook_result(
+      result, hook_result, FALSE);
 
   fitsbin_mmap_clear_thread_advice();
 
-  if (!index) {
-    result->acquire_seconds =
-        monotonic_seconds() - phase_wall_start;
+  result->acquire_seconds =
+      monotonic_seconds() - phase_wall_start;
 
-    ERROR("Failed to load index order %zu", index_order);
-    index_shard_result_fail(
-        result,
-        INDEX_SHARD_FAILURE_TASK_LOCAL,
-        -1);
+  if (hook_status || !index) {
+    if (!hook_status && !index) {
+      index_shard_result_fail(
+          result,
+          INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+          -1);
+    }
+    if (result->failed) {
+      ERROR("Failed to load index order %zu", index_order);
+    }
+    if (index_shard_arbitrate_candidate(
+            shared, index_order)) {
+      index_shard_result_fail(
+          result,
+          INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+          -1);
+    }
 
-    index_shard_result_finish_task(result,
-                                   shared,
-                                   task_wall_start);
-    return -1;
+    index_shard_result_finish_task(
+        result, shared, task_wall_start);
+    return result->failed ? -1 : 0;
   }
 
   /*
@@ -3883,23 +4302,29 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
     index_shard_master_limit_or_cancel_requested(
         shared,
         &result->hit_total_cpulimit,
+        &result->hit_total_timelimit,
         &result->cancelled);
 
     phase_wall_start = monotonic_seconds();
-    if (index_shard_done_with_index(
-            ctx,
-            shared,
-            index_order,
-            index,
-            &inverse_lease)) {
+    hook_result = index_shard_done_with_index(
+        ctx,
+        shared,
+        index_order,
+        index,
+        &inverse_lease);
+    (void)index_shard_apply_hook_result(
+        result, hook_result, FALSE);
+    index = NULL;
+    result->release_seconds =
+        monotonic_seconds() - phase_wall_start;
+
+    if (index_shard_arbitrate_candidate(
+            shared, index_order)) {
       index_shard_result_fail(
           result,
           INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
           -1);
     }
-    index = NULL;
-    result->release_seconds =
-        monotonic_seconds() - phase_wall_start;
     index_shard_result_finish_task(
         result,
         shared,
@@ -3920,43 +4345,37 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
   // Worker-lifetime TLS lets onefield callbacks poll this pass for stop.
   ctx->current_index_order = index_order;
   ctx->current_outer_active = TRUE;
-  fitsbin_payload_io_clear_thread_wait_helper();
-  (void)fitsbin_payload_io_set_thread_wait_helper(
-      index_shard_payload_wait_help,
-      index_shard_payload_wait_stop,
-      ctx);
-  rc = shared->hooks->solve_one_index(&ctx->local_bp, index);
-  fitsbin_payload_io_clear_thread_wait_helper();
+  hook_result = shared->hooks->solve_one_index(
+      &ctx->local_bp, index);
   ctx->current_outer_active = FALSE;
 
   result->wall_seconds = monotonic_seconds() - wall_start;
   result->cpu_seconds = get_cpu_usage() - cpu_start;
 
-  result->hit_total_cpulimit = ctx->local_bp.hit_total_cpulimit;
+  result->hit_total_cpulimit =
+      ctx->local_bp.hit_total_cpulimit;
+  result->hit_total_timelimit =
+      ctx->local_bp.hit_total_timelimit;
   result->cancelled = ctx->local_bp.cancelled;
   result->solver_profile = ctx->local_bp.solver.profile;
-  result->rc = rc;
+  hook_status = index_shard_apply_hook_result(
+      result, hook_result, FALSE);
 
-  if (rc) {
-    index_shard_result_fail(
-        result,
-        INDEX_SHARD_FAILURE_TASK_LOCAL,
-        rc);
-  }
-
-  if (result->cancelled) {
-    index_shard_request_stop(shared);
-  }
-
-  // Analyze before immutable result publication and winner election.
   phase_wall_start = monotonic_seconds();
-
-  if (!result->failed) {
-    index_shard_capture_solution_analysis(shared, result);
+  if (!hook_status && !result->failed) {
+    hook_status = index_shard_capture_solution_analysis(
+        shared, result);
   }
-
   result->analyze_seconds =
       monotonic_seconds() - phase_wall_start;
+
+  if (index_shard_arbitrate_candidate(
+          shared, index_order)) {
+    index_shard_result_fail(
+        result,
+        INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+        -1);
+  }
 
   /*
    * Log the index name before done_with_index() releases index ownership.
@@ -3970,32 +4389,23 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
 
   // Release through the original onefield ownership hook.
   phase_wall_start = monotonic_seconds();
-  if (index_shard_done_with_index(
-          ctx,
-          shared,
-          index_order,
-          index,
-          &inverse_lease)) {
-    index_shard_result_fail(
-        result,
-        INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
-        -1);
-    rc = -1;
-  }
+  hook_result = index_shard_done_with_index(
+      ctx,
+      shared,
+      index_order,
+      index,
+      &inverse_lease);
+  (void)index_shard_apply_hook_result(
+      result, hook_result, FALSE);
   index = NULL;
 
   result->release_seconds =
       monotonic_seconds() - phase_wall_start;
 
-  index_shard_result_finish_task(result,
-                                 shared,
-                                 task_wall_start);
+  index_shard_result_finish_task(
+      result, shared, task_wall_start);
 
-  if (rc) {
-    return rc;
-  }
-
-  return 0;
+  return result->failed ? -1 : 0;
 }
 // ANCHOR INDEX-SHARD: worker-done
 /*
@@ -4011,6 +4421,78 @@ static void index_shard_worker_done(index_shard_thread_state_t *shared) {
 
   pthread_cond_broadcast(&shared->result_cv);
   pthread_mutex_unlock(&shared->result_mutex);
+}
+
+/*
+ * A compute worker waiting for one mapped-page completion may execute one
+ * already-published coarse helper task. This never claims an outer index and
+ * never changes index ownership. The ticket remains responsible for waking
+ * the worker when its own pages become ready.
+ */
+static int index_shard_payload_wait_stop(void *opaque) {
+  index_shard_worker_context_t *ctx = opaque;
+
+  if (!ctx || !ctx->pool) {
+    return TRUE;
+  }
+  return index_shard_worker_stop_requested();
+}
+
+static int index_shard_payload_wait_help(void *opaque) {
+  index_shard_worker_context_t *ctx = opaque;
+  index_shard_thread_state_t *shared;
+  index_shard_helper_claim_t claim;
+  int selection;
+
+  if (!ctx || !ctx->pool ||
+      index_shard_worker_stop_requested()) {
+    return FALSE;
+  }
+  shared = &ctx->pool->shared;
+  memset(&claim, 0, sizeof(claim));
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  if (ctx->published_helper_group) {
+    index_shard_helper_group_t *group =
+        ctx->published_helper_group;
+    size_t reserved = 0U;
+
+    if (group->foreign_reserve > group->foreign_claims) {
+      reserved = group->foreign_reserve -
+          group->foreign_claims;
+    }
+    if (!group->ready_count ||
+        group->ready_count <= reserved) {
+      pthread_mutex_unlock(&shared->queue_mutex);
+      return FALSE;
+    }
+    claim.group = group;
+    selection = index_shard_helper_owner_claim_locked(
+        shared, group, &claim.task_index);
+    if (!selection) {
+      group->owner_claims++;
+      group->owner_work += index_shard_helper_task_work(
+          &group->tasks[claim.task_index]);
+      shared->helper_tasks_owner++;
+    }
+  } else {
+    selection = index_shard_helper_select_locked(
+        ctx, shared, &claim);
+  }
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  if (selection < 0) {
+    index_shard_request_fatal_stop(shared);
+    return FALSE;
+  }
+  if (selection > 0) {
+    return FALSE;
+  }
+  if (index_shard_helper_execute_claim(shared, &claim)) {
+    index_shard_request_fatal_stop(shared);
+    return FALSE;
+  }
+  return TRUE;
 }
 
 // ANCHOR INDEX-SHARD: worker-main
@@ -4040,6 +4522,12 @@ static void *index_shard_worker_main(void *userdata) {
    * silently runs without global stop/cancellation visibility.
    */
   tls_status = index_shard_set_tls(ctx);
+  if (!tls_status) {
+    tls_status = fitsbin_payload_io_set_thread_wait_helper(
+        index_shard_payload_wait_help,
+        index_shard_payload_wait_stop,
+        ctx);
+  }
   pthread_mutex_lock(&pool->control_mutex);
   if (tls_status && !pool->tls_startup_error) {
     pool->tls_startup_error = tls_status;
@@ -4128,6 +4616,7 @@ static void *index_shard_worker_main(void *userdata) {
         index_shard_master_limit_or_cancel_requested(
             shared,
             &result->hit_total_cpulimit,
+            &result->hit_total_timelimit,
             &result->cancelled);
         index_shard_finish_outer_claim(shared, index_order);
         break;
@@ -4210,6 +4699,7 @@ static void *index_shard_worker_main(void *userdata) {
     index_shard_worker_done(shared);
   }
 
+  fitsbin_payload_io_clear_thread_wait_helper();
   tls_status = index_shard_set_tls(NULL);
   if (tls_status) {
     logerr("[index-shard] failed to clear worker TLS "
@@ -4308,29 +4798,35 @@ static int index_shard_pool_reduce_first_valid(index_shard_pool_t *pool) {
     }
 
     winner = &shared->results[state.selected_index_order];
-    if (!winner->solved ||
+    if (!winner->candidate_ready ||
+        !winner->solved ||
         winner->failed ||
         winner->rc ||
         winner->failure_class != INDEX_SHARD_FAILURE_NONE ||
         winner->cancelled ||
+        winner->hit_total_timelimit ||
         winner->hit_total_cpulimit ||
         winner->merged ||
+        !winner->candidate_sequence ||
+        winner->candidate_sequence !=
+            state.selected_candidate_sequence ||
         !winner->completion_sequence ||
-        winner->completion_sequence !=
-            state.selected_completion_sequence) {
+        !shared->completed[state.selected_index_order]) {
       logerr("[index-shard] selected winner result is inconsistent "
-             "index_order=%zu completion_sequence=%zu\n",
+             "index_order=%zu candidate_sequence=%zu\n",
              state.selected_index_order,
-             state.selected_completion_sequence);
+             state.selected_candidate_sequence);
       index_shard_request_fatal_stop(shared);
       return -1;
     }
 
     if (index_shard_trace_enabled()) {
       logmsg("[index-shard] reduce-winner index_order=%zu worker=%i "
-             "completion_sequence=%zu solved=%i failed=%i\n",
+             "candidate_sequence=%zu completion_sequence=%zu "
+             "solved=%i failed=%i\n",
              winner->index_order,
              winner->worker_id,
+             winner->candidate_sequence,
              winner->completion_sequence,
              winner->solved,
              winner->failed);
@@ -4632,6 +5128,7 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   int i;
   int tls_status;
   int worker_count;
+  int payload_io_lanes;
 
    // pool already active for this engine job
   if (!index_shard_pthread_enabled(bp)) {
@@ -4693,6 +5190,7 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   pool->owner_sp = sp;
   pool->worker_count = worker_count;
   pool->producer_width = 1U;
+  pool->helper_width = 0U;
   pool->inverse_cache_budget =
       index_shard_inverse_cache_budget();
 
@@ -4810,16 +5308,35 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
     return -1;
   }
 
-  index_shard_global_pool = pool;
+  /*
+   * Completion lanes populate only packet-planned mapped pages. They are not
+   * compute workers and do not own solver, index, or result state.
+   */
   fitsbin_payload_io_configure_workers(worker_count);
-  pool->producer_width = (size_t)worker_count;
+  payload_io_lanes = MIN(2, MAX(1, worker_count / 2));
+  if (!fitsbin_payload_io_service_width()) {
+    if (fitsbin_payload_io_service_start(payload_io_lanes)) {
+      logverb("[index-shard] mapped-page completion unavailable; "
+              "using native mmap demand\n");
+    } else {
+      pool->payload_io_owned = TRUE;
+    }
+  }
+
+  index_shard_global_pool = pool;
+  /* Keep one fixed-pool lane available for coarse inner packets. */
+  pool->helper_width = worker_count > 1 ? 1U : 0U;
+  pool->producer_width =
+      (size_t)worker_count - pool->helper_width;
 
   logverb("[index-shard] workers=%i mode=pthread "
-          "compute_width=%i producer_width=%zu "
-          "inverse_cache_budget=%zu\n",
+          "compute_width=%i producer_width=%zu helper_width=%zu "
+          "payload_io_width=%i inverse_cache_budget=%zu\n",
           worker_count,
           worker_count,
           pool->producer_width,
+          pool->helper_width,
+          fitsbin_payload_io_service_width(),
           pool->inverse_cache_budget);
 
   pthread_mutex_unlock(&index_shard_global_pool_mutex);
@@ -4881,8 +5398,10 @@ void index_shard_pool_stop(onefield_t *bp) {
   for (i = 0; i < pool->worker_count; i++) {
     pthread_join(pool->threads[i], NULL);
   }
-  fitsbin_payload_io_configure_workers(1);
 
+  if (pool->payload_io_owned) {
+    fitsbin_payload_io_service_stop();
+  }
   free(pool->threads);
   free(pool->contexts);
   index_shard_shared_destroy(&pool->shared);
@@ -4949,14 +5468,16 @@ static int index_shard_pool_submit(
     solver_t *base_sp,
     size_t nindexes,
     const index_shard_hooks_t *hooks,
+    const void *worker_view,
     index_shard_result_t *results,
     unsigned char *completed,
     unsigned char *outer_states) {
   index_shard_thread_state_t *shared = &pool->shared;
   int worker_count = pool->worker_count;
   int i;
+  int payload_io_width;
 
-  if (!outer_states || !pool->producer_width) {
+  if (!outer_states || !worker_view || !pool->producer_width) {
     return -1;
   }
 
@@ -5014,11 +5535,15 @@ static int index_shard_pool_submit(
   shared->bp = bp;
   shared->base_sp = base_sp;
   shared->hooks = hooks;
+  shared->worker_view = worker_view;
   shared->nindexes = nindexes;
   shared->canonical_scan_cursor = 0U;
   shared->outer_unclaimed = nindexes;
   shared->outer_running = 0U;
   shared->producer_width = MIN(pool->producer_width, nindexes);
+  /* Idle outer capacity joins the inner width for this pass. */
+  shared->helper_width =
+      (size_t)worker_count - shared->producer_width;
   shared->queue_waiters = 0U;
   shared->helper_groups_active = 0U;
   shared->helper_preparations_active = 0U;
@@ -5040,6 +5565,7 @@ static int index_shard_pool_submit(
   shared->completed = completed;
   shared->results_reduced = 0U;
   shared->next_completion_sequence = 0U;
+  shared->next_candidate_sequence = 0U;
 
   shared->worker_count = worker_count;
   shared->active_workers = worker_count;
@@ -5049,13 +5575,14 @@ static int index_shard_pool_submit(
   shared->winner_selected = FALSE;
   shared->solved_published = FALSE;
   shared->master_committed = FALSE;
+  shared->terminal_cause = INDEX_SHARD_TERMINAL_NONE;
   shared->first_stop_wall_since_pass = -1.0;
   __atomic_store_n(
       &shared->worker_stop_requested,
       FALSE,
       __ATOMIC_RELEASE);
   shared->selected_index_order = nindexes;
-  shared->selected_completion_sequence = 0U;
+  shared->selected_candidate_sequence = 0U;
   shared->have_committed_result = FALSE;
   shared->committed_index_order = 0U;
   shared->limit_reported = FALSE;
@@ -5064,8 +5591,9 @@ static int index_shard_pool_submit(
   shared->reducer_work_wall_seconds = 0.0;
 
   /*
-   * Every mapping follows the parallel pass policy. Bounded exact page
-   * population is additive and never changes that base policy.
+   * Preserve the established mmap policy. Coarse CodeKD packets may populate
+   * a bounded exact DATA/PERM plan, but there is no independent delivery
+   * generation and native mmap demand remains authoritative.
    */
   shared->mmap_advice =
       fitsbin_mmap_advice_state_begin_pass(
@@ -5090,18 +5618,21 @@ static int index_shard_pool_submit(
   pool->generation++;
   pthread_cond_broadcast(&pool->work_cv);
   pthread_mutex_unlock(&pool->control_mutex);
+  payload_io_width = fitsbin_payload_io_service_width();
 
   logverb("[index-shard] pthread-pool submit compute_width=%i "
-          "producer_width=%zu candidates=%zu engine_pass=%zu "
+          "producer_width=%zu helper_width=%zu "
+          "candidates=%zu engine_pass=%zu "
           "depth_index=%zu scale_index=%zu startobj=%i endobj=%i "
-          "scheduler=first-valid-completion inner_scheduler=prepared-groups "
-          "mmap_pass=%u mmap_advice=%s mmap_scope=all-chunks "
+          "scheduler=first-valid-completion inner_scheduler=ordered-codekd-packets "
+          "mmap_pass=%u mmap_advice=%s "
+          "mmap_scope=payload-random-topology-normal "
           "mmap_policy=parallel-random-serial-normal "
-          "page_delivery=native-mmap-demand "
-          "payload_io=kernel-page-cache credits=%i "
-          "outer_admission=full-width-canonical\n",
+          "page_delivery=%s payload_io=%s payload_io_width=%i "
+          "outer_admission=reserved-helper\n",
           worker_count,
           shared->producer_width,
+          shared->helper_width,
           nindexes,
           bp->engine_pass_ordinal,
           bp->engine_depth_index,
@@ -5110,7 +5641,11 @@ static int index_shard_pool_submit(
           base_sp->endobj,
           shared->mmap_pass_number,
           fitsbin_mmap_advice_name(shared->mmap_advice),
-          worker_count);
+          payload_io_width > 0
+              ? "bounded-mapped-completion"
+              : "native-mmap-demand",
+          payload_io_width > 0 ? "kernel-page-cache" : "native-mmap",
+          payload_io_width);
 
   return 0;
 }
@@ -5137,6 +5672,7 @@ index_shard_solve_impl(onefield_t *bp,
   unsigned char *outer_states = NULL;
   index_shard_result_t *results = NULL;
   unsigned char *completed = NULL;
+  void *worker_view = NULL;
   size_t i;
   int acquire_rc;
   int rc = 0;
@@ -5188,6 +5724,20 @@ index_shard_solve_impl(onefield_t *bp,
     return INDEX_SHARD_SOLVE_LIFECYCLE_CONFLICT;
   }
 
+  if (!hooks->create_worker_view ||
+      !hooks->destroy_worker_view ||
+      !hooks->prepare_local_context ||
+      hooks->create_worker_view(
+          bp, base_sp, &worker_view) ||
+      !worker_view) {
+    logerr("[index-shard] failed to create immutable worker view\n");
+    if (worker_view && hooks->destroy_worker_view) {
+      hooks->destroy_worker_view(worker_view);
+    }
+    index_shard_pool_release_pass(pool);
+    return INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
+  }
+
   results = calloc(nindexes, sizeof(index_shard_result_t));
   completed = calloc(nindexes, sizeof(unsigned char));
   outer_states = calloc(nindexes, sizeof(*outer_states));
@@ -5199,6 +5749,7 @@ index_shard_solve_impl(onefield_t *bp,
     free(results);
     free(completed);
 
+    hooks->destroy_worker_view(worker_view);
     index_shard_pool_release_pass(pool);
     return INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
   }
@@ -5210,6 +5761,7 @@ index_shard_solve_impl(onefield_t *bp,
       base_sp,
       nindexes,
       hooks,
+      worker_view,
       results,
       completed,
       outer_states);
@@ -5219,6 +5771,7 @@ index_shard_solve_impl(onefield_t *bp,
     free(results);
     free(completed);
 
+    hooks->destroy_worker_view(worker_view);
     index_shard_pool_release_pass(pool);
     return INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
   }
@@ -5319,11 +5872,13 @@ index_shard_solve_impl(onefield_t *bp,
 
   logverb("[index-shard] ownership-pass generation=%lu "
           "scale_index=%zu canonical_claims=%llu "
-          "producer_width=%zu unclaimed=%zu quiescent=%i\n",
+          "producer_width=%zu helper_width=%zu "
+          "unclaimed=%zu quiescent=%i\n",
           pool->generation,
           bp->engine_scale_index,
           pool->shared.outer_claims,
           pool->shared.producer_width,
+          pool->shared.helper_width,
           pool->shared.outer_unclaimed,
           helper_quiescence_valid ? 1 : 0);
 
@@ -5515,13 +6070,14 @@ index_shard_solve_impl(onefield_t *bp,
           pool->shared.helper_owner_wait_seconds);
 
   logverb("[index-shard] context-pass generation=%lu candidates=%zu "
-          "compute_width=%i producer_width=%zu "
+          "compute_width=%i producer_width=%zu helper_width=%zu "
           "prepare_work_wall_sum=%.6f prepare_max=%.6f "
           "cleanup_work_wall_sum=%.6f cleanup_max=%.6f\n",
           pool->generation,
           nindexes,
           pool->shared.worker_count,
           pool->shared.producer_width,
+          pool->shared.helper_width,
           context_prepare_wall_seconds,
           context_prepare_max_seconds,
           context_cleanup_wall_seconds,
@@ -5534,20 +6090,15 @@ index_shard_solve_impl(onefield_t *bp,
           "resolve_work_wall_sum=%.6f "
           "reduction_ex_verify_hit_work_wall_sum=%.6f "
           "resolve_calls=%llu verify_hit_work_wall_sum=%.6f "
-          "verify_calls=%llu hypothesis_wave_elapsed_sum=%.6f "
+          "verify_calls=%llu "
           "batches=%llu completed=%llu stopped=%llu "
           "batch_failed=%llu hypotheses=%llu executed=%llu reduced=%llu "
           "task_ranges=%llu tasks_executed=%llu submitted=%llu "
           "inline=%llu parallel_batches=%llu observed_parallel=%llu "
           "parallel_hypotheses=%llu alloc_failures=%llu "
           "search_failures=%llu max_batch=%zu max_tasks=%zu "
-          "max_parallel=%zu ab_blocks_planned=%llu "
-          "ab_blocks_retired=%llu ab_blocks_owner=%llu "
-          "ab_segments_retired=%llu "
-          "ab_segment_payload_bytes=%llu ab_pairs=%llu "
-          "ab_combinations=%llu intra_pair_splits=%llu "
-          "max_pair_combinations=%llu ab_plan_wall=%.6f "
-          "helper_tasks=%llu helper_combinations=%llu "
+          "max_parallel=%zu helper_tasks=%llu "
+          "helper_combinations=%llu "
           "hypothesis_order=%016llx kd_result_order=%016llx "
           "candidate_order=%016llx\n",
           pool->generation,
@@ -5563,7 +6114,6 @@ index_shard_solve_impl(onefield_t *bp,
           solver_profile.resolve_calls,
           solver_profile.verify_wall_seconds,
           solver_profile.verify_calls,
-          solver_profile.hypothesis_wave_wall_seconds,
           solver_profile.hypothesis_batches,
           solver_profile.hypothesis_batches_completed,
           solver_profile.hypothesis_batches_stopped,
@@ -5583,16 +6133,6 @@ index_shard_solve_impl(onefield_t *bp,
           solver_profile.max_batch_hypotheses,
           solver_profile.max_task_ranges,
           solver_profile.max_parallel_ranges,
-          solver_profile.ab_blocks_planned,
-          solver_profile.ab_blocks_retired,
-          solver_profile.ab_blocks_owner,
-          solver_profile.ab_segments_retired,
-          solver_profile.ab_segment_payload_bytes,
-          solver_profile.ab_pairs_planned,
-          solver_profile.ab_combinations_planned,
-          solver_profile.ab_intra_pair_splits,
-          solver_profile.ab_max_pair_combinations,
-          solver_profile.ab_planning_wall_seconds,
           solver_profile.ab_helper_tasks,
           solver_profile.ab_helper_combinations,
           solver_profile.hypothesis_order_hash,
@@ -5602,7 +6142,7 @@ index_shard_solve_impl(onefield_t *bp,
   logverb("[index-shard] pass-detail candidates=%zu reduced=%zu "
           "hit_total_cpu_limit=%i hit_total_wall_limit=%i "
           "cancelled=%i rc=%i status=%i "
-          "master_committed=%i winner_selected=%i "
+          "master_committed=%i winner_selected=%i terminal=%s "
           "selected_order=%zu selected_sequence=%zu "
           "task_local_failures=%llu global_integrity_failures=%llu "
           "late_loser_failures=%llu\n",
@@ -5615,8 +6155,9 @@ index_shard_solve_impl(onefield_t *bp,
           (int)status,
           state.master_committed,
           state.winner_selected,
+          index_shard_terminal_cause_name(state.terminal_cause),
           state.selected_index_order,
-          state.selected_completion_sequence,
+          state.selected_candidate_sequence,
           state.task_local_failures,
           state.global_integrity_failures,
           pool->shared.late_loser_failures);
@@ -5764,7 +6305,11 @@ index_shard_solve_impl(onefield_t *bp,
   pthread_mutex_lock(&pool->shared.queue_mutex);
   pool->shared.outer_states = NULL;
   pool->shared.producer_width = 0U;
+  pool->shared.helper_width = 0U;
   pthread_mutex_unlock(&pool->shared.queue_mutex);
+  pool->shared.worker_view = NULL;
+  hooks->destroy_worker_view(worker_view);
+  worker_view = NULL;
   free(outer_states);
   index_shard_pool_release_pass(pool);
   return status;

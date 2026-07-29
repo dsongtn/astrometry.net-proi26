@@ -194,8 +194,9 @@ fitsbin_mmap_policy_t fitsbin_mmap_policy_parse(
 
 fitsbin_mmap_policy_t fitsbin_get_configured_mmap_policy(void) {
     /*
-     * W2+ shard and preparation threads install RANDOM for every mapped index
-     * chunk. Serial callers have no thread-local advice and retain NORMAL.
+     * W2+ shard and preparation threads select RANDOM for sparse payload
+     * chunks. Compact topology remains NORMAL. Serial callers have no
+     * thread-local advice and retain NORMAL throughout.
      */
     return FITSBIN_MMAP_POLICY_FIXED_RANDOM;
 }

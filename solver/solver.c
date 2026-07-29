@@ -32,15 +32,21 @@
 #include "kdtree.h"
 #include "quad-utils.h"
 #include "errors.h"
+#include "../libkd/kdtree_prefetch_internal.h"
 #include "tweak2.h"
 #include "astrometry/fitsbin.h"
-#include "../libkd/kdtree_prefetch_internal.h"
 #include "index_shard_internal.h"
 
 #ifndef SOLVER_FIELD_GEOMETRY_BUDGET_BYTES
 #define SOLVER_FIELD_GEOMETRY_BUDGET_BYTES \
     (64ULL * 1024ULL * 1024ULL)
 #endif
+
+#define SOLVER_CODEKD_SEARCH_OPTIONS \
+    (KD_OPTIONS_SMALL_RADIUS | \
+     KD_OPTIONS_COMPUTE_DISTS | \
+     KD_OPTIONS_NO_RESIZE_RESULTS | \
+     KD_OPTIONS_USE_SPLIT)
 
 static kdtree_qres_t* solver_codekd_rangesearch(
     const kdtree_t* tree,
@@ -543,8 +549,8 @@ void solver_set_field(solver_t* s, starxy_t* field) {
 
     /*
      * Reset the compatibility policy counters at the field boundary.
-     * Shard workers apply RANDOM to every mapped index chunk. Serial solving
-     * retains original NORMAL mappings.
+     * Shard workers apply RANDOM only to sparse payload chunks; compact
+     * topology and serial solving retain original NORMAL mappings.
      */
     fitsbin_mmap_advice_state_reset(
         &s->index_mmap_policy);
@@ -694,6 +700,15 @@ static void solver_execute_hypothesis_owner(
     double tol2,
     kdtree_qres_t** presult);
 
+static void solver_execute_prepared_hypothesis_owner(
+    const int* stars,
+    const double* code,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity,
+    kdtree_qres_t* result,
+    double search_wall_seconds);
+
 static void resolve_matches(kdtree_qres_t* krez,
                             const double* field,
                             const int* fstars,
@@ -738,10 +753,6 @@ void solver_profile_accumulate(solver_profile_t* total,
     total->codekd_wall_seconds += profile->codekd_wall_seconds;
     total->resolve_wall_seconds += profile->resolve_wall_seconds;
     total->verify_wall_seconds += profile->verify_wall_seconds;
-    total->hypothesis_wave_wall_seconds +=
-        profile->hypothesis_wave_wall_seconds;
-    total->ab_planning_wall_seconds +=
-        profile->ab_planning_wall_seconds;
 
     total->codekd_calls += profile->codekd_calls;
     total->codekd_hits += profile->codekd_hits;
@@ -767,20 +778,6 @@ void solver_profile_accumulate(solver_profile_t* total,
     total->parallel_hypotheses += profile->parallel_hypotheses;
     total->allocation_failures += profile->allocation_failures;
     total->search_failures += profile->search_failures;
-    total->ab_blocks_planned += profile->ab_blocks_planned;
-    total->ab_blocks_retired += profile->ab_blocks_retired;
-    total->ab_blocks_owner += profile->ab_blocks_owner;
-    total->ab_segments_retired += profile->ab_segments_retired;
-    total->ab_segment_payload_bytes +=
-        profile->ab_segment_payload_bytes;
-    total->ab_pairs_planned += profile->ab_pairs_planned;
-    total->ab_combinations_planned +=
-        profile->ab_combinations_planned;
-    total->ab_intra_pair_splits +=
-        profile->ab_intra_pair_splits;
-    total->ab_max_pair_combinations =
-        MAX(total->ab_max_pair_combinations,
-            profile->ab_max_pair_combinations);
     total->ab_helper_tasks += profile->ab_helper_tasks;
     total->ab_helper_combinations +=
         profile->ab_helper_combinations;
@@ -851,18 +848,13 @@ static void solver_profile_report(const solver_t* solver) {
            "resolve_work_wall_sum=%.6f "
            "reduction_ex_verify_hit_work_wall_sum=%.6f "
            "resolve_calls=%llu verify_hit_work_wall_sum=%.6f "
-           "verify_calls=%llu hypothesis_wave_elapsed_sum=%.6f "
+           "verify_calls=%llu "
            "hypothesis_batches=%llu parallel_batches=%llu "
            "parallel_batches_observed=%llu "
            "parallel_hypotheses=%llu "
            "task_ranges_planned=%llu task_ranges_executed=%llu "
            "task_ranges_inline=%llu allocation_failures=%llu "
            "search_failures=%llu "
-           "ab_blocks_planned=%llu ab_blocks_retired=%llu "
-           "ab_blocks_owner=%llu ab_segments_retired=%llu "
-           "ab_segment_payload_bytes=%llu ab_pairs=%llu "
-           "ab_combinations=%llu intra_pair_splits=%llu "
-           "max_pair_combinations=%llu ab_plan_wall=%.6f "
            "helper_tasks=%llu helper_combinations=%llu "
            "hypothesis_order=%016llx "
            "kd_result_order=%016llx candidate_order=%016llx\n",
@@ -877,7 +869,6 @@ static void solver_profile_report(const solver_t* solver) {
            profile->resolve_calls,
            profile->verify_wall_seconds,
            profile->verify_calls,
-           profile->hypothesis_wave_wall_seconds,
            profile->hypothesis_batches,
            profile->parallel_batches,
            profile->parallel_batches_observed,
@@ -887,16 +878,6 @@ static void solver_profile_report(const solver_t* solver) {
            profile->task_ranges_inline,
            profile->allocation_failures,
            profile->search_failures,
-           profile->ab_blocks_planned,
-           profile->ab_blocks_retired,
-           profile->ab_blocks_owner,
-           profile->ab_segments_retired,
-           profile->ab_segment_payload_bytes,
-           profile->ab_pairs_planned,
-           profile->ab_combinations_planned,
-           profile->ab_intra_pair_splits,
-           profile->ab_max_pair_combinations,
-           profile->ab_planning_wall_seconds,
            profile->ab_helper_tasks,
            profile->ab_helper_combinations,
            profile->hypothesis_order_hash,
@@ -1536,32 +1517,8 @@ static void add_stars(const pquad* pq, int* field, int fieldoffset,
     }
 }
 
-#define SOLVER_AB_BLOCKS_PER_WORKER 4U
-#ifndef SOLVER_AB_PACKET_LIMIT_BYTES
-#define SOLVER_AB_PACKET_LIMIT_BYTES (1024U * 1024U)
-#endif
-#ifndef SOLVER_AB_HYPOTHESIS_LIMIT_BYTES
-#define SOLVER_AB_HYPOTHESIS_LIMIT_BYTES (256U * 1024U)
-#endif
 #ifndef SOLVER_AB_CANDIDATE_LIMIT_BYTES
-#define SOLVER_AB_CANDIDATE_LIMIT_BYTES \
-    (SOLVER_AB_PACKET_LIMIT_BYTES - SOLVER_AB_HYPOTHESIS_LIMIT_BYTES)
-#endif
-#define SOLVER_AB_REORDER_WINDOWS_PER_WORKER 2U
-#ifndef SOLVER_AB_PLAN_CACHE_BUDGET_BYTES
-#define SOLVER_AB_PLAN_CACHE_BUDGET_BYTES \
-    (64U * 1024U * 1024U)
-#endif
-#ifndef SOLVER_AB_PACKET_CACHE_BUDGET_BYTES
-#define SOLVER_AB_PACKET_CACHE_BUDGET_BYTES \
-    (64U * 1024U * 1024U)
-#endif
-#ifndef SOLVER_AB_ELIGIBLE_CACHE_BUDGET_BYTES
-#define SOLVER_AB_ELIGIBLE_CACHE_BUDGET_BYTES \
-    (64U * 1024U * 1024U)
-#endif
-#ifndef SOLVER_AB_INLINE_PUBLISH_MAX
-#define SOLVER_AB_INLINE_PUBLISH_MAX 64U
+#define SOLVER_AB_CANDIDATE_LIMIT_BYTES (768U * 1024U)
 #endif
 #define SOLVER_AB_DESCRIPTOR_MAX_TASKS 6U
 #define SOLVER_AB_DESCRIPTOR_CAPACITY 4096U
@@ -1569,7 +1526,6 @@ static void add_stars(const pquad* pq, int* field, int fieldoffset,
 #define SOLVER_AB_DESCRIPTOR_MAX_FIELD_OBJECTS 1000
 #define SOLVER_AB_DESCRIPTOR_PAIR_CACHE_BYTES \
     (8U * 1024U * 1024U)
-#define SOLVER_AB_WAIT_NANOSECONDS 100000000L
 
 typedef enum solver_ab_phase_kind {
     SOLVER_AB_PHASE_DIAGONAL = 0,
@@ -1578,9 +1534,8 @@ typedef enum solver_ab_phase_kind {
 
 typedef enum solver_ab_phase_mode {
     SOLVER_AB_MODE_NATIVE = 0,
-    SOLVER_AB_MODE_EMPTY = 1,
-    SOLVER_AB_MODE_FLATTENED_OWNER = 2,
-    SOLVER_AB_MODE_ASSISTED = 3
+    SOLVER_AB_MODE_FLATTENED_OWNER = 1,
+    SOLVER_AB_MODE_ASSISTED = 2
 } solver_ab_phase_mode_t;
 
 typedef enum solver_ab_candidate_action {
@@ -1591,24 +1546,11 @@ typedef enum solver_ab_candidate_action {
     SOLVER_AB_CANDIDATE_VERIFY = 4
 } solver_ab_candidate_action_t;
 
-typedef enum solver_ab_task_state {
-    SOLVER_AB_TASK_PENDING = 0,
-    SOLVER_AB_TASK_RUNNING = 1,
-    SOLVER_AB_TASK_DONE = 2
-} solver_ab_task_state_t;
-
-typedef enum solver_ab_reserve_result {
-    SOLVER_AB_RESERVE_ERROR = -1,
-    SOLVER_AB_RESERVE_OK = 0,
-    SOLVER_AB_RESERVE_FULL = 1
-} solver_ab_reserve_result_t;
-
-typedef enum solver_ab_helper_state {
-    SOLVER_AB_HELPER_NEW = 0,
-    SOLVER_AB_HELPER_ACTIVE = 1,
-    SOLVER_AB_HELPER_EXITED = 2,
-    SOLVER_AB_HELPER_FAILED = 3
-} solver_ab_helper_state_t;
+typedef enum solver_packet_reserve_result {
+    SOLVER_PACKET_RESERVE_ERROR = -1,
+    SOLVER_PACKET_RESERVE_OK = 0,
+    SOLVER_PACKET_RESERVE_FULL = 1
+} solver_packet_reserve_result_t;
 
 typedef struct solver_ab_pair {
     int field_a;
@@ -1654,62 +1596,28 @@ typedef struct solver_ab_candidate {
     double quadxyz[3 * DQMAX];
 } solver_ab_candidate_t;
 
-typedef struct solver_ab_hypothesis {
-    unsigned long long numtries_delta;
-    unsigned long long cxdx_delta;
-    unsigned long long meanx_delta;
-    size_t candidate_first;
-    size_t candidate_count;
-    int nresults;
-    anbool search_failed;
-    anbool begins_hypothesis;
-    anbool ends_hypothesis;
-    uint64_t hypothesis_order_digest;
-    uint64_t kd_result_order_digest;
-    double codekd_wall_seconds;
-    double prepare_wall_seconds;
-} solver_ab_hypothesis_t;
-
-typedef struct solver_ab_packet {
-    solver_ab_hypothesis_t* hypotheses;
-    size_t hypothesis_count;
-    size_t hypothesis_capacity;
-
+typedef struct solver_verification_packet {
     solver_ab_candidate_t* candidates;
-    size_t candidate_count;
     size_t candidate_capacity;
-
-    unsigned long long trailing_numtries;
-    unsigned long long trailing_cxdx;
-    unsigned long long trailing_meanx;
-
-    size_t allocated_bytes;
     anbool allocation_failed;
+} solver_verification_packet_t;
+
+typedef struct solver_descriptor_status {
     anbool evaluation_failed;
     anbool cancelled;
-} solver_ab_packet_t;
+} solver_descriptor_status_t;
 
 typedef struct solver_ab_task {
     unsigned long long combination_first;
     unsigned long long combination_end;
-    solver_ab_task_state_t state;
-    int worker_id;
-    anbool producer_done;
 } solver_ab_task_t;
 
-typedef struct solver_ab_channel {
-    solver_ab_packet_t packet;
-    size_t task_index;
-    anbool ready;
-    anbool final;
-} solver_ab_channel_t;
+typedef struct solver_ab_descriptor_planner
+    solver_ab_descriptor_planner_t;
 
 typedef struct solver_ab_builder {
-    solver_ab_executor_t* executor;
-    solver_ab_packet_t* packet;
-    kdtree_qres_t** query_result;
-    size_t task_index;
-    int worker_id;
+    solver_ab_descriptor_planner_t* planner;
+    solver_descriptor_status_t* status;
     double tol2;
     double rel_field_noise2;
     unsigned long long pending_numtries;
@@ -1718,7 +1626,6 @@ typedef struct solver_ab_builder {
     solver_ab_descriptor_output_t* descriptor_output;
     anbool rel_field_noise_valid;
     anbool fatal_error;
-    anbool producer_completed;
 } solver_ab_builder_t;
 
 typedef struct solver_ab_snapshot {
@@ -1749,58 +1656,14 @@ typedef struct solver_ab_phase_telemetry {
     unsigned long long codekd_calls_start;
     unsigned long long codekd_hits_start;
     unsigned long long verify_calls_start;
-    unsigned long long blocks_planned_start;
-    unsigned long long blocks_retired_start;
-    unsigned long long blocks_owner_start;
-    unsigned long long segments_retired_start;
-    unsigned long long segment_payload_bytes_start;
 } solver_ab_phase_telemetry_t;
 
-typedef struct solver_ab_reduce_state {
-    anbool in_hypothesis;
-    int expected_candidates;
-    int seen_candidates;
-} solver_ab_reduce_state_t;
-
-struct solver_ab_executor {
-    pthread_mutex_t mutex;
-    pthread_cond_t work_cv;
-    pthread_cond_t done_cv;
-
-    int worker_count;
-    int bound;
-    int join_closed;
-    int stopping;
-    int fatal_error;
-    int cancel_requested;
-    int helpers_arrived;
-    int helpers_exited;
-    int helpers_failed;
-    int work_notify_inflight;
-    unsigned long long pending_allocation_failures;
-    unsigned long long pending_search_failures;
-    anbool pending_evaluation_failure;
-    unsigned char* helper_state;
-    void (*work_notify)(void*);
-    int (*available_lenders)(void*);
-    void* work_notify_opaque;
-    anbool detailed;
-    anbool starkd_initializing;
-    anbool starkd_ready;
-
-    unsigned long generation;
-    anbool phase_active;
-
-    solver_t* owner;
-    index_t* index;
+struct solver_ab_descriptor_planner {
     solver_ab_snapshot_t snapshot;
-    anbool snapshot_ready;
     const solver_field_geometry_t* field_geometry;
     int newpoint;
     int dimquads;
     solver_ab_phase_kind_t phase;
-    double min_ab2;
-    double max_ab2;
 
     solver_ab_pair_t* pairs;
     size_t pair_count;
@@ -1809,180 +1672,10 @@ struct solver_ab_executor {
     size_t pair_cache_capacity;
     size_t pair_cache_limit_bytes;
     anbool pairs_transient;
-    solver_ab_task_t* tasks;
-    size_t task_count;
-    size_t task_capacity;
-    solver_ab_task_t* task_cache;
-    size_t task_cache_capacity;
-    size_t task_cache_limit_bytes;
-    size_t packet_cache_limit_bytes;
-    size_t eligible_cache_limit_bytes;
-    anbool tasks_transient;
-    unsigned long long pair_cache_grows;
-    unsigned long long pair_cache_reuses;
-    unsigned long long task_cache_grows;
-    unsigned long long task_cache_reuses;
-    unsigned long long plan_transient_allocations;
-    size_t plan_transient_peak_bytes;
-    unsigned long long index_epochs_started;
-    unsigned long long index_epochs_quiesced;
-    unsigned long long owner_query_reuses;
-    unsigned long long packet_cache_trims;
-    unsigned long long eligible_cache_trims;
-    size_t next_task;
-    size_t next_reduce;
-    size_t reorder_window;
-    size_t remaining_tasks;
 
-    kdtree_qres_t** query_results;
-    int** combination_eligible;
-    size_t* combination_eligible_capacity;
-    solver_ab_channel_t* channels;
-    solver_ab_packet_t drain_packet;
+    int* combination_eligible;
+    size_t combination_eligible_capacity;
 };
-
-static void solver_ab_executor_notify_work(
-    solver_ab_executor_t* executor);
-
-/*
- * startree_get() lazily builds the index-owned inverse permutation on its
- * first real StarKD lookup. Parallel AB evaluation must retain that laziness
- * while ensuring that exactly one worker performs the construction.
- *
- * Initialization is scientific-state neutral and publishes an immutable
- * vector. The first real hit may therefore initialize it from any canonical
- * work packet; retirement order continues to be enforced independently.
- */
-static int solver_ab_ensure_starkd_ready(
-    solver_ab_executor_t* executor,
-    int worker_id,
-    size_t task_index) {
-    startree_t* starkd;
-    const char* index_name = NULL;
-    int rc = 0;
-
-    if (!executor ||
-        worker_id < 0 ||
-        worker_id >= executor->worker_count) {
-        return -1;
-    }
-
-    pthread_mutex_lock(&executor->mutex);
-    while (TRUE) {
-        if (executor->stopping ||
-            __atomic_load_n(
-                &executor->cancel_requested,
-                __ATOMIC_ACQUIRE)) {
-            pthread_mutex_unlock(&executor->mutex);
-            return 1;
-        }
-        if (executor->fatal_error ||
-            !executor->bound ||
-            !executor->index ||
-            !executor->index->starkd ||
-            !executor->index->starkd->tree) {
-            pthread_mutex_unlock(&executor->mutex);
-            return -1;
-        }
-        starkd = executor->index->starkd;
-        if (executor->starkd_ready) {
-            pthread_mutex_unlock(&executor->mutex);
-            return 0;
-        }
-        if (!starkd->tree->perm ||
-            starkd->inverse_perm) {
-            executor->starkd_ready = TRUE;
-            pthread_mutex_unlock(&executor->mutex);
-            return 0;
-        }
-        if (executor->starkd_initializing) {
-            pthread_cond_wait(
-                &executor->done_cv,
-                &executor->mutex);
-            continue;
-        }
-        executor->starkd_initializing = TRUE;
-        index_name = executor->index->indexname;
-        break;
-    }
-    pthread_mutex_unlock(&executor->mutex);
-
-    logverb(
-        "[solver-ab] starkd-inverse-init state=start "
-        "index=%s worker=%i task=%zu\n",
-        index_name ? index_name : "(unnamed)",
-        worker_id,
-        task_index);
-
-    /* The universal StarKD lifecycle owns exact-PERM-range advice. */
-    startree_compute_inverse_perm(starkd);
-    if (!starkd->inverse_perm) {
-        rc = -1;
-    }
-
-    logverb(
-        "[solver-ab] starkd-inverse-init state=%s "
-        "index=%s worker=%i task=%zu\n",
-        rc ? "failed" : "ready",
-        index_name ? index_name : "(unnamed)",
-        worker_id,
-        task_index);
-
-    pthread_mutex_lock(&executor->mutex);
-    executor->starkd_initializing = FALSE;
-    if (rc) {
-        executor->fatal_error = TRUE;
-        __atomic_store_n(
-            &executor->cancel_requested,
-            TRUE,
-            __ATOMIC_RELEASE);
-    } else {
-        executor->starkd_ready = TRUE;
-    }
-    pthread_cond_broadcast(&executor->done_cv);
-    pthread_cond_broadcast(&executor->work_cv);
-    pthread_mutex_unlock(&executor->mutex);
-    return rc;
-}
-
-static int solver_ab_capture_snapshot(
-    solver_ab_executor_t* executor,
-    const solver_t* solver) {
-    solver_ab_snapshot_t* snapshot;
-
-    if (!executor || !solver || !executor->index ||
-        !solver->fieldxy) {
-        return -1;
-    }
-    if (executor->snapshot_ready) {
-        return 0;
-    }
-
-    snapshot = &executor->snapshot;
-    memset(snapshot, 0, sizeof(*snapshot));
-    snapshot->index = executor->index;
-    snapshot->fieldxy = solver->fieldxy;
-    snapshot->use_radec = solver->use_radec;
-    snapshot->cx_less_than_dx =
-        executor->index->cx_less_than_dx;
-    snapshot->meanx_less_than_half =
-        executor->index->meanx_less_than_half;
-    snapshot->parity = solver->parity;
-    memcpy(
-        snapshot->centerxyz,
-        solver->centerxyz,
-        sizeof(snapshot->centerxyz));
-    snapshot->r2 = solver->r2;
-    snapshot->abscale_low = solver->abscale_low;
-    snapshot->abscale_high = solver->abscale_high;
-    snapshot->funits_lower = solver->funits_lower;
-    snapshot->funits_upper = solver->funits_upper;
-    snapshot->cxdx_margin = solver->cxdx_margin;
-    snapshot->codetol = solver->codetol;
-    snapshot->rel_index_noise2 = solver->rel_index_noise2;
-    executor->snapshot_ready = TRUE;
-    return 0;
-}
 
 static uint64_t solver_order_hash_mix(
     uint64_t state,
@@ -2095,6 +1788,39 @@ static void solver_record_candidate_order(
             digest);
 }
 
+static anbool solver_ab_poll_phase_stop(
+    solver_t* solver,
+    time_t* next_timer_callback_time) {
+    time_t delay;
+    time_t now;
+
+    if (solver->quit_now ||
+        solver_poll_worker_stop(solver)) {
+        return TRUE;
+    }
+    if (!solver->timer_callback ||
+        !next_timer_callback_time) {
+        return FALSE;
+    }
+    now = time(NULL);
+    if (now <= *next_timer_callback_time) {
+        return FALSE;
+    }
+    update_timeused(solver);
+    delay = solver->timer_callback(solver->userdata);
+    if (!delay || solver->quit_now) {
+        solver->quit_now = TRUE;
+        return TRUE;
+    }
+    *next_timer_callback_time = now + delay;
+    return FALSE;
+}
+
+/*
+ * Descriptor planning is index-free. A synchronous packet may borrow a const
+ * CodeKD tree view; QuadFile, StarKD, lazy index initialization, verification,
+ * counters, callbacks, and reducer state remain owner-local.
+ */
 static double solver_ab_timeval_seconds(
     const struct timeval* value) {
     return (double)value->tv_sec +
@@ -2124,16 +1850,6 @@ static void solver_ab_phase_telemetry_begin(
         solver->profile.codekd_hits;
     telemetry->verify_calls_start =
         solver->profile.verify_calls;
-    telemetry->blocks_planned_start =
-        solver->profile.ab_blocks_planned;
-    telemetry->blocks_retired_start =
-        solver->profile.ab_blocks_retired;
-    telemetry->blocks_owner_start =
-        solver->profile.ab_blocks_owner;
-    telemetry->segments_retired_start =
-        solver->profile.ab_segments_retired;
-    telemetry->segment_payload_bytes_start =
-        solver->profile.ab_segment_payload_bytes;
 }
 
 static void solver_ab_phase_telemetry_report(
@@ -2175,9 +1891,6 @@ static void solver_ab_phase_telemetry_report(
     logverb("[solver-ab-phase] index=%s object=%i phase=%s mode=%s "
             "combinations=%llu codekd_queries=%llu codekd_hits=%llu "
             "candidates=%llu verifications=%llu "
-            "blocks_planned=%llu blocks_retired=%llu "
-            "blocks_owner=%llu segments_retired=%llu "
-            "segment_payload_bytes=%llu "
             "wall=%.6f user=%.6f system=%.6f "
             "major_faults=%ld resource=%s "
             "hypothesis_order=%016llx kd_result_order=%016llx "
@@ -2191,9 +1904,7 @@ static void solver_ab_phase_telemetry_report(
                 ? "assisted"
                 : (mode == SOLVER_AB_MODE_FLATTENED_OWNER
                     ? "flattened-owner"
-                    : (mode == SOLVER_AB_MODE_EMPTY
-                        ? "empty"
-                        : "native")),
+                    : "native"),
             (unsigned long long)(
                 solver->numtries -
                 telemetry->combinations_start),
@@ -2206,16 +1917,6 @@ static void solver_ab_phase_telemetry_report(
                 telemetry->candidates_start),
             solver->profile.verify_calls -
                 telemetry->verify_calls_start,
-            solver->profile.ab_blocks_planned -
-                telemetry->blocks_planned_start,
-            solver->profile.ab_blocks_retired -
-                telemetry->blocks_retired_start,
-            solver->profile.ab_blocks_owner -
-                telemetry->blocks_owner_start,
-            solver->profile.ab_segments_retired -
-                telemetry->segments_retired_start,
-            solver->profile.ab_segment_payload_bytes -
-                telemetry->segment_payload_bytes_start,
             monotonic_seconds() - telemetry->wall_start,
             user_seconds,
             system_seconds,
@@ -2260,60 +1961,9 @@ static unsigned long long solver_ab_saturating_choose(int n, int k) {
     return result;
 }
 
-static solver_ab_reserve_result_t
-solver_ab_packet_reserve_hypotheses(
-    solver_ab_packet_t* packet,
-    size_t required) {
-    solver_ab_hypothesis_t* resized;
-    size_t capacity;
-    size_t max_capacity =
-        SOLVER_AB_HYPOTHESIS_LIMIT_BYTES / sizeof(*resized);
-    size_t bytes;
-
-    if (required <= packet->hypothesis_capacity) {
-        return SOLVER_AB_RESERVE_OK;
-    }
-    if (required > max_capacity || !max_capacity) {
-        return SOLVER_AB_RESERVE_FULL;
-    }
-    capacity = packet->hypothesis_capacity ?
-        packet->hypothesis_capacity : MIN(16U, max_capacity);
-    while (capacity < required) {
-        if (capacity > SIZE_MAX / 2U) {
-            packet->allocation_failed = TRUE;
-            return SOLVER_AB_RESERVE_ERROR;
-        }
-        if (capacity > max_capacity / 2U) {
-            capacity = max_capacity;
-        } else {
-            capacity *= 2U;
-        }
-    }
-    if (capacity > SIZE_MAX / sizeof(*resized)) {
-        packet->allocation_failed = TRUE;
-        return SOLVER_AB_RESERVE_ERROR;
-    }
-    bytes = capacity * sizeof(*resized);
-    if (bytes > SOLVER_AB_HYPOTHESIS_LIMIT_BYTES) {
-        return SOLVER_AB_RESERVE_FULL;
-    }
-
-    resized = realloc(packet->hypotheses, bytes);
-    if (!resized) {
-        packet->allocation_failed = TRUE;
-        return SOLVER_AB_RESERVE_ERROR;
-    }
-    packet->hypotheses = resized;
-    packet->hypothesis_capacity = capacity;
-    packet->allocated_bytes =
-        bytes +
-        packet->candidate_capacity * sizeof(*packet->candidates);
-    return SOLVER_AB_RESERVE_OK;
-}
-
-static solver_ab_reserve_result_t
-solver_ab_packet_reserve_candidates(
-    solver_ab_packet_t* packet,
+static solver_packet_reserve_result_t
+solver_verification_packet_reserve(
+    solver_verification_packet_t* packet,
     size_t required) {
     solver_ab_candidate_t* resized;
     size_t capacity;
@@ -2322,17 +1972,17 @@ solver_ab_packet_reserve_candidates(
     size_t bytes;
 
     if (required <= packet->candidate_capacity) {
-        return SOLVER_AB_RESERVE_OK;
+        return SOLVER_PACKET_RESERVE_OK;
     }
     if (required > max_capacity || !max_capacity) {
-        return SOLVER_AB_RESERVE_FULL;
+        return SOLVER_PACKET_RESERVE_FULL;
     }
     capacity = packet->candidate_capacity ?
         packet->candidate_capacity : MIN(16U, max_capacity);
     while (capacity < required) {
         if (capacity > SIZE_MAX / 2U) {
             packet->allocation_failed = TRUE;
-            return SOLVER_AB_RESERVE_ERROR;
+            return SOLVER_PACKET_RESERVE_ERROR;
         }
         if (capacity > max_capacity / 2U) {
             capacity = max_capacity;
@@ -2342,182 +1992,35 @@ solver_ab_packet_reserve_candidates(
     }
     if (capacity > SIZE_MAX / sizeof(*resized)) {
         packet->allocation_failed = TRUE;
-        return SOLVER_AB_RESERVE_ERROR;
+        return SOLVER_PACKET_RESERVE_ERROR;
     }
     bytes = capacity * sizeof(*resized);
     if (bytes > SOLVER_AB_CANDIDATE_LIMIT_BYTES) {
-        return SOLVER_AB_RESERVE_FULL;
+        return SOLVER_PACKET_RESERVE_FULL;
     }
 
     resized = realloc(packet->candidates, bytes);
     if (!resized) {
         packet->allocation_failed = TRUE;
-        return SOLVER_AB_RESERVE_ERROR;
+        return SOLVER_PACKET_RESERVE_ERROR;
     }
     packet->candidates = resized;
     packet->candidate_capacity = capacity;
-    packet->allocated_bytes =
-        packet->hypothesis_capacity * sizeof(*packet->hypotheses) +
-        bytes;
-    return SOLVER_AB_RESERVE_OK;
+    return SOLVER_PACKET_RESERVE_OK;
 }
 
-static void solver_ab_packet_reset(
-    solver_ab_packet_t* packet) {
-    packet->hypothesis_count = 0U;
-    packet->candidate_count = 0U;
-    packet->trailing_numtries = 0U;
-    packet->trailing_cxdx = 0U;
-    packet->trailing_meanx = 0U;
-    packet->allocation_failed = FALSE;
-    packet->evaluation_failed = FALSE;
-    packet->cancelled = FALSE;
-}
-
-static anbool solver_ab_packet_has_events(
-    const solver_ab_packet_t* packet) {
-    return packet->hypothesis_count > 0U ||
-        packet->trailing_numtries > 0U ||
-        packet->trailing_cxdx > 0U ||
-        packet->trailing_meanx > 0U ||
-        packet->allocation_failed ||
-        packet->evaluation_failed ||
-        packet->cancelled;
-}
-
-static void solver_ab_packet_free(solver_ab_packet_t* packet) {
+static void solver_verification_packet_free(solver_verification_packet_t* packet) {
     if (!packet) {
         return;
     }
-    free(packet->hypotheses);
     free(packet->candidates);
     memset(packet, 0, sizeof(*packet));
 }
 
 static anbool solver_ab_cancelled(
-    const solver_ab_executor_t* executor) {
-    if (__atomic_load_n(
-            &executor->cancel_requested,
-            __ATOMIC_ACQUIRE)) {
-        return TRUE;
-    }
+    const solver_ab_descriptor_planner_t* executor) {
+    (void)executor;
     return index_shard_worker_stop_requested();
-}
-
-static void solver_ab_complete_task_locked(
-    solver_ab_executor_t* executor,
-    size_t task_index) {
-    solver_ab_task_t* task = &executor->tasks[task_index];
-
-    if (task->producer_done) {
-        return;
-    }
-    task->producer_done = TRUE;
-    task->state = SOLVER_AB_TASK_DONE;
-    if (executor->remaining_tasks > 0U) {
-        executor->remaining_tasks--;
-    } else {
-        logerr(
-            "[solver-ab] task completion underflow for block %zu\n",
-            task_index);
-        executor->fatal_error = TRUE;
-        __atomic_store_n(
-            &executor->cancel_requested,
-            TRUE,
-            __ATOMIC_RELEASE);
-    }
-}
-
-static void solver_ab_stage_pending_deltas(
-    solver_ab_builder_t* builder) {
-    builder->packet->trailing_numtries +=
-        builder->pending_numtries;
-    builder->packet->trailing_cxdx +=
-        builder->pending_cxdx;
-    builder->packet->trailing_meanx +=
-        builder->pending_meanx;
-    builder->pending_numtries = 0U;
-    builder->pending_cxdx = 0U;
-    builder->pending_meanx = 0U;
-}
-
-static int solver_ab_publish_segment(
-    solver_ab_builder_t* builder,
-    anbool final) {
-    solver_ab_executor_t* executor = builder->executor;
-    solver_ab_channel_t* channel =
-        &executor->channels[builder->worker_id];
-
-    solver_ab_stage_pending_deltas(builder);
-    if (!final &&
-        !solver_ab_packet_has_events(builder->packet)) {
-        return 0;
-    }
-
-    pthread_mutex_lock(&executor->mutex);
-    if (channel->ready ||
-        channel->task_index != builder->task_index ||
-        executor->tasks[builder->task_index].state !=
-            SOLVER_AB_TASK_RUNNING) {
-        logerr(
-            "[solver-ab] invalid publish state for block %zu "
-            "worker %i\n",
-            builder->task_index,
-            builder->worker_id);
-        executor->fatal_error = TRUE;
-        __atomic_store_n(
-            &executor->cancel_requested,
-            TRUE,
-            __ATOMIC_RELEASE);
-        solver_ab_complete_task_locked(
-            executor,
-            builder->task_index);
-        builder->producer_completed = TRUE;
-        pthread_cond_broadcast(&executor->done_cv);
-        pthread_cond_broadcast(&executor->work_cv);
-        pthread_mutex_unlock(&executor->mutex);
-        return -1;
-    }
-
-    channel->final = final;
-    channel->ready = TRUE;
-    pthread_cond_broadcast(&executor->done_cv);
-    while (channel->ready &&
-           !executor->stopping &&
-           !__atomic_load_n(
-               &executor->cancel_requested,
-               __ATOMIC_ACQUIRE)) {
-        pthread_cond_wait(
-            &executor->work_cv,
-            &executor->mutex);
-    }
-
-    if (channel->ready) {
-        channel->ready = FALSE;
-        channel->final = FALSE;
-        solver_ab_packet_reset(&channel->packet);
-    }
-    if (executor->stopping ||
-        __atomic_load_n(
-            &executor->cancel_requested,
-            __ATOMIC_ACQUIRE)) {
-        solver_ab_complete_task_locked(
-            executor,
-            builder->task_index);
-        builder->producer_completed = TRUE;
-        pthread_cond_broadcast(&executor->done_cv);
-        pthread_mutex_unlock(&executor->mutex);
-        return -1;
-    }
-    if (final) {
-        solver_ab_complete_task_locked(
-            executor,
-            builder->task_index);
-        builder->producer_completed = TRUE;
-        pthread_cond_broadcast(&executor->done_cv);
-    }
-    pthread_mutex_unlock(&executor->mutex);
-    return 0;
 }
 
 static int solver_ab_candidate_prepare(
@@ -2657,8 +2160,8 @@ static int solver_ab_record_descriptor(
         output->descriptor_count >=
             SOLVER_AB_DESCRIPTOR_CAPACITY) {
         builder->fatal_error = TRUE;
-        if (builder->packet) {
-            builder->packet->evaluation_failed = TRUE;
+        if (builder->status) {
+            builder->status->evaluation_failed = TRUE;
         }
         return -1;
     }
@@ -2692,220 +2195,19 @@ static int solver_ab_record_hypothesis(
     const double* code,
     int dimquad,
     anbool current_parity) {
-    solver_ab_executor_t* executor = builder->executor;
-    solver_ab_packet_t* packet = builder->packet;
-    solver_ab_hypothesis_t* hypothesis;
-    double field_xy[DQMAX * 2];
-    double search_start = 0.0;
-    double prepare_start = 0.0;
-    solver_ab_reserve_result_t reserve_result;
-    int nresults;
-    int options =
-        KD_OPTIONS_SMALL_RADIUS |
-        KD_OPTIONS_COMPUTE_DISTS |
-        KD_OPTIONS_NO_RESIZE_RESULTS |
-        KD_OPTIONS_USE_SPLIT;
-    int i;
-
-    if (solver_ab_cancelled(executor)) {
-        packet->cancelled = TRUE;
-        return -1;
-    }
-    if (builder->descriptor_output) {
-        return solver_ab_record_descriptor(
-            builder,
-            stars,
-            code,
-            dimquad,
-            current_parity);
-    }
-    reserve_result = solver_ab_packet_reserve_hypotheses(
-        packet,
-        packet->hypothesis_count + 1U);
-    if (reserve_result == SOLVER_AB_RESERVE_FULL) {
-        if (solver_ab_publish_segment(builder, FALSE)) {
-            return -1;
+    if (!builder || !builder->status ||
+        index_shard_worker_stop_requested()) {
+        if (builder && builder->status) {
+            builder->status->cancelled = TRUE;
         }
-        reserve_result = solver_ab_packet_reserve_hypotheses(
-            packet,
-            packet->hypothesis_count + 1U);
-    }
-    if (reserve_result != SOLVER_AB_RESERVE_OK) {
-        packet->allocation_failed = TRUE;
-        builder->fatal_error = TRUE;
         return -1;
     }
-
-    hypothesis = &packet->hypotheses[
-        packet->hypothesis_count++];
-    memset(hypothesis, 0, sizeof(*hypothesis));
-    hypothesis->begins_hypothesis = TRUE;
-    hypothesis->numtries_delta = builder->pending_numtries;
-    hypothesis->cxdx_delta = builder->pending_cxdx;
-    hypothesis->meanx_delta = builder->pending_meanx;
-    builder->pending_numtries = 0;
-    builder->pending_cxdx = 0;
-    builder->pending_meanx = 0;
-    if (executor->detailed) {
-        hypothesis->hypothesis_order_digest =
-            solver_hypothesis_order_digest(
-                stars,
-                code,
-                dimquad,
-                current_parity);
-    }
-
-#if defined(TESTING_TRYPERMUTATIONS)
-    /*
-     * Route the exact-order unit test through the real packet-producing
-     * evaluator without requiring a synthetic CodeKD. Production builds
-     * continue directly into the native range search below.
-     */
-    TEST_TRY_PERMUTATIONS(
-        (int*)stars,
-        (double*)code,
+    return solver_ab_record_descriptor(
+        builder,
+        stars,
+        code,
         dimquad,
-        executor->owner);
-    hypothesis->ends_hypothesis = TRUE;
-    return 0;
-#endif
-
-    if (executor->detailed) {
-        search_start = monotonic_seconds();
-    }
-    *builder->query_result =
-        solver_codekd_rangesearch(
-            executor->snapshot.index->codekd->tree,
-            *builder->query_result,
-            code,
-            builder->tol2,
-            options);
-    if (executor->detailed) {
-        hypothesis->codekd_wall_seconds =
-            monotonic_seconds() - search_start;
-    }
-
-    if (!*builder->query_result) {
-        hypothesis->search_failed = TRUE;
-        hypothesis->ends_hypothesis = TRUE;
-        builder->fatal_error = TRUE;
-        return -1;
-    }
-    if (executor->detailed) {
-        hypothesis->kd_result_order_digest =
-            solver_kd_result_order_digest(
-                *builder->query_result);
-    }
-    nresults = (*builder->query_result)->nres;
-    hypothesis->nresults = nresults;
-    hypothesis->candidate_first = packet->candidate_count;
-
-    if (!nresults) {
-        hypothesis->ends_hypothesis = TRUE;
-        return 0;
-    }
-    {
-        int starkd_status =
-            solver_ab_ensure_starkd_ready(
-                executor,
-                builder->worker_id,
-                builder->task_index);
-
-        if (starkd_status > 0) {
-            packet->cancelled = TRUE;
-            hypothesis->ends_hypothesis = TRUE;
-            return -1;
-        }
-        if (starkd_status < 0) {
-            logerr("[solver-ab] failed to initialize StarKD lookup state\n");
-            packet->allocation_failed = TRUE;
-            hypothesis->ends_hypothesis = TRUE;
-            builder->fatal_error = TRUE;
-            return -1;
-        }
-    }
-
-    for (i = 0; i < dimquad; i++) {
-        setx(field_xy, i,
-             starxy_getx(executor->snapshot.fieldxy, stars[i]));
-        sety(field_xy, i,
-             starxy_gety(executor->snapshot.fieldxy, stars[i]));
-    }
-    if (executor->detailed) {
-        prepare_start = monotonic_seconds();
-    }
-    for (i = 0; i < nresults; i++) {
-        solver_ab_candidate_t* candidate;
-
-        if (solver_ab_cancelled(executor)) {
-            packet->cancelled = TRUE;
-            return -1;
-        }
-        reserve_result = solver_ab_packet_reserve_candidates(
-            packet,
-            packet->candidate_count + 1U);
-        if (reserve_result == SOLVER_AB_RESERVE_FULL) {
-            if (executor->detailed) {
-                hypothesis->prepare_wall_seconds +=
-                    monotonic_seconds() - prepare_start;
-            }
-            hypothesis->candidate_count =
-                packet->candidate_count -
-                hypothesis->candidate_first;
-            if (solver_ab_publish_segment(builder, FALSE)) {
-                return -1;
-            }
-            reserve_result =
-                solver_ab_packet_reserve_hypotheses(
-                    packet,
-                    1U);
-            if (reserve_result != SOLVER_AB_RESERVE_OK) {
-                packet->allocation_failed = TRUE;
-                builder->fatal_error = TRUE;
-                return -1;
-            }
-            hypothesis =
-                &packet->hypotheses[packet->hypothesis_count++];
-            memset(hypothesis, 0, sizeof(*hypothesis));
-            hypothesis->candidate_first =
-                packet->candidate_count;
-            if (executor->detailed) {
-                prepare_start = monotonic_seconds();
-            }
-            reserve_result =
-                solver_ab_packet_reserve_candidates(
-                    packet,
-                    packet->candidate_count + 1U);
-        }
-        if (reserve_result != SOLVER_AB_RESERVE_OK) {
-            packet->allocation_failed = TRUE;
-            builder->fatal_error = TRUE;
-            return -1;
-        }
-        candidate =
-            &packet->candidates[packet->candidate_count++];
-        if (solver_ab_candidate_prepare(
-                candidate,
-                *builder->query_result,
-                i,
-                field_xy,
-                stars,
-                dimquad,
-                &executor->snapshot,
-                current_parity)) {
-            packet->evaluation_failed = TRUE;
-            builder->fatal_error = TRUE;
-            return -1;
-        }
-    }
-    if (executor->detailed) {
-        hypothesis->prepare_wall_seconds +=
-            monotonic_seconds() - prepare_start;
-    }
-    hypothesis->candidate_count =
-        packet->candidate_count - hypothesis->candidate_first;
-    hypothesis->ends_hypothesis = TRUE;
-    return 0;
+        current_parity);
 }
 
 static void solver_ab_try_permutations(
@@ -2919,7 +2221,7 @@ static void solver_ab_try_permutations(
     int slot,
     anbool* placed) {
     const solver_ab_snapshot_t* snapshot =
-        &builder->executor->snapshot;
+        &builder->planner->snapshot;
     double mycode[DCMAX];
     int nstars = dimquad - NBACK;
     int lastslot = dimquad - NBACK - 1;
@@ -2929,10 +2231,10 @@ static void solver_ab_try_permutations(
         code = mycode;
     }
     if (slot >= DCMAX / 2 ||
-        solver_ab_cancelled(builder->executor) ||
+        solver_ab_cancelled(builder->planner) ||
         builder->fatal_error) {
-        if (solver_ab_cancelled(builder->executor)) {
-            builder->packet->cancelled = TRUE;
+        if (solver_ab_cancelled(builder->planner)) {
+            builder->status->cancelled = TRUE;
         }
         return;
     }
@@ -2982,7 +2284,7 @@ static void solver_ab_try_permutations(
                 placed);
             placed[i] = FALSE;
             if (builder->fatal_error ||
-                builder->packet->cancelled) {
+                builder->status->cancelled) {
                 return;
             }
         } else if (solver_ab_record_hypothesis(
@@ -3022,7 +2324,7 @@ static void solver_ab_try_all_codes_2(
         0,
         placed);
     if (builder->fatal_error ||
-        builder->packet->cancelled) {
+        builder->status->cancelled) {
         return;
     }
 
@@ -3052,9 +2354,9 @@ static void solver_ab_try_all_codes(
     int dimquad,
     solver_ab_builder_t* builder) {
     const solver_field_geometry_t* geometry =
-        builder->executor->field_geometry;
+        builder->planner->field_geometry;
     const solver_ab_snapshot_t* snapshot =
-        &builder->executor->snapshot;
+        &builder->planner->snapshot;
     double code[DCMAX];
     double flipcode[DCMAX];
     int dimcode = (dimquad - 2) * 2;
@@ -3071,7 +2373,7 @@ static void solver_ab_try_all_codes(
                 &code[2 * i],
                 &code[2 * i + 1])) {
             builder->fatal_error = TRUE;
-            builder->packet->evaluation_failed = TRUE;
+            builder->status->evaluation_failed = TRUE;
             return;
         }
     }
@@ -3086,7 +2388,7 @@ static void solver_ab_try_all_codes(
             FALSE);
     }
     if (builder->fatal_error ||
-        builder->packet->cancelled) {
+        builder->status->cancelled) {
         return;
     }
     if (snapshot->parity == PARITY_FLIP ||
@@ -3184,51 +2486,18 @@ static anbool solver_ab_next_combination(
     return FALSE;
 }
 
-static int* solver_ab_reserve_eligible_workspace(
-    solver_ab_executor_t* executor,
-    int worker_id,
-    size_t required) {
-    int* resized;
-    size_t capacity;
-
-    if (!executor ||
-        worker_id < 0 ||
-        worker_id >= executor->worker_count ||
-        !executor->combination_eligible ||
-        !executor->combination_eligible_capacity ||
-        required > SIZE_MAX / sizeof(*resized)) {
-        return NULL;
-    }
-    capacity =
-        executor->combination_eligible_capacity[worker_id];
-    if (capacity >= required) {
-        return executor->combination_eligible[worker_id];
-    }
-    resized = realloc(
-        executor->combination_eligible[worker_id],
-        required * sizeof(*resized));
-    if (!resized) {
-        return NULL;
-    }
-    executor->combination_eligible[worker_id] = resized;
-    executor->combination_eligible_capacity[worker_id] =
-        required;
-    return resized;
-}
-
 static int* solver_ab_get_eligible_workspace(
-    solver_ab_executor_t* executor,
-    int worker_id,
+    solver_ab_descriptor_planner_t* planner,
     size_t required) {
-    return solver_ab_reserve_eligible_workspace(
-        executor,
-        worker_id,
-        required);
+    if (!planner || !planner->combination_eligible ||
+        required > planner->combination_eligible_capacity) {
+        return NULL;
+    }
+    return planner->combination_eligible;
 }
 
 static int solver_ab_visit_pair_range(
-    solver_ab_executor_t* executor,
-    int worker_id,
+    solver_ab_descriptor_planner_t* executor,
     const solver_ab_pair_t* pair,
     const solver_pair_geometry_t* pair_geometry,
     unsigned long long local_first,
@@ -3276,7 +2545,6 @@ static int solver_ab_visit_pair_range(
     }
     eligible = solver_ab_get_eligible_workspace(
         executor,
-        worker_id,
         (size_t)executor->newpoint);
     if (!eligible) {
         return -1;
@@ -3363,8 +2631,8 @@ static anbool solver_ab_builder_visit(
     void* opaque) {
     solver_ab_builder_t* builder = opaque;
 
-    if (solver_ab_cancelled(builder->executor)) {
-        builder->packet->cancelled = TRUE;
+    if (solver_ab_cancelled(builder->planner)) {
+        builder->status->cancelled = TRUE;
         return TRUE;
     }
     solver_ab_try_all_codes(
@@ -3375,12 +2643,11 @@ static anbool solver_ab_builder_visit(
         dimquad,
         builder);
     return builder->fatal_error ||
-        builder->packet->cancelled;
+        builder->status->cancelled;
 }
 
 typedef int (*solver_ab_pair_range_visitor_t)(
-    solver_ab_executor_t* executor,
-    int worker_id,
+    solver_ab_descriptor_planner_t* executor,
     const solver_ab_pair_t* pair,
     const solver_pair_geometry_t* pair_geometry,
     unsigned long long local_first,
@@ -3388,9 +2655,8 @@ typedef int (*solver_ab_pair_range_visitor_t)(
     void* opaque);
 
 static int solver_ab_walk_task_ranges(
-    solver_ab_executor_t* executor,
+    solver_ab_descriptor_planner_t* executor,
     const solver_ab_task_t* task,
-    int worker_id,
     solver_ab_pair_range_visitor_t visitor,
     void* opaque) {
     unsigned long long cursor;
@@ -3443,7 +2709,6 @@ static int solver_ab_walk_task_ranges(
         }
         visit_result = visitor(
             executor,
-            worker_id,
             pair,
             pair_geometry,
             cursor - pair->combination_first,
@@ -3458,8 +2723,7 @@ static int solver_ab_walk_task_ranges(
 }
 
 static int solver_ab_builder_visit_pair_range(
-    solver_ab_executor_t* executor,
-    int worker_id,
+    solver_ab_descriptor_planner_t* executor,
     const solver_ab_pair_t* pair,
     const solver_pair_geometry_t* pair_geometry,
     unsigned long long local_first,
@@ -3468,7 +2732,7 @@ static int solver_ab_builder_visit_pair_range(
     solver_ab_builder_t* builder = opaque;
 
     if (solver_ab_cancelled(executor)) {
-        builder->packet->cancelled = TRUE;
+        builder->status->cancelled = TRUE;
         return 1;
     }
     builder->tol2 = pair->tol2;
@@ -3477,173 +2741,12 @@ static int solver_ab_builder_visit_pair_range(
     builder->rel_field_noise_valid = TRUE;
     return solver_ab_visit_pair_range(
         executor,
-        worker_id,
         pair,
         pair_geometry,
         local_first,
         local_end,
         solver_ab_builder_visit,
         builder);
-}
-
-static int solver_ab_evaluate_task(
-    solver_ab_executor_t* executor,
-    size_t task_index,
-    int worker_id) {
-    solver_ab_task_t* task = &executor->tasks[task_index];
-    solver_ab_channel_t* channel =
-        &executor->channels[worker_id];
-    solver_ab_builder_t builder;
-    int visit_result;
-
-    memset(&builder, 0, sizeof(builder));
-    builder.executor = executor;
-    builder.packet = &channel->packet;
-    builder.query_result =
-        &executor->query_results[worker_id];
-    builder.task_index = task_index;
-    builder.worker_id = worker_id;
-
-    visit_result = solver_ab_walk_task_ranges(
-        executor,
-        task,
-        worker_id,
-        solver_ab_builder_visit_pair_range,
-        &builder);
-    if (visit_result < 0) {
-        builder.fatal_error = TRUE;
-        builder.packet->evaluation_failed = TRUE;
-    }
-    if (builder.fatal_error ||
-        builder.packet->evaluation_failed ||
-        builder.packet->allocation_failed) {
-        size_t hypothesis_index;
-        unsigned long long search_failures = 0U;
-
-        for (hypothesis_index = 0U;
-             hypothesis_index <
-                 builder.packet->hypothesis_count;
-             hypothesis_index++) {
-            if (builder.packet
-                    ->hypotheses[hypothesis_index]
-                    .search_failed) {
-                search_failures++;
-            }
-        }
-        pthread_mutex_lock(&executor->mutex);
-        if (builder.packet->allocation_failed) {
-            executor->pending_allocation_failures++;
-        }
-        executor->pending_search_failures +=
-            search_failures;
-        executor->pending_evaluation_failure =
-            executor->pending_evaluation_failure ||
-            builder.packet->evaluation_failed;
-        executor->fatal_error = TRUE;
-        __atomic_store_n(
-            &executor->cancel_requested,
-            TRUE,
-            __ATOMIC_RELEASE);
-        pthread_cond_broadcast(&executor->done_cv);
-        pthread_cond_broadcast(&executor->work_cv);
-        pthread_mutex_unlock(&executor->mutex);
-    }
-    if (builder.producer_completed) {
-        return -1;
-    }
-    if (solver_ab_publish_segment(&builder, TRUE)) {
-        return -1;
-    }
-    return 0;
-}
-
-static anbool solver_ab_task_claimable_locked(
-    const solver_ab_executor_t* executor,
-    int worker_id) {
-    const solver_ab_channel_t* channel;
-    size_t claim_limit = executor->next_reduce;
-
-    if (worker_id <= 0 ||
-        worker_id >= executor->worker_count) {
-        return FALSE;
-    }
-    channel = &executor->channels[worker_id];
-    if (SIZE_MAX - claim_limit <
-        executor->reorder_window) {
-        claim_limit = SIZE_MAX;
-    } else {
-        claim_limit += executor->reorder_window;
-    }
-    return executor->phase_active &&
-        !executor->stopping &&
-        !executor->fatal_error &&
-        !channel->ready &&
-        !__atomic_load_n(
-            &executor->cancel_requested,
-            __ATOMIC_ACQUIRE) &&
-        executor->next_task < executor->task_count &&
-        executor->next_task < claim_limit;
-}
-
-static int solver_ab_claim_task_locked(
-    solver_ab_executor_t* executor,
-    int worker_id,
-    size_t* task_index) {
-    solver_ab_channel_t* channel;
-    int claimed = FALSE;
-
-    if (worker_id <= 0 ||
-        worker_id >= executor->worker_count) {
-        return FALSE;
-    }
-    channel = &executor->channels[worker_id];
-    if (solver_ab_task_claimable_locked(
-            executor,
-            worker_id)) {
-        *task_index = executor->next_task++;
-        executor->tasks[*task_index].state =
-            SOLVER_AB_TASK_RUNNING;
-        executor->tasks[*task_index].worker_id =
-            worker_id;
-        channel->task_index = *task_index;
-        channel->final = FALSE;
-        solver_ab_packet_reset(&channel->packet);
-        claimed = TRUE;
-    }
-    return claimed;
-}
-
-static anbool solver_ab_claim_owner_task_locked(
-    solver_ab_executor_t* executor,
-    size_t* task_index) {
-    size_t next;
-
-    if (!executor || !task_index ||
-        !executor->phase_active ||
-        executor->stopping ||
-        executor->fatal_error ||
-        __atomic_load_n(
-            &executor->cancel_requested,
-            __ATOMIC_ACQUIRE) ||
-        executor->next_task >= executor->task_count ||
-        executor->next_task != executor->next_reduce) {
-        return FALSE;
-    }
-    next = executor->next_task++;
-    if (executor->tasks[next].state !=
-        SOLVER_AB_TASK_PENDING) {
-        executor->fatal_error = TRUE;
-        __atomic_store_n(
-            &executor->cancel_requested,
-            TRUE,
-            __ATOMIC_RELEASE);
-        return FALSE;
-    }
-    executor->tasks[next].state =
-        SOLVER_AB_TASK_RUNNING;
-    executor->tasks[next].worker_id = 0;
-    *task_index = next;
-    return TRUE;
 }
 
 static int solver_ab_counter_failure(
@@ -3709,564 +2812,8 @@ int solver_ab_checked_counter_delta(
     return 0;
 }
 
-static int solver_ab_reduce_packet(
-    solver_ab_executor_t* executor,
-    solver_ab_packet_t* packet,
-    solver_ab_reduce_state_t* state) {
-    solver_t* solver = executor->owner;
-    size_t hypothesis_index;
-
-    for (hypothesis_index = 0;
-         hypothesis_index < packet->hypothesis_count;
-         hypothesis_index++) {
-        solver_ab_hypothesis_t* hypothesis =
-            &packet->hypotheses[hypothesis_index];
-        size_t candidate_index;
-        double reduction_start = 0.0;
-
-        if (solver_poll_worker_stop(solver)) {
-            return 0;
-        }
-        if (hypothesis->begins_hypothesis) {
-            if (state->in_hypothesis) {
-                logerr("[solver-ab] hypothesis begin before prior end\n");
-                solver->profile.execution_failed = TRUE;
-                solver->quit_now = TRUE;
-                return -1;
-            }
-            if (hypothesis->nresults < 0) {
-                logerr(
-                    "[solver-ab] hypothesis has negative "
-                    "candidate count\n");
-                solver->profile.execution_failed = TRUE;
-                solver->quit_now = TRUE;
-                return -1;
-            }
-            if (solver_ab_checked_counter_delta(
-                solver,
-                hypothesis->numtries_delta,
-                hypothesis->cxdx_delta,
-                hypothesis->meanx_delta)) {
-                return -1;
-            }
-            state->in_hypothesis = TRUE;
-            state->expected_candidates =
-                hypothesis->nresults;
-            state->seen_candidates = 0;
-            if (solver->profile.detailed) {
-                solver->profile.hypothesis_order_hash =
-                    solver_order_hash_mix(
-                        solver->profile.hypothesis_order_hash,
-                        hypothesis->hypothesis_order_digest);
-                solver->profile.kd_result_order_hash =
-                    solver_order_hash_mix(
-                        solver->profile.kd_result_order_hash,
-                        hypothesis->kd_result_order_digest);
-            }
-            solver->profile.hypotheses_generated++;
-            solver->profile.hypotheses_executed++;
-            solver->profile.codekd_calls++;
-            solver->profile.codekd_hits +=
-                (unsigned long long)hypothesis->nresults;
-            solver->profile.codekd_wall_seconds +=
-                hypothesis->codekd_wall_seconds;
-            if (solver->profile.max_batch_hypotheses < 1U) {
-                solver->profile.max_batch_hypotheses = 1U;
-            }
-
-            if (hypothesis->search_failed) {
-                solver->profile.search_failures++;
-                solver->profile.execution_failed = TRUE;
-                solver->quit_now = TRUE;
-                return -1;
-            }
-            if (hypothesis->nresults > 0) {
-                solver->profile.resolve_calls++;
-            }
-        } else if (!state->in_hypothesis) {
-            logerr("[solver-ab] hypothesis continuation without begin\n");
-            solver->profile.execution_failed = TRUE;
-            solver->quit_now = TRUE;
-            return -1;
-        }
-        if (hypothesis->candidate_first >
-                packet->candidate_count ||
-            hypothesis->candidate_count >
-                packet->candidate_count -
-                    hypothesis->candidate_first) {
-            logerr("[solver-ab] candidate segment bounds are invalid\n");
-            solver->profile.execution_failed = TRUE;
-            solver->quit_now = TRUE;
-            return -1;
-        }
-        solver->profile.resolve_wall_seconds +=
-            hypothesis->prepare_wall_seconds;
-        if (solver->profile.detailed &&
-            hypothesis->candidate_count > 0U) {
-            reduction_start = monotonic_seconds();
-        }
-
-        for (candidate_index = hypothesis->candidate_first;
-             candidate_index <
-                hypothesis->candidate_first +
-                    hypothesis->candidate_count;
-             candidate_index++) {
-            solver_ab_candidate_t* candidate =
-                &packet->candidates[candidate_index];
-
-            if (solver->nummatches < 0 ||
-                solver->nummatches == INT_MAX ||
-                state->seen_candidates < 0 ||
-                state->seen_candidates == INT_MAX) {
-                return solver_ab_counter_failure(
-                    solver,
-                    "nummatches/seen_candidates");
-            }
-            if (candidate->action ==
-                    SOLVER_AB_CANDIDATE_RADEC_SKIP &&
-                (solver->num_radec_skipped < 0 ||
-                 solver->num_radec_skipped ==
-                     INT_MAX)) {
-                return solver_ab_counter_failure(
-                    solver,
-                    "num_radec_skipped");
-            }
-            if (candidate->action ==
-                    SOLVER_AB_CANDIDATE_ABSCALE_SKIP &&
-                (solver->num_abscale_skipped < 0 ||
-                 solver->num_abscale_skipped ==
-                     INT_MAX)) {
-                return solver_ab_counter_failure(
-                    solver,
-                    "num_abscale_skipped");
-            }
-            if (candidate->action ==
-                    SOLVER_AB_CANDIDATE_VERIFY &&
-                (solver->numscaleok < 0 ||
-                 solver->numscaleok == INT_MAX ||
-                 solver->num_verified < 0 ||
-                 solver->num_verified == INT_MAX)) {
-                return solver_ab_counter_failure(
-                    solver,
-                    "numscaleok/num_verified");
-            }
-            solver->nummatches++;
-            state->seen_candidates++;
-            solver_record_candidate_order(
-                solver,
-                candidate->action,
-                candidate->quadno,
-                candidate->code_err);
-            switch (candidate->action) {
-            case SOLVER_AB_CANDIDATE_RADEC_SKIP:
-                solver->num_radec_skipped++;
-                break;
-
-            case SOLVER_AB_CANDIDATE_ABSCALE_SKIP:
-                solver->num_abscale_skipped++;
-                break;
-
-            case SOLVER_AB_CANDIDATE_BAD_QUAD:
-                logverb("bad quad at %s:%i\n",
-                        __FILE__,
-                        __LINE__);
-                break;
-
-            case SOLVER_AB_CANDIDATE_SCALE_SKIP:
-                break;
-
-            case SOLVER_AB_CANDIDATE_VERIFY:
-            {
-                MatchObj mo;
-                int i;
-
-                solver->numscaleok++;
-                set_matchobj_template(solver, &mo);
-                memcpy(&mo.wcstan, &candidate->wcs, sizeof(tan_t));
-                mo.wcs_valid = TRUE;
-                mo.code_err = candidate->code_err;
-                mo.scale = candidate->scale;
-                mo.parity = candidate->parity;
-                mo.quad_npeers = candidate->quad_npeers;
-                mo.timeused = solver->timeused;
-                mo.quadno = candidate->quadno;
-                mo.dimquads = executor->dimquads;
-                for (i = 0; i < executor->dimquads; i++) {
-                    mo.star[i] = candidate->star[i];
-                    mo.field[i] = candidate->field[i];
-                    mo.ids[i] = 0;
-                }
-                memcpy(
-                    mo.quadpix,
-                    candidate->quadpix,
-                    (size_t)2 * (size_t)executor->dimquads *
-                        sizeof(double));
-                memcpy(
-                    mo.quadxyz,
-                    candidate->quadxyz,
-                    (size_t)3 * (size_t)executor->dimquads *
-                        sizeof(double));
-                set_center_and_radius(
-                    solver,
-                    &mo,
-                    &mo.wcstan,
-                    NULL);
-                mo.quads_tried = solver->numtries;
-                mo.quads_matched = solver->nummatches;
-                mo.quads_scaleok = solver->numscaleok;
-                if (solver_handle_hit(
-                        solver,
-                        &mo,
-                        NULL,
-                        FALSE)) {
-                    solver->quit_now = TRUE;
-                }
-                break;
-            }
-
-            default:
-                solver->profile.execution_failed = TRUE;
-                solver->quit_now = TRUE;
-                return -1;
-            }
-            if (unlikely(solver->quit_now)) {
-                break;
-            }
-        }
-        if (solver->profile.detailed &&
-            hypothesis->candidate_count > 0U) {
-            solver->profile.resolve_wall_seconds +=
-                monotonic_seconds() - reduction_start;
-        }
-        if (unlikely(solver->quit_now)) {
-            if (state->in_hypothesis) {
-                state->in_hypothesis = FALSE;
-                state->expected_candidates = 0;
-                state->seen_candidates = 0;
-                solver->profile.hypotheses_reduced++;
-            }
-            return 0;
-        }
-        if (hypothesis->ends_hypothesis) {
-            if (!state->in_hypothesis ||
-                state->seen_candidates !=
-                    state->expected_candidates) {
-                logerr(
-                    "[solver-ab] hypothesis ended after %i of %i "
-                    "candidates\n",
-                    state->seen_candidates,
-                    state->expected_candidates);
-                solver->profile.execution_failed = TRUE;
-                solver->quit_now = TRUE;
-                return -1;
-            }
-            state->in_hypothesis = FALSE;
-            state->expected_candidates = 0;
-            state->seen_candidates = 0;
-            solver->profile.hypotheses_reduced++;
-        }
-    }
-    if (solver_ab_checked_counter_delta(
-        solver,
-        packet->trailing_numtries,
-        packet->trailing_cxdx,
-        packet->trailing_meanx)) {
-        return -1;
-    }
-    if (packet->evaluation_failed) {
-        logerr("[solver-ab] combination-range evaluation failed\n");
-        solver->profile.execution_failed = TRUE;
-        solver->quit_now = TRUE;
-        return -1;
-    }
-    if (packet->allocation_failed) {
-        logerr("[solver-ab] bounded segment allocation failed\n");
-        solver->profile.allocation_failures++;
-        solver->profile.execution_failed = TRUE;
-        solver->quit_now = TRUE;
-        return -1;
-    }
-    return 0;
-}
-
-typedef struct solver_ab_native_visitor {
-    solver_t* solver;
-    const solver_field_geometry_t* field_geometry;
-    kdtree_qres_t* query_result;
-    double tol2;
-} solver_ab_native_visitor_t;
-
-static void solver_ab_try_all_codes_native(
-    const solver_field_geometry_t* geometry,
-    const solver_pair_geometry_t* pair_geometry,
-    const solver_ab_pair_t* pair,
-    const int* fieldstars,
-    int dimquad,
-    solver_ab_native_visitor_t* visitor) {
-    solver_t* solver = visitor->solver;
-    double code[DCMAX];
-    double flipcode[DCMAX];
-    int dimcode = (dimquad - NBACK) * 2;
-    int i;
-
-    solver->numtries++;
-    for (i = 0; i < dimquad - NBACK; i++) {
-        if (!solver_pair_geometry_transform(
-                geometry,
-                pair_geometry,
-                pair->field_a,
-                pair->field_b,
-                fieldstars[NBACK + i],
-                &code[2 * i],
-                &code[2 * i + 1])) {
-            solver->profile.execution_failed = TRUE;
-            solver->quit_now = TRUE;
-            return;
-        }
-    }
-    if (solver->parity == PARITY_NORMAL ||
-        solver->parity == PARITY_BOTH) {
-        try_all_codes_2(
-            fieldstars,
-            dimquad,
-            code,
-            solver,
-            FALSE,
-            visitor->tol2,
-            &visitor->query_result);
-    }
-    if (solver->quit_now) {
-        return;
-    }
-    if (solver->parity == PARITY_FLIP ||
-        solver->parity == PARITY_BOTH) {
-        quad_flip_parity(code, flipcode, dimcode);
-        try_all_codes_2(
-            fieldstars,
-            dimquad,
-            flipcode,
-            solver,
-            TRUE,
-            visitor->tol2,
-            &visitor->query_result);
-    }
-}
-
-static anbool solver_ab_native_visit(
-    const solver_pair_geometry_t* pair_geometry,
-    const solver_ab_pair_t* pair,
-    int* field,
-    int dimquad,
-    void* opaque) {
-    solver_ab_native_visitor_t* visitor = opaque;
-
-    if (solver_poll_worker_stop(visitor->solver)) {
-        return TRUE;
-    }
-    solver_ab_try_all_codes_native(
-        visitor->field_geometry,
-        pair_geometry,
-        pair,
-        field,
-        dimquad,
-        visitor);
-    return visitor->solver->quit_now;
-}
-
-static int solver_ab_native_visit_pair_range(
-    solver_ab_executor_t* executor,
-    int worker_id,
-    const solver_ab_pair_t* pair,
-    const solver_pair_geometry_t* pair_geometry,
-    unsigned long long local_first,
-    unsigned long long local_end,
-    void* opaque) {
-    solver_ab_native_visitor_t* visitor = opaque;
-
-    if (solver_poll_worker_stop(visitor->solver)) {
-        return 1;
-    }
-    visitor->solver->rel_field_noise2 =
-        pair_geometry->rel_field_noise2;
-    visitor->tol2 = pair->tol2;
-    return solver_ab_visit_pair_range(
-        executor,
-        worker_id,
-        pair,
-        pair_geometry,
-        local_first,
-        local_end,
-        solver_ab_native_visit,
-        visitor);
-}
-
-static int solver_ab_run_task_inline(
-    solver_ab_executor_t* executor,
-    const solver_ab_task_t* task) {
-    solver_t* solver = executor->owner;
-    solver_ab_native_visitor_t visitor;
-    int visit_result;
-
-    memset(&visitor, 0, sizeof(visitor));
-    visitor.solver = solver;
-    visitor.field_geometry = executor->field_geometry;
-    visitor.query_result = executor->query_results[0];
-    if (visitor.query_result) {
-        executor->owner_query_reuses++;
-    }
-    solver->profile.ab_blocks_owner++;
-    visit_result = solver_ab_walk_task_ranges(
-        executor,
-        task,
-        0,
-        solver_ab_native_visit_pair_range,
-        &visitor);
-    if (visit_result < 0) {
-        solver->profile.execution_failed = TRUE;
-        solver->quit_now = TRUE;
-    }
-    executor->query_results[0] = visitor.query_result;
-    return solver->profile.execution_failed ? -1 : 0;
-}
-
-static int solver_ab_retire_segment(
-    solver_ab_executor_t* executor,
-    size_t task_index,
-    solver_ab_reduce_state_t* reduce_state,
-    anbool* final_out) {
-    solver_t* solver = executor->owner;
-    solver_ab_task_t* task = &executor->tasks[task_index];
-    solver_ab_channel_t* channel;
-    solver_ab_packet_t swap;
-    anbool final;
-    int rc;
-
-    pthread_mutex_lock(&executor->mutex);
-    if (task->worker_id <= 0 ||
-        task->worker_id >= executor->worker_count) {
-        pthread_mutex_unlock(&executor->mutex);
-        return 1;
-    }
-    channel = &executor->channels[task->worker_id];
-    if (!channel->ready ||
-        channel->task_index != task_index) {
-        pthread_mutex_unlock(&executor->mutex);
-        return 1;
-    }
-    swap = executor->drain_packet;
-    executor->drain_packet = channel->packet;
-    channel->packet = swap;
-    solver_ab_packet_reset(&channel->packet);
-    final = channel->final;
-    channel->ready = FALSE;
-    channel->final = FALSE;
-    pthread_cond_broadcast(&executor->work_cv);
-    pthread_cond_broadcast(&executor->done_cv);
-    pthread_mutex_unlock(&executor->mutex);
-
-    solver->profile.ab_segments_retired++;
-    solver->profile.ab_segment_payload_bytes +=
-        executor->drain_packet.hypothesis_count *
-            sizeof(*executor->drain_packet.hypotheses) +
-        executor->drain_packet.candidate_count *
-            sizeof(*executor->drain_packet.candidates);
-    if (executor->drain_packet.cancelled) {
-        solver_poll_worker_stop(solver);
-        if (!solver->quit_now) {
-            solver->profile.execution_failed = TRUE;
-            solver->quit_now = TRUE;
-            rc = -1;
-        } else {
-            rc = 0;
-        }
-    } else {
-        rc = solver_ab_reduce_packet(
-            executor,
-            &executor->drain_packet,
-            reduce_state);
-    }
-    solver_ab_packet_reset(&executor->drain_packet);
-
-    if (final && !rc) {
-        if (reduce_state->in_hypothesis &&
-            !solver->quit_now) {
-            logerr("[solver-ab] task ended inside a hypothesis\n");
-            solver->profile.execution_failed = TRUE;
-            solver->quit_now = TRUE;
-            rc = -1;
-        } else {
-            solver->profile.ab_blocks_retired++;
-            solver->profile.task_ranges_executed++;
-        }
-    }
-    *final_out = final;
-    return rc;
-}
-
-static anbool solver_ab_canonical_segment_ready_locked(
-    const solver_ab_executor_t* executor,
-    size_t task_index) {
-    const solver_ab_task_t* task;
-    const solver_ab_channel_t* channel;
-
-    if (task_index >= executor->task_count) {
-        return FALSE;
-    }
-    task = &executor->tasks[task_index];
-    if (task->worker_id <= 0 ||
-        task->worker_id >= executor->worker_count) {
-        return FALSE;
-    }
-    channel = &executor->channels[task->worker_id];
-    return channel->ready &&
-        channel->task_index == task_index;
-}
-
-static void solver_ab_configure_plan_cache_limits(
-    solver_ab_executor_t* executor) {
-    size_t lane_budget;
-    size_t task_limit;
-
-    if (!executor || executor->worker_count <= 0) {
-        return;
-    }
-    lane_budget =
-        (size_t)SOLVER_AB_PLAN_CACHE_BUDGET_BYTES /
-        (size_t)executor->worker_count;
-    if (!executor->pair_cache_limit_bytes &&
-        !executor->task_cache_limit_bytes) {
-        if ((size_t)executor->worker_count >
-            SIZE_MAX / SOLVER_AB_BLOCKS_PER_WORKER ||
-            (size_t)executor->worker_count *
-                SOLVER_AB_BLOCKS_PER_WORKER >
-            SIZE_MAX / sizeof(solver_ab_task_t)) {
-            task_limit = lane_budget;
-        } else {
-            task_limit =
-                (size_t)executor->worker_count *
-                SOLVER_AB_BLOCKS_PER_WORKER *
-                sizeof(solver_ab_task_t);
-            task_limit = MIN(task_limit, lane_budget);
-        }
-        executor->task_cache_limit_bytes =
-            task_limit;
-        executor->pair_cache_limit_bytes =
-            lane_budget - task_limit;
-    }
-    if (!executor->packet_cache_limit_bytes) {
-        executor->packet_cache_limit_bytes =
-            (size_t)SOLVER_AB_PACKET_CACHE_BUDGET_BYTES /
-            (size_t)executor->worker_count;
-    }
-    if (!executor->eligible_cache_limit_bytes) {
-        executor->eligible_cache_limit_bytes =
-            (size_t)SOLVER_AB_ELIGIBLE_CACHE_BUDGET_BYTES /
-            (size_t)executor->worker_count;
-    }
-}
-
 static int solver_ab_reserve_pair_buffer(
-    solver_ab_executor_t* executor,
+    solver_ab_descriptor_planner_t* executor,
     size_t required) {
     solver_ab_pair_t* resized;
     size_t capacity;
@@ -4276,7 +2823,10 @@ static int solver_ab_reserve_pair_buffer(
         required > SIZE_MAX / sizeof(*resized)) {
         return -1;
     }
-    solver_ab_configure_plan_cache_limits(executor);
+    if (!executor->pair_cache_limit_bytes) {
+        executor->pair_cache_limit_bytes =
+            SOLVER_AB_DESCRIPTOR_PAIR_CACHE_BYTES;
+    }
     if (required <= executor->pair_capacity) {
         return 0;
     }
@@ -4308,7 +2858,6 @@ static int solver_ab_reserve_pair_buffer(
         executor->pair_cache_capacity = capacity;
         executor->pairs = resized;
         executor->pair_capacity = capacity;
-        executor->pair_cache_grows++;
         return 0;
     }
 
@@ -4334,79 +2883,19 @@ static int solver_ab_reserve_pair_buffer(
     executor->pairs = resized;
     executor->pair_capacity = capacity;
     executor->pairs_transient = TRUE;
-    executor->plan_transient_allocations++;
-    executor->plan_transient_peak_bytes = MAX(
-        executor->plan_transient_peak_bytes,
-        capacity * sizeof(*resized));
-    return 0;
-}
-
-static int solver_ab_reserve_task_buffer(
-    solver_ab_executor_t* executor,
-    size_t required) {
-    solver_ab_task_t* resized;
-    size_t bytes;
-
-    if (!executor ||
-        required > SIZE_MAX / sizeof(*resized)) {
-        return -1;
-    }
-    solver_ab_configure_plan_cache_limits(executor);
-    if (!executor->tasks &&
-        required <= executor->task_cache_capacity) {
-        executor->tasks = executor->task_cache;
-        executor->task_capacity =
-            executor->task_cache_capacity;
-        executor->tasks_transient = FALSE;
-        executor->task_cache_reuses++;
-        return 0;
-    }
-    bytes = required * sizeof(*resized);
-    if (required <= executor->task_capacity) {
-        return 0;
-    }
-    if (bytes <= executor->task_cache_limit_bytes) {
-        resized = realloc(
-            executor->task_cache,
-            bytes);
-        if (!resized) {
-            return -1;
-        }
-        executor->task_cache = resized;
-        executor->task_cache_capacity = required;
-        executor->tasks = resized;
-        executor->task_capacity = required;
-        executor->tasks_transient = FALSE;
-        executor->task_cache_grows++;
-        return 0;
-    }
-    resized = malloc(bytes);
-    if (!resized) {
-        return -1;
-    }
-    executor->tasks = resized;
-    executor->task_capacity = required;
-    executor->tasks_transient = TRUE;
-    executor->plan_transient_allocations++;
-    executor->plan_transient_peak_bytes = MAX(
-        executor->plan_transient_peak_bytes,
-        bytes);
     return 0;
 }
 
 static void solver_ab_begin_pair_buffer(
-    solver_ab_executor_t* executor) {
+    solver_ab_descriptor_planner_t* executor) {
     executor->pairs = executor->pair_cache;
     executor->pair_capacity =
         executor->pair_cache_capacity;
     executor->pairs_transient = FALSE;
-    if (executor->pair_cache_capacity) {
-        executor->pair_cache_reuses++;
-    }
 }
 
 static int solver_ab_collect_pairs(
-    solver_ab_executor_t* executor,
+    solver_ab_descriptor_planner_t* executor,
     solver_ab_phase_kind_t phase,
     int newpoint,
     int dimquads,
@@ -4562,72 +3051,14 @@ static int solver_ab_collect_pairs(
 }
 
 #define SOLVER_PAYLOAD_CANDIDATE_BATCH 32U
-#define SOLVER_VERIFICATION_WINDOW_CANDIDATES (2U * SOLVER_PAYLOAD_CANDIDATE_BATCH)
-#define SOLVER_PAYLOAD_PAGE_PLAN_INLINE_RANGES 128U
-#define SOLVER_PAYLOAD_PAGE_PLAN_BATCH_BYTES (4U * 1024U * 1024U)
-enum {
-    SOLVER_PAYLOAD_PAGE_PLAN_MAX_RANGES =
-        SOLVER_VERIFICATION_WINDOW_CANDIDATES *
-        FITSBIN_PREAD_ASYNC_RANGE_LIMIT
-};
-
-typedef struct solver_payload_page_range {
-    fitsbin_prefetch_range_t mapped;
-    kdtree_prefetch_array_kind_t kind;
-} solver_payload_page_range_t;
-
-typedef struct solver_payload_page_plan {
-    fitsbin_t* fitsbin;
-    solver_payload_page_range_t* ranges;
-    size_t range_count;
-    size_t range_capacity;
-    solver_t* solver;
-    anbool failed;
-    anbool delivery_unavailable;
-    solver_payload_page_range_t
-        inline_ranges[SOLVER_PAYLOAD_PAGE_PLAN_INLINE_RANGES];
-} solver_payload_page_plan_t;
-
-static void solver_payload_page_plan_init(
-    solver_payload_page_plan_t* plan,
-    solver_t* solver) {
-    if (!plan) {
-        return;
-    }
-    memset(plan, 0, sizeof(*plan));
-    plan->solver = solver;
-    plan->ranges = plan->inline_ranges;
-    plan->range_capacity =
-        SOLVER_PAYLOAD_PAGE_PLAN_INLINE_RANGES;
-}
-
-static void solver_payload_page_plan_destroy(
-    solver_payload_page_plan_t* plan) {
-    if (!plan) {
-        return;
-    }
-    if (plan->ranges && plan->ranges != plan->inline_ranges) {
-        free(plan->ranges);
-    }
-    memset(plan, 0, sizeof(*plan));
-}
-
-static void solver_payload_page_plan_fail(
-    solver_payload_page_plan_t* plan) {
-    if (plan) {
-        plan->failed = TRUE;
-    }
-}
+#define SOLVER_VERIFICATION_WINDOW_CANDIDATES \
+    (2U * SOLVER_PAYLOAD_CANDIDATE_BATCH)
 
 /*
- * A nonresident page plan has exactly one optional completion provider. The
- * solver never starts that provider implicitly: when it is absent, callers
- * abandon planning before walking payload topology and use native mmap demand.
+ * Inner compute assistance never starts or waits for a cold page provider.
+ * Only an already resident Quad/Star payload may enter prepared verification;
+ * every other case remains on the native owner-local mmap path.
  */
-static anbool solver_payload_completion_service_available(void) {
-    return fitsbin_payload_io_service_width() > 0;
-}
-
 static anbool solver_payload_candidate_data_fully_resident(
     const solver_t* solver) {
     if (!solver || !solver->index || !solver->index->quads ||
@@ -4643,996 +3074,6 @@ static anbool solver_payload_candidate_data_fully_resident(
                (const fitsbin_t*)solver->index->starkd->tree->io);
 }
 
-static int solver_payload_page_plan_enabled(
-    void* userdata,
-    void* mapping) {
-    solver_payload_page_plan_t* plan = userdata;
-
-    if (!plan || !mapping || plan->failed ||
-        plan->delivery_unavailable) {
-        return FALSE;
-    }
-    if (plan->fitsbin && plan->fitsbin != mapping) {
-        return FALSE;
-    }
-    return TRUE;
-}
-
-static int solver_payload_page_plan_reserve(
-    solver_payload_page_plan_t* plan,
-    size_t needed) {
-    solver_payload_page_range_t* ranges;
-    size_t capacity;
-
-    if (!plan) {
-        return -1;
-    }
-    if (needed <= plan->range_capacity) {
-        return 0;
-    }
-    if (needed > SOLVER_PAYLOAD_PAGE_PLAN_MAX_RANGES) {
-        errno = E2BIG;
-        solver_payload_page_plan_fail(plan);
-        return -1;
-    }
-    capacity = plan->range_capacity;
-    while (capacity < needed) {
-        if (capacity > SIZE_MAX / 2U) {
-            solver_payload_page_plan_fail(plan);
-            return -1;
-        }
-        capacity *= 2U;
-    }
-    if (capacity > SIZE_MAX / sizeof(*ranges)) {
-        solver_payload_page_plan_fail(plan);
-        return -1;
-    }
-    ranges = malloc(capacity * sizeof(*ranges));
-    if (!ranges) {
-        solver_payload_page_plan_fail(plan);
-        return -1;
-    }
-    memcpy(ranges,
-           plan->ranges,
-           plan->range_count * sizeof(*ranges));
-    if (plan->ranges != plan->inline_ranges) {
-        free(plan->ranges);
-    }
-    plan->ranges = ranges;
-    plan->range_capacity = capacity;
-    return 0;
-}
-
-static int solver_payload_page_plan_append(
-    solver_payload_page_plan_t* plan,
-    fitsbin_t* fitsbin,
-    const void* data,
-    size_t size,
-    kdtree_prefetch_array_kind_t kind) {
-    uintptr_t begin;
-
-    if (!plan || !fitsbin || !data || !size || plan->failed) {
-        return -1;
-    }
-    if (plan->fitsbin && plan->fitsbin != fitsbin) {
-        solver_payload_page_plan_fail(plan);
-        return -1;
-    }
-    if (!(plan->range_count %
-          FITSBIN_PREAD_ASYNC_RANGE_LIMIT) &&
-        plan->solver &&
-        solver_poll_worker_stop(plan->solver)) {
-        errno = ECANCELED;
-        solver_payload_page_plan_fail(plan);
-        return -1;
-    }
-    begin = (uintptr_t)data;
-    if (size > UINTPTR_MAX - begin ||
-        plan->range_count >=
-            SOLVER_PAYLOAD_PAGE_PLAN_MAX_RANGES ||
-        solver_payload_page_plan_reserve(
-            plan, plan->range_count + 1U)) {
-        if (plan->range_count >=
-            SOLVER_PAYLOAD_PAGE_PLAN_MAX_RANGES) {
-            errno = E2BIG;
-        }
-        solver_payload_page_plan_fail(plan);
-        return -1;
-    }
-    if (!plan->fitsbin) {
-        plan->fitsbin = fitsbin;
-    }
-    plan->ranges[plan->range_count].mapped.data = data;
-    plan->ranges[plan->range_count].mapped.size = size;
-    plan->ranges[plan->range_count].kind = kind;
-    plan->range_count++;
-    return 0;
-}
-
-static int solver_payload_page_plan_append_page_cover(
-    solver_payload_page_plan_t* plan,
-    fitsbin_t* fitsbin,
-    const void* data,
-    size_t size,
-    kdtree_prefetch_array_kind_t kind) {
-    const void* cover_data;
-    size_t cover_size;
-    off_t cover_file_offset;
-    size_t exact_offset;
-
-    if (fitsbin_mapped_range_page_cover(
-            fitsbin,
-            data,
-            size,
-            &cover_data,
-            &cover_size,
-            &cover_file_offset,
-            &exact_offset)) {
-        solver_payload_page_plan_fail(plan);
-        return -1;
-    }
-    (void)cover_file_offset;
-    (void)exact_offset;
-    return solver_payload_page_plan_append(
-        plan, fitsbin, cover_data, cover_size, kind);
-}
-
-static int solver_payload_page_plan_emit(
-    void* userdata,
-    const kdtree_prefetch_hint_t* hint) {
-    solver_payload_page_plan_t* plan = userdata;
-
-    if (!plan || !hint || !hint->mapping ||
-        !hint->address || !hint->length) {
-        return 0;
-    }
-    if (hint->kind != KDTREE_PREFETCH_ARRAY_DATA &&
-        hint->kind != KDTREE_PREFETCH_ARRAY_PERM) {
-        return 0;
-    }
-    return solver_payload_page_plan_append(
-        plan,
-        hint->mapping,
-        hint->address,
-        hint->length,
-        hint->kind);
-}
-
-static int solver_payload_page_plan_add_query(
-    solver_payload_page_plan_t* plan,
-    const kdtree_t* tree,
-    const void* query,
-    double maxd2,
-    int options) {
-    kdtree_prefetch_sink_t sink;
-    int status;
-
-    if (!plan || !tree || !query ||
-        !tree->io || !tree->io_is_fitsbin) {
-        return 0;
-    }
-    if (fitsbin_payload_is_fully_resident(
-            (const fitsbin_t*)tree->io)) {
-        return 0;
-    }
-    if (!solver_payload_completion_service_available()) {
-        if (plan->fitsbin && plan->fitsbin != tree->io) {
-            solver_payload_page_plan_fail(plan);
-            return -1;
-        }
-        plan->fitsbin = tree->io;
-        plan->delivery_unavailable = TRUE;
-        return 0;
-    }
-    memset(&sink, 0, sizeof(sink));
-    sink.userdata = plan;
-    sink.enabled = solver_payload_page_plan_enabled;
-    sink.emit = solver_payload_page_plan_emit;
-    status = kdtree_rangesearch_prefetch_prepare(
-        tree, query, maxd2, options, &sink);
-    if (status || plan->failed) {
-        if (!plan->fitsbin) {
-            plan->fitsbin = tree->io;
-        }
-        solver_payload_page_plan_fail(plan);
-        return -1;
-    }
-    return 0;
-}
-
-static size_t solver_payload_page_plan_chunk(
-    solver_payload_page_plan_t* plan,
-    size_t first,
-    fitsbin_prefetch_range_t* ranges,
-    size_t* byte_budget) {
-    size_t budget = 0U;
-    size_t count = 0U;
-    size_t page_size;
-    long detected_page_size;
-
-    if (!plan || !ranges || !byte_budget ||
-        first >= plan->range_count) {
-        return 0U;
-    }
-    detected_page_size = sysconf(_SC_PAGESIZE);
-    if (detected_page_size <= 0 ||
-        (size_t)detected_page_size > SIZE_MAX / 2U) {
-        solver_payload_page_plan_fail(plan);
-        return 0U;
-    }
-    page_size = (size_t)detected_page_size;
-
-    while (count < plan->range_count - first &&
-           count < FITSBIN_PREAD_ASYNC_RANGE_LIMIT) {
-        const fitsbin_prefetch_range_t* range =
-            &plan->ranges[first + count].mapped;
-        size_t range_budget;
-
-        if (range->size > SIZE_MAX - 2U * page_size) {
-            solver_payload_page_plan_fail(plan);
-            return 0U;
-        }
-        range_budget = range->size + 2U * page_size;
-        if (range_budget >
-            SOLVER_PAYLOAD_PAGE_PLAN_BATCH_BYTES) {
-            errno = E2BIG;
-            solver_payload_page_plan_fail(plan);
-            return 0U;
-        }
-        if (count &&
-            (budget >= SOLVER_PAYLOAD_PAGE_PLAN_BATCH_BYTES ||
-             range_budget >
-                 SOLVER_PAYLOAD_PAGE_PLAN_BATCH_BYTES - budget)) {
-            break;
-        }
-        if (range_budget > SIZE_MAX - budget) {
-            solver_payload_page_plan_fail(plan);
-            return 0U;
-        }
-        ranges[count] = *range;
-        budget += range_budget;
-        count++;
-    }
-    if (!count || !budget) {
-        solver_payload_page_plan_fail(plan);
-        return 0U;
-    }
-    *byte_budget = budget;
-    return count;
-}
-
-static int solver_payload_page_plan_deliver_chunk(
-    solver_payload_page_plan_t* plan,
-    const fitsbin_prefetch_range_t* ranges,
-    size_t range_count,
-    size_t byte_budget) {
-    fitsbin_payload_io_ticket_t* ticket = NULL;
-    int status;
-
-    if (!plan || !plan->fitsbin || !ranges ||
-        !range_count || !byte_budget) {
-        return -1;
-    }
-    if (fitsbin_payload_is_fully_resident(plan->fitsbin)) {
-        return 1;
-    }
-    if (!solver_payload_completion_service_available()) {
-        plan->delivery_unavailable = TRUE;
-        return 0;
-    }
-    status = fitsbin_prefetch_ranges_submit(
-        plan->fitsbin,
-        ranges,
-        range_count,
-        byte_budget,
-        &ticket);
-    if (status > 0 && ticket) {
-        int saved_errno;
-
-        errno = 0;
-        status = fitsbin_payload_io_ticket_wait(
-            plan->fitsbin, ticket);
-        saved_errno = errno;
-        fitsbin_payload_io_ticket_destroy(ticket);
-        if (status > 0) {
-            return 1;
-        }
-        if (!status && saved_errno == ECANCELED) {
-            errno = ECANCELED;
-            return 0;
-        }
-    }
-    return status;
-}
-
-typedef struct solver_payload_page_delivery {
-    fitsbin_t* fitsbin;
-    fitsbin_payload_io_ticket_t* ticket;
-    anbool ready;
-} solver_payload_page_delivery_t;
-
-static int solver_payload_page_plan_coalesce(
-    solver_payload_page_plan_t* plan);
-
-static int solver_payload_page_plan_submit(
-    solver_payload_page_plan_t* plan,
-    solver_payload_page_delivery_t* delivery) {
-    fitsbin_prefetch_range_t
-        ranges[FITSBIN_PREAD_ASYNC_RANGE_LIMIT];
-    size_t byte_budget = 0U;
-    size_t range_count;
-    int status;
-
-    if (!plan || !delivery || plan->failed) {
-        errno = EINVAL;
-        return -1;
-    }
-    memset(delivery, 0, sizeof(*delivery));
-    if (plan->delivery_unavailable) {
-        return 0;
-    }
-    if (!plan->range_count) {
-        delivery->ready = TRUE;
-        return 1;
-    }
-    if (!plan->fitsbin ||
-        solver_payload_page_plan_coalesce(plan)) {
-        return -1;
-    }
-    delivery->fitsbin = plan->fitsbin;
-    if (fitsbin_payload_is_fully_resident(plan->fitsbin)) {
-        delivery->ready = TRUE;
-        return 1;
-    }
-    if (!solver_payload_completion_service_available()) {
-        plan->delivery_unavailable = TRUE;
-        return 0;
-    }
-    range_count = solver_payload_page_plan_chunk(
-        plan, 0U, ranges, &byte_budget);
-    if (!range_count || range_count != plan->range_count) {
-        return 0;
-    }
-    status = fitsbin_prefetch_ranges_submit(
-        plan->fitsbin,
-        ranges,
-        range_count,
-        byte_budget,
-        &delivery->ticket);
-    if (status <= 0 || !delivery->ticket) {
-        delivery->ticket = NULL;
-        return status < 0 ? -1 : 0;
-    }
-    return 1;
-}
-
-static int solver_payload_page_delivery_wait(
-    solver_payload_page_delivery_t* delivery) {
-    fitsbin_payload_io_ticket_t* ticket;
-    int status;
-
-    if (!delivery) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (delivery->ready) {
-        return 1;
-    }
-    if (!delivery->fitsbin || !delivery->ticket) {
-        return 0;
-    }
-    ticket = delivery->ticket;
-    delivery->ticket = NULL;
-    status = fitsbin_payload_io_ticket_wait(
-        delivery->fitsbin, ticket);
-    {
-        int saved_errno = errno;
-
-        fitsbin_payload_io_ticket_destroy(ticket);
-        errno = saved_errno;
-    }
-    if (status > 0) {
-        delivery->ready = TRUE;
-        return 1;
-    }
-    return status;
-}
-
-static void solver_payload_page_delivery_cancel(
-    solver_payload_page_delivery_t* delivery) {
-    fitsbin_payload_io_ticket_t* ticket;
-
-    if (!delivery || !delivery->ticket || !delivery->fitsbin) {
-        return;
-    }
-    ticket = delivery->ticket;
-    delivery->ticket = NULL;
-    (void)fitsbin_payload_io_ticket_cancel_and_wait(
-        delivery->fitsbin, ticket);
-    fitsbin_payload_io_ticket_destroy(ticket);
-}
-
-static int solver_payload_page_plan_deliver(
-    solver_payload_page_plan_t* plan) {
-    fitsbin_prefetch_range_t
-        ranges[FITSBIN_PREAD_ASYNC_RANGE_LIMIT];
-    size_t first = 0U;
-
-    if (!plan) {
-        return -1;
-    }
-    if (plan->failed) {
-        return -1;
-    }
-    if (plan->delivery_unavailable) {
-        return 0;
-    }
-    if (!plan->range_count) {
-        return 0;
-    }
-    if (!plan->fitsbin) {
-        solver_payload_page_plan_fail(plan);
-        return -1;
-    }
-
-    while (first < plan->range_count) {
-        size_t byte_budget = 0U;
-        size_t range_count;
-        int status;
-
-        if (plan->solver &&
-            solver_poll_worker_stop(plan->solver)) {
-            errno = ECANCELED;
-            return 0;
-        }
-        range_count = solver_payload_page_plan_chunk(
-            plan, first, ranges, &byte_budget);
-        if (!range_count) {
-            return -1;
-        }
-        status = solver_payload_page_plan_deliver_chunk(
-            plan,
-            ranges,
-            range_count,
-            byte_budget);
-        if (status <= 0) {
-            return status;
-        }
-        first += range_count;
-        if (plan->solver &&
-            solver_poll_worker_stop(plan->solver)) {
-            errno = ECANCELED;
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static int solver_payload_page_range_compare(
-    const void* left,
-    const void* right) {
-    const solver_payload_page_range_t* lhs = left;
-    const solver_payload_page_range_t* rhs = right;
-    uintptr_t lhs_begin = (uintptr_t)lhs->mapped.data;
-    uintptr_t rhs_begin = (uintptr_t)rhs->mapped.data;
-
-    if (lhs_begin < rhs_begin) {
-        return -1;
-    }
-    if (lhs_begin > rhs_begin) {
-        return 1;
-    }
-    if (lhs->mapped.size < rhs->mapped.size) {
-        return -1;
-    }
-    if (lhs->mapped.size > rhs->mapped.size) {
-        return 1;
-    }
-    return 0;
-}
-
-static int solver_payload_page_plan_coalesce(
-    solver_payload_page_plan_t* plan) {
-    size_t output = 0U;
-    size_t i;
-
-    if (!plan || plan->failed) {
-        return -1;
-    }
-    if (plan->range_count < 2U) {
-        return 0;
-    }
-    qsort(
-        plan->ranges,
-        plan->range_count,
-        sizeof(plan->ranges[0]),
-        solver_payload_page_range_compare);
-    for (i = 0U; i < plan->range_count; i++) {
-        solver_payload_page_range_t* current =
-            &plan->ranges[i];
-
-        if (output) {
-            solver_payload_page_range_t* previous =
-                &plan->ranges[output - 1U];
-            uintptr_t previous_begin =
-                (uintptr_t)previous->mapped.data;
-            uintptr_t previous_end =
-                previous_begin + previous->mapped.size;
-            uintptr_t current_begin =
-                (uintptr_t)current->mapped.data;
-            uintptr_t current_end =
-                current_begin + current->mapped.size;
-
-            if (previous->kind == current->kind &&
-                current_begin <= previous_end) {
-                if (current_end > previous_end) {
-                    previous->mapped.size =
-                        (size_t)(current_end - previous_begin);
-                }
-                continue;
-            }
-        }
-        if (output != i) {
-            plan->ranges[output] = *current;
-        }
-        output++;
-    }
-    plan->range_count = output;
-    return 0;
-}
-
-static int solver_payload_page_plan_add_starkd_sweep(
-    const solver_payload_page_plan_t* leaf_plan,
-    startree_t* starkd,
-    solver_payload_page_plan_t* sweep_plan) {
-    const kdtree_t* tree;
-    size_t i;
-
-    if (!leaf_plan || !starkd || !starkd->tree ||
-        !sweep_plan || !starkd->sweep) {
-        return 0;
-    }
-    tree = starkd->tree;
-    if (tree->ndata <= 0 || !tree->io ||
-        !tree->io_is_fitsbin) {
-        return 0;
-    }
-    if (fitsbin_payload_is_fully_resident(
-            (const fitsbin_t*)tree->io)) {
-        return 0;
-    }
-    if (leaf_plan->delivery_unavailable ||
-        !solver_payload_completion_service_available()) {
-        sweep_plan->fitsbin = tree->io;
-        sweep_plan->delivery_unavailable = TRUE;
-        return 0;
-    }
-
-    for (i = 0U; i < leaf_plan->range_count; i++) {
-        const solver_payload_page_range_t* leaf =
-            &leaf_plan->ranges[i];
-        size_t first;
-        size_t count;
-        size_t j;
-
-        if (tree->perm) {
-            uintptr_t base;
-            uintptr_t begin;
-            size_t total_bytes;
-            size_t offset;
-
-            if (leaf->kind != KDTREE_PREFETCH_ARRAY_PERM ||
-                (size_t)tree->ndata >
-                    SIZE_MAX / sizeof(*tree->perm)) {
-                continue;
-            }
-            total_bytes =
-                (size_t)tree->ndata * sizeof(*tree->perm);
-            base = (uintptr_t)tree->perm;
-            begin = (uintptr_t)leaf->mapped.data;
-            if (begin < base ||
-                (size_t)(begin - base) > total_bytes) {
-                solver_payload_page_plan_fail(sweep_plan);
-                return -1;
-            }
-            offset = (size_t)(begin - base);
-            if (offset % sizeof(*tree->perm) ||
-                leaf->mapped.size % sizeof(*tree->perm) ||
-                leaf->mapped.size > total_bytes - offset) {
-                solver_payload_page_plan_fail(sweep_plan);
-                return -1;
-            }
-            first = offset / sizeof(*tree->perm);
-            count = leaf->mapped.size / sizeof(*tree->perm);
-            for (j = 0U; j < count; j++) {
-                unsigned int starid = tree->perm[first + j];
-
-                if (starid >= (unsigned int)tree->ndata ||
-                    solver_payload_page_plan_append_page_cover(
-                        sweep_plan,
-                        tree->io,
-                        starkd->sweep + starid,
-                        sizeof(starkd->sweep[starid]),
-                        KDTREE_PREFETCH_ARRAY_DATA)) {
-                    solver_payload_page_plan_fail(sweep_plan);
-                    return -1;
-                }
-            }
-        } else {
-            uintptr_t base;
-            uintptr_t begin;
-            size_t data_bytes;
-            size_t row_size;
-            size_t offset;
-
-            if (leaf->kind != KDTREE_PREFETCH_ARRAY_DATA) {
-                continue;
-            }
-            data_bytes = kdtree_sizeof_data(tree);
-            if (!data_bytes ||
-                data_bytes % (size_t)tree->ndata) {
-                solver_payload_page_plan_fail(sweep_plan);
-                return -1;
-            }
-            row_size = data_bytes / (size_t)tree->ndata;
-            base = (uintptr_t)tree->data.any;
-            begin = (uintptr_t)leaf->mapped.data;
-            if (!row_size || begin < base ||
-                (size_t)(begin - base) > data_bytes) {
-                solver_payload_page_plan_fail(sweep_plan);
-                return -1;
-            }
-            offset = (size_t)(begin - base);
-            if (offset % row_size ||
-                leaf->mapped.size % row_size ||
-                leaf->mapped.size > data_bytes - offset) {
-                solver_payload_page_plan_fail(sweep_plan);
-                return -1;
-            }
-            first = offset / row_size;
-            count = leaf->mapped.size / row_size;
-            if (first > (size_t)tree->ndata ||
-                count > (size_t)tree->ndata - first) {
-                solver_payload_page_plan_fail(sweep_plan);
-                return -1;
-            }
-            for (j = 0U; j < count; j++) {
-                size_t starid = first + j;
-
-                if (solver_payload_page_plan_append_page_cover(
-                        sweep_plan,
-                        tree->io,
-                        starkd->sweep + starid,
-                        sizeof(starkd->sweep[starid]),
-                        KDTREE_PREFETCH_ARRAY_DATA)) {
-                    solver_payload_page_plan_fail(sweep_plan);
-                    return -1;
-                }
-            }
-        }
-    }
-    return solver_payload_page_plan_coalesce(sweep_plan);
-}
-
-static int solver_payload_wait_advisory_ticket(
-    fitsbin_t* fitsbin,
-    fitsbin_payload_io_ticket_t** ticket) {
-    fitsbin_payload_io_ticket_t* pending;
-    int status;
-
-    if (!ticket || !*ticket) {
-        return 0;
-    }
-    pending = *ticket;
-    *ticket = NULL;
-    status = fitsbin_payload_io_ticket_wait(fitsbin, pending);
-    {
-        int saved_errno = errno;
-
-        fitsbin_payload_io_ticket_destroy(pending);
-        errno = saved_errno;
-    }
-    return status;
-}
-
-static size_t solver_payload_prepare_candidate_rows(
-    const kdtree_qres_t* result,
-    size_t first,
-    size_t end,
-    int dimquads,
-    solver_t* solver) {
-    fitsbin_payload_io_ticket_t* ticket = NULL;
-    unsigned int quadids[SOLVER_PAYLOAD_CANDIDATE_BATCH];
-    unsigned int starids[
-        SOLVER_PAYLOAD_CANDIDATE_BATCH * DQMAX];
-    unsigned int stars[DQMAX];
-    quadfile_t* quads;
-    startree_t* starkd;
-    size_t count;
-    size_t star_count = 0U;
-    size_t i;
-    int status;
-    anbool quad_ready;
-    anbool star_ready;
-
-    if (!result || !solver || !solver->index ||
-        !solver->index->quads || !solver->index->starkd ||
-        !solver->index->quads->fb ||
-        !solver->index->starkd->tree ||
-        !solver->index->starkd->tree->io ||
-        !solver->index->starkd->tree->io_is_fitsbin ||
-        first >= end || end > (size_t)result->nres ||
-        dimquads <= 0 || dimquads > DQMAX) {
-        return 0U;
-    }
-    quads = solver->index->quads;
-    starkd = solver->index->starkd;
-    quad_ready = fitsbin_payload_is_fully_resident(quads->fb);
-    star_ready = fitsbin_payload_is_fully_resident(
-        (fitsbin_t*)starkd->tree->io);
-    if ((!quad_ready || !star_ready) &&
-        !solver_payload_completion_service_available()) {
-        return 0U;
-    }
-    count = MIN(
-        end - first,
-        (size_t)SOLVER_PAYLOAD_CANDIDATE_BATCH);
-    for (i = 0U; i < count; i++) {
-        int quadid = result->inds[first + i];
-
-        if (quadid < 0 || (unsigned int)quadid >= quads->numquads) {
-            return 0U;
-        }
-        quadids[i] = (unsigned int)quadid;
-    }
-
-    if (!quad_ready) {
-        status = quadfile_prefetch_stars_submit(
-            quads, quadids, (int)count, &ticket);
-        if (status > 0 && ticket) {
-            status = solver_payload_wait_advisory_ticket(
-                quads->fb, &ticket);
-            quad_ready = status > 0;
-        }
-        if (solver_poll_worker_stop(solver)) {
-            return 0U;
-        }
-    }
-    if (!quad_ready) {
-        return 0U;
-    }
-
-    for (i = 0U; i < count; i++) {
-        int star_index;
-
-        if (quadfile_get_stars(quads, quadids[i], stars)) {
-            return 0U;
-        }
-        for (star_index = 0;
-             star_index < dimquads;
-             star_index++) {
-            starids[star_count++] = stars[star_index];
-        }
-    }
-
-    if (!star_ready) {
-        status = startree_prefetch_stars_submit(
-            starkd, starids, (int)star_count, &ticket);
-        if (status > 0 && ticket) {
-            status = solver_payload_wait_advisory_ticket(
-                starkd->tree->io, &ticket);
-            star_ready = status > 0;
-        }
-        if (solver_poll_worker_stop(solver)) {
-            return 0U;
-        }
-    }
-    return quad_ready && star_ready ? count : 0U;
-}
-
-typedef enum solver_payload_candidate_window_state {
-    SOLVER_PAYLOAD_CANDIDATE_EMPTY = 0,
-    SOLVER_PAYLOAD_CANDIDATE_QUAD_PENDING,
-    SOLVER_PAYLOAD_CANDIDATE_QUAD_READY,
-    SOLVER_PAYLOAD_CANDIDATE_STAR_PENDING,
-    SOLVER_PAYLOAD_CANDIDATE_READY,
-    SOLVER_PAYLOAD_CANDIDATE_FAILED
-} solver_payload_candidate_window_state_t;
-
-typedef struct solver_payload_candidate_window {
-    fitsbin_payload_io_ticket_t* quad_ticket;
-    fitsbin_payload_io_ticket_t* star_ticket;
-    quadfile_t* quads;
-    startree_t* starkd;
-    unsigned int quadids[SOLVER_PAYLOAD_CANDIDATE_BATCH];
-    unsigned int starids[
-        SOLVER_PAYLOAD_CANDIDATE_BATCH * DQMAX];
-    size_t first;
-    size_t end;
-    size_t count;
-    size_t star_count;
-    int dimquads;
-    solver_payload_candidate_window_state_t state;
-} solver_payload_candidate_window_t;
-
-static void solver_payload_candidate_window_cancel(
-    solver_payload_candidate_window_t* window) {
-    if (!window) {
-        return;
-    }
-    if (window->quad_ticket && window->quads) {
-        (void)fitsbin_payload_io_ticket_cancel_and_wait(
-            window->quads->fb, window->quad_ticket);
-        fitsbin_payload_io_ticket_destroy(window->quad_ticket);
-        window->quad_ticket = NULL;
-    }
-    if (window->star_ticket && window->starkd &&
-        window->starkd->tree && window->starkd->tree->io) {
-        (void)fitsbin_payload_io_ticket_cancel_and_wait(
-            window->starkd->tree->io, window->star_ticket);
-        fitsbin_payload_io_ticket_destroy(window->star_ticket);
-        window->star_ticket = NULL;
-    }
-    memset(window, 0, sizeof(*window));
-}
-
-static int solver_payload_candidate_window_begin(
-    solver_payload_candidate_window_t* window,
-    const kdtree_qres_t* result,
-    size_t first,
-    size_t end,
-    int dimquads,
-    solver_t* solver) {
-    size_t i;
-    int status;
-
-    if (!window || !result || !solver || !solver->index ||
-        !solver->index->quads || !solver->index->starkd ||
-        !solver->index->quads->fb ||
-        !solver->index->starkd->tree ||
-        !solver->index->starkd->tree->io ||
-        !solver->index->starkd->tree->io_is_fitsbin ||
-        first >= end || end > (size_t)result->nres ||
-        end - first > SOLVER_PAYLOAD_CANDIDATE_BATCH ||
-        dimquads <= 0 || dimquads > DQMAX) {
-        return 0;
-    }
-    memset(window, 0, sizeof(*window));
-    window->quads = solver->index->quads;
-    window->starkd = solver->index->starkd;
-    window->first = first;
-    window->end = end;
-    window->count = end - first;
-    window->dimquads = dimquads;
-    if ((!fitsbin_payload_is_fully_resident(window->quads->fb) ||
-         !fitsbin_payload_is_fully_resident(
-             (fitsbin_t*)window->starkd->tree->io)) &&
-        !solver_payload_completion_service_available()) {
-        window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
-        return 0;
-    }
-    for (i = 0U; i < window->count; i++) {
-        int quadid = result->inds[first + i];
-
-        if (quadid < 0 ||
-            (unsigned int)quadid >= window->quads->numquads) {
-            window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
-            return 0;
-        }
-        window->quadids[i] = (unsigned int)quadid;
-    }
-    if (fitsbin_payload_is_fully_resident(window->quads->fb)) {
-        window->state = SOLVER_PAYLOAD_CANDIDATE_QUAD_READY;
-        return 1;
-    }
-    status = quadfile_prefetch_stars_submit(
-        window->quads,
-        window->quadids,
-        (int)window->count,
-        &window->quad_ticket);
-    if (status <= 0 || !window->quad_ticket) {
-        window->quad_ticket = NULL;
-        window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
-        return 0;
-    }
-    window->state = SOLVER_PAYLOAD_CANDIDATE_QUAD_PENDING;
-    return 1;
-}
-
-static int solver_payload_candidate_window_submit_stars(
-    solver_payload_candidate_window_t* window,
-    solver_t* solver) {
-    unsigned int stars[DQMAX];
-    size_t i;
-    int status;
-
-    if (!window || !solver ||
-        (window->state != SOLVER_PAYLOAD_CANDIDATE_QUAD_PENDING &&
-         window->state != SOLVER_PAYLOAD_CANDIDATE_QUAD_READY)) {
-        return 0;
-    }
-    if (window->state == SOLVER_PAYLOAD_CANDIDATE_QUAD_PENDING) {
-        status = solver_payload_wait_advisory_ticket(
-            window->quads->fb, &window->quad_ticket);
-        if (status <= 0 || solver_poll_worker_stop(solver)) {
-            window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
-            return 0;
-        }
-        window->state = SOLVER_PAYLOAD_CANDIDATE_QUAD_READY;
-    }
-    if (!fitsbin_payload_is_fully_resident(
-            (fitsbin_t*)window->starkd->tree->io) &&
-        !solver_payload_completion_service_available()) {
-        window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
-        return 0;
-    }
-    for (i = 0U; i < window->count; i++) {
-        int star_index;
-
-        if (quadfile_get_stars(
-                window->quads, window->quadids[i], stars)) {
-            window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
-            return 0;
-        }
-        for (star_index = 0;
-             star_index < window->dimquads;
-             star_index++) {
-            if (window->star_count >=
-                sizeof(window->starids) /
-                    sizeof(window->starids[0])) {
-                window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
-                return 0;
-            }
-            window->starids[window->star_count++] =
-                stars[star_index];
-        }
-    }
-    if (fitsbin_payload_is_fully_resident(
-            (fitsbin_t*)window->starkd->tree->io)) {
-        window->state = SOLVER_PAYLOAD_CANDIDATE_READY;
-        return 1;
-    }
-    status = startree_prefetch_stars_submit(
-        window->starkd,
-        window->starids,
-        (int)window->star_count,
-        &window->star_ticket);
-    if (status <= 0 || !window->star_ticket) {
-        window->star_ticket = NULL;
-        window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
-        return 0;
-    }
-    window->state = SOLVER_PAYLOAD_CANDIDATE_STAR_PENDING;
-    return 1;
-}
-
-static int solver_payload_candidate_window_wait(
-    solver_payload_candidate_window_t* window,
-    solver_t* solver) {
-    int status;
-
-    if (!window || !solver) {
-        return 0;
-    }
-    if ((window->state == SOLVER_PAYLOAD_CANDIDATE_QUAD_PENDING ||
-         window->state == SOLVER_PAYLOAD_CANDIDATE_QUAD_READY) &&
-        !solver_payload_candidate_window_submit_stars(
-            window, solver)) {
-        return 0;
-    }
-    if (window->state == SOLVER_PAYLOAD_CANDIDATE_STAR_PENDING) {
-        status = solver_payload_wait_advisory_ticket(
-            window->starkd->tree->io,
-            &window->star_ticket);
-        if (status <= 0 || solver_poll_worker_stop(solver)) {
-            window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
-            return 0;
-        }
-        window->state = SOLVER_PAYLOAD_CANDIDATE_READY;
-    }
-    return window->state == SOLVER_PAYLOAD_CANDIDATE_READY;
-}
-
 typedef struct solver_verification_score_slot {
     verify_prepared_hit_t* prepared;
 } solver_verification_score_slot_t;
@@ -5645,8 +3086,13 @@ typedef struct solver_verification_candidate_runtime {
 
 typedef struct solver_verification_task_input {
     const solver_verification_score_slot_t* slots;
+    size_t slot_first;
     size_t slot_count;
 } solver_verification_task_input_t;
+
+typedef struct solver_verification_retire_context {
+    size_t next_slot;
+} solver_verification_retire_context_t;
 
 static index_shard_helper_task_status_t
 solver_verification_helper_execute(
@@ -5690,6 +3136,29 @@ solver_verification_helper_ops = {
     solver_verification_helper_execute
 };
 
+static index_shard_helper_retire_status_t
+solver_verification_packet_retire(
+    const index_shard_helper_task_t* task,
+    size_t task_index,
+    void* owner_context) {
+    const solver_verification_task_input_t* input;
+    solver_verification_retire_context_t* context = owner_context;
+
+    (void)task_index;
+    if (!task || !context || !task->input ||
+        task->input_bytes != sizeof(*input)) {
+        return INDEX_SHARD_HELPER_RETIRE_ERROR;
+    }
+    input = task->input;
+    if (!input->slot_count ||
+        input->slot_first != context->next_slot ||
+        input->slot_count > SIZE_MAX - context->next_slot) {
+        return INDEX_SHARD_HELPER_RETIRE_ERROR;
+    }
+    context->next_slot += input->slot_count;
+    return INDEX_SHARD_HELPER_RETIRE_OK;
+}
+
 #define SOLVER_VERIFICATION_WAVE_MAX_BYTES \
     (32U * 1024U * 1024U)
 static size_t solver_verification_wave_memory_budget(void) {
@@ -5716,7 +3185,7 @@ static void solver_verification_wave_cleanup(
     verify_prepared_score_t* scores,
     size_t slot_count,
     solver_verification_candidate_runtime_t* runtime,
-    solver_ab_packet_t* packet) {
+    solver_verification_packet_t* packet) {
     size_t i;
 
     if (slots) {
@@ -5731,7 +3200,7 @@ static void solver_verification_wave_cleanup(
     free(slots);
     free(scores);
     free(runtime);
-    solver_ab_packet_free(packet);
+    solver_verification_packet_free(packet);
 }
 
 /*
@@ -5752,20 +3221,18 @@ static int solver_ab_try_verification_wave(
     solver_t* solver,
     anbool current_parity,
     int candidate_first,
-    int candidate_end,
-    size_t* payload_prepared) {
-    solver_ab_packet_t packet;
+    int candidate_end) {
+    solver_verification_packet_t packet;
     solver_ab_snapshot_t snapshot;
     solver_verification_candidate_runtime_t* runtime = NULL;
     solver_verification_score_slot_t* slots = NULL;
     verify_prepared_score_t* scores = NULL;
-    solver_payload_page_plan_t page_plan;
-    solver_payload_page_plan_t sweep_plan;
     index_shard_helper_task_t tasks[INDEX_SHARD_HELPER_MAX_TASKS];
     solver_verification_task_input_t
         inputs[INDEX_SHARD_HELPER_MAX_TASKS];
     index_shard_helper_run_stats_t run_stats;
     index_shard_helper_run_status_t run_status;
+    solver_verification_retire_context_t retire_context;
     size_t available = 0U;
     size_t candidate_count;
     size_t verify_count = 0U;
@@ -5777,7 +3244,6 @@ static int solver_ab_try_verification_wave(
     double verify_wall_start;
     double verify_wall_seconds;
     int candidate_index;
-    int delivery_status;
     int handled = 0;
 
     if (!result || !field_xy || !fieldstars || !solver ||
@@ -5787,14 +3253,14 @@ static int solver_ab_try_verification_wave(
         candidate_end - candidate_first >
             (int)SOLVER_VERIFICATION_WINDOW_CANDIDATES ||
         verify_datalog_enabled() ||
+        !solver_payload_candidate_data_fully_resident(solver) ||
         !index_shard_worker_context_active()) {
         return 0;
     }
     candidate_count = (size_t)(candidate_end - candidate_first);
-    if (payload_prepared &&
-        (*payload_prepared < (size_t)candidate_first ||
-         *payload_prepared > (size_t)candidate_end)) {
-        *payload_prepared = (size_t)candidate_first;
+    available = index_shard_helper_available_workers();
+    if (!available) {
+        return 0;
     }
 
     memset(&packet, 0, sizeof(packet));
@@ -5802,14 +3268,11 @@ static int solver_ab_try_verification_wave(
     memset(tasks, 0, sizeof(tasks));
     memset(inputs, 0, sizeof(inputs));
     memset(&run_stats, 0, sizeof(run_stats));
-    solver_payload_page_plan_init(
-        &page_plan, solver);
-    solver_payload_page_plan_init(
-        &sweep_plan, solver);
+    memset(&retire_context, 0, sizeof(retire_context));
 
-    if (solver_ab_packet_reserve_candidates(
+    if (solver_verification_packet_reserve(
             &packet, candidate_count) !=
-        SOLVER_AB_RESERVE_OK) {
+        SOLVER_PACKET_RESERVE_OK) {
         goto cleanup;
     }
     runtime = calloc(candidate_count, sizeof(*runtime));
@@ -5845,38 +3308,6 @@ static int solver_ab_try_verification_wave(
         solver_ab_candidate_t* candidate =
             &packet.candidates[packet_index];
 
-        if (!((candidate_index - candidate_first) %
-              (int)SOLVER_PAYLOAD_CANDIDATE_BATCH) &&
-            (!payload_prepared ||
-             *payload_prepared <= (size_t)candidate_index)) {
-            size_t expected = MIN(
-                (size_t)candidate_end -
-                    (size_t)candidate_index,
-                (size_t)SOLVER_PAYLOAD_CANDIDATE_BATCH);
-            size_t prepared = solver_payload_prepare_candidate_rows(
-                result,
-                (size_t)candidate_index,
-                (size_t)candidate_end,
-                dimquads,
-                solver);
-
-            if (prepared != expected) {
-                if (solver_poll_worker_stop(solver)) {
-                    solver->quit_now = TRUE;
-                    handled = 1;
-                }
-                goto cleanup;
-            }
-            if (payload_prepared &&
-                *payload_prepared == (size_t)candidate_index) {
-                *payload_prepared += prepared;
-            }
-            if (solver_poll_worker_stop(solver)) {
-                solver->quit_now = TRUE;
-                handled = 1;
-                goto cleanup;
-            }
-        }
         if (solver_poll_worker_stop(solver)) {
             solver->quit_now = TRUE;
             handled = 1;
@@ -5893,11 +3324,17 @@ static int solver_ab_try_verification_wave(
                 current_parity)) {
             goto cleanup;
         }
-        packet.candidate_count++;
         if (candidate->action ==
             SOLVER_AB_CANDIDATE_VERIFY) {
             verify_count++;
         }
+    }
+    if (verify_count < 2U) {
+        goto cleanup;
+    }
+    available = index_shard_helper_prepare_reserve();
+    if (!available) {
+        goto cleanup;
     }
     verify_wall_start = monotonic_seconds();
     for (candidate_index = candidate_first;
@@ -5947,52 +3384,6 @@ static int solver_ab_try_verification_wave(
                 solver,
                 &candidate_runtime->match,
                 &candidate_runtime->logaccept);
-        slot_cursor++;
-        if (solver_payload_page_plan_add_query(
-                &page_plan,
-                solver->index->starkd->tree,
-                candidate_runtime->match.center,
-                square(candidate_runtime->match.radius),
-                KD_OPTIONS_SMALL_RADIUS |
-                    KD_OPTIONS_RETURN_POINTS)) {
-            break;
-        }
-    }
-    if (page_plan.delivery_unavailable) {
-        goto cleanup;
-    }
-    if (solver_payload_page_plan_coalesce(&page_plan)) {
-        goto cleanup;
-    }
-    delivery_status =
-        solver_payload_page_plan_deliver(&page_plan);
-    if (solver_poll_worker_stop(solver)) {
-        solver->quit_now = TRUE;
-        handled = 1;
-        goto cleanup;
-    }
-    if ((page_plan.range_count && delivery_status <= 0) ||
-        slot_cursor != verify_count) {
-        goto cleanup;
-    }
-    if (solver_payload_page_plan_add_starkd_sweep(
-            &page_plan,
-            solver->index->starkd,
-            &sweep_plan)) {
-        goto cleanup;
-    }
-    if (sweep_plan.delivery_unavailable) {
-        goto cleanup;
-    }
-    delivery_status =
-        solver_payload_page_plan_deliver(&sweep_plan);
-    if (solver_poll_worker_stop(solver)) {
-        solver->quit_now = TRUE;
-        handled = 1;
-        goto cleanup;
-    }
-    if (sweep_plan.range_count && delivery_status <= 0) {
-        goto cleanup;
     }
     peak_budget = solver_verification_wave_memory_budget();
     slot_cursor = 0U;
@@ -6048,9 +3439,6 @@ static int solver_ab_try_verification_wave(
     }
 
     if (verify_count) {
-        index_shard_helper_task_status_t task_status;
-
-        available = index_shard_helper_prepare_reserve();
         task_count = MIN(
             verify_count,
             MIN(available + 1U,
@@ -6068,6 +3456,7 @@ static int solver_ab_try_verification_wave(
             unsigned long long work_units = 0U;
 
             inputs[task_index].slots = &slots[slot_cursor];
+            inputs[task_index].slot_first = slot_cursor;
             inputs[task_index].slot_count = count;
             for (i = 0U; i < count; i++) {
                 unsigned long long work =
@@ -6095,33 +3484,13 @@ static int solver_ab_try_verification_wave(
             goto cleanup;
         }
 
-        if (task_count == 1U) {
-            index_shard_helper_prepare_cancel();
-            task_status = solver_verification_helper_execute(
-                tasks[0].input,
-                tasks[0].input_bytes,
-                tasks[0].output,
-                tasks[0].output_bytes);
-            if (task_status == INDEX_SHARD_HELPER_TASK_STOPPED) {
-                (void)solver_poll_worker_stop(solver);
-                solver->quit_now = TRUE;
-                handled = 1;
-                goto cleanup;
-            }
-            if (task_status != INDEX_SHARD_HELPER_TASK_OK) {
-                goto cleanup;
-            }
-            run_status = INDEX_SHARD_HELPER_OK;
-            run_stats.owner_tasks = 1U;
-            run_stats.owner_work_units = tasks[0].work_units;
-            run_stats.max_concurrent_tasks = 1U;
-        } else {
-            run_status = index_shard_helper_run(
-                &solver_verification_helper_ops,
-                tasks,
-                task_count,
-                &run_stats);
-        }
+        run_status = index_shard_helper_run_ordered(
+            &solver_verification_helper_ops,
+            tasks,
+            task_count,
+            solver_verification_packet_retire,
+            &retire_context,
+            &run_stats);
         if (run_status == INDEX_SHARD_HELPER_UNAVAILABLE ||
             run_status == INDEX_SHARD_HELPER_TASK_FAILED) {
             goto cleanup;
@@ -6133,6 +3502,12 @@ static int solver_ab_try_verification_wave(
             goto cleanup;
         }
         if (run_status != INDEX_SHARD_HELPER_OK) {
+            solver->profile.execution_failed = TRUE;
+            solver->quit_now = TRUE;
+            handled = 1;
+            goto cleanup;
+        }
+        if (retire_context.next_slot != verify_count) {
             solver->profile.execution_failed = TRUE;
             solver->quit_now = TRUE;
             handled = 1;
@@ -6281,8 +3656,6 @@ static int solver_ab_try_verification_wave(
 
 cleanup:
     index_shard_helper_prepare_cancel();
-    solver_payload_page_plan_destroy(&sweep_plan);
-    solver_payload_page_plan_destroy(&page_plan);
     solver_verification_wave_cleanup(
         slots,
         scores,
@@ -6308,7 +3681,7 @@ typedef struct solver_ab_descriptor_task_input {
 } solver_ab_descriptor_task_input_t;
 
 typedef struct solver_ab_descriptor_workspace {
-    solver_ab_executor_t planner;
+    solver_ab_descriptor_planner_t planner;
     solver_ab_descriptor_output_t* outputs;
 } solver_ab_descriptor_workspace_t;
 
@@ -6319,7 +3692,7 @@ static int solver_ab_descriptor_workspace_status = EAGAIN;
 
 static void solver_ab_descriptor_release_pairs(
     solver_ab_descriptor_workspace_t* workspace) {
-    solver_ab_executor_t* planner;
+    solver_ab_descriptor_planner_t* planner;
 
     if (!workspace) {
         return;
@@ -6379,8 +3752,6 @@ solver_ab_descriptor_workspace_get(void) {
         free(workspace);
         return NULL;
     }
-    workspace->planner.worker_count =
-        (int)SOLVER_AB_DESCRIPTOR_MAX_TASKS;
     workspace->planner.pair_cache_limit_bytes =
         SOLVER_AB_DESCRIPTOR_PAIR_CACHE_BYTES;
     if (pthread_setspecific(
@@ -6400,14 +3771,11 @@ solver_ab_descriptor_helper_execute(
     size_t output_size) {
     const solver_ab_descriptor_task_input_t* input = input_bytes;
     solver_ab_descriptor_output_t* output = output_bytes;
-    solver_ab_executor_t executor;
+    solver_ab_descriptor_planner_t executor;
     solver_ab_builder_t builder;
-    solver_ab_packet_t packet;
+    solver_descriptor_status_t status;
     solver_ab_task_t task;
     int eligible[SOLVER_AB_DESCRIPTOR_MAX_FIELD_OBJECTS];
-    int* eligible_pointer = eligible;
-    size_t eligible_capacity =
-        SOLVER_AB_DESCRIPTOR_MAX_FIELD_OBJECTS;
     int visit_result;
 
     if (!input ||
@@ -6432,7 +3800,7 @@ solver_ab_descriptor_helper_execute(
 
     memset(&executor, 0, sizeof(executor));
     memset(&builder, 0, sizeof(builder));
-    memset(&packet, 0, sizeof(packet));
+    memset(&status, 0, sizeof(status));
     memset(&task, 0, sizeof(task));
     output->descriptor_count = 0U;
     output->trailing_numtries = 0U;
@@ -6440,16 +3808,15 @@ solver_ab_descriptor_helper_execute(
     output->trailing_meanx = 0U;
     output->has_final_rel_field_noise2 = FALSE;
 
-    executor.worker_count = 1;
     executor.field_geometry = input->field_geometry;
     executor.newpoint = input->newpoint;
     executor.dimquads = input->dimquads;
     executor.phase = input->phase;
     executor.pairs = (solver_ab_pair_t*)input->pairs;
     executor.pair_count = input->pair_count;
-    executor.combination_eligible = &eligible_pointer;
+    executor.combination_eligible = eligible;
     executor.combination_eligible_capacity =
-        &eligible_capacity;
+        SOLVER_AB_DESCRIPTOR_MAX_FIELD_OBJECTS;
     executor.snapshot.parity = input->parity;
     executor.snapshot.cx_less_than_dx =
         input->cx_less_than_dx;
@@ -6457,26 +3824,23 @@ solver_ab_descriptor_helper_execute(
         input->meanx_less_than_half;
     executor.snapshot.cxdx_margin = input->cxdx_margin;
 
-    builder.executor = &executor;
-    builder.packet = &packet;
+    builder.planner = &executor;
+    builder.status = &status;
     builder.descriptor_output = output;
-    builder.worker_id = 0;
     task.combination_first = input->combination_first;
     task.combination_end = input->combination_end;
     visit_result = solver_ab_walk_task_ranges(
         &executor,
         &task,
-        0,
         solver_ab_builder_visit_pair_range,
         &builder);
-    if (packet.cancelled ||
+    if (status.cancelled ||
         index_shard_worker_stop_requested()) {
         return INDEX_SHARD_HELPER_TASK_STOPPED;
     }
     if (visit_result < 0 ||
         builder.fatal_error ||
-        packet.evaluation_failed ||
-        packet.allocation_failed) {
+        status.evaluation_failed) {
         return INDEX_SHARD_HELPER_TASK_ERROR;
     }
     output->trailing_numtries = builder.pending_numtries;
@@ -6488,12 +3852,6 @@ solver_ab_descriptor_helper_execute(
         builder.rel_field_noise_valid;
     return INDEX_SHARD_HELPER_TASK_OK;
 }
-
-static const index_shard_helper_ops_t
-solver_ab_descriptor_helper_ops = {
-    "ab-descriptor",
-    solver_ab_descriptor_helper_execute
-};
 
 static size_t solver_ab_descriptor_expansion(
     int dimquads,
@@ -6517,199 +3875,422 @@ static size_t solver_ab_descriptor_expansion(
     return expansion;
 }
 
-#define SOLVER_AB_IO_BATCH_DESCRIPTORS 64U
-#define SOLVER_AB_IO_BATCH_SLOTS 2U
-#define SOLVER_AB_IO_PROBE_DESCRIPTORS \
-    MAX(1U, SOLVER_AB_IO_BATCH_DESCRIPTORS / \
-        (SOLVER_AB_IO_BATCH_SLOTS * 4U))
+#define SOLVER_CODEKD_PACKET_RESULT_LIMIT_BYTES \
+    (2U * 1024U * 1024U)
 
-typedef enum solver_ab_io_batch_state {
-    SOLVER_AB_IO_BATCH_EMPTY = 0,
-    SOLVER_AB_IO_BATCH_PLANNED,
-    SOLVER_AB_IO_BATCH_SUBMITTED,
-    SOLVER_AB_IO_BATCH_READY,
-    SOLVER_AB_IO_BATCH_EXECUTING,
-    SOLVER_AB_IO_BATCH_RETIRED,
-    SOLVER_AB_IO_BATCH_CANCELLED
-} solver_ab_io_batch_state_t;
+#define SOLVER_CODEKD_DELIVERY_RANGE_CAPACITY \
+    FITSBIN_PREAD_ASYNC_RANGE_LIMIT
+#define SOLVER_CODEKD_DELIVERY_BUDGET_BYTES \
+    (2U * 1024U * 1024U)
 
-typedef struct solver_ab_io_batch {
-    solver_payload_page_delivery_t delivery;
+typedef enum solver_codekd_result_state {
+    SOLVER_CODEKD_RESULT_UNUSED = 0,
+    SOLVER_CODEKD_RESULT_READY,
+    SOLVER_CODEKD_RESULT_OWNER_REPLAY
+} solver_codekd_result_state_t;
+
+typedef struct solver_codekd_result_slot {
+    size_t hit_first;
+    unsigned int hit_count;
+    double search_wall_seconds;
+    solver_codekd_result_state_t state;
+} solver_codekd_result_slot_t;
+
+typedef enum solver_codekd_search_packet_state {
+    SOLVER_CODEKD_PACKET_PLANNED = 0,
+    SOLVER_CODEKD_PACKET_DELIVERY_SUBMITTED,
+    SOLVER_CODEKD_PACKET_DELIVERY_READY,
+    SOLVER_CODEKD_PACKET_DELIVERY_SKIPPED,
+    SOLVER_CODEKD_PACKET_EXECUTING,
+    SOLVER_CODEKD_PACKET_READY,
+    SOLVER_CODEKD_PACKET_RETIRING,
+    SOLVER_CODEKD_PACKET_RETIRED,
+    SOLVER_CODEKD_PACKET_STOPPED,
+    SOLVER_CODEKD_PACKET_FAILED
+} solver_codekd_search_packet_state_t;
+
+typedef struct solver_codekd_search_packet {
+    solver_ab_descriptor_output_t* descriptors;
+    const kdtree_t* tree;
+    solver_codekd_result_slot_t* slots;
+    u32* inds;
+    double* sdists;
+    size_t hit_capacity;
+    size_t hit_count;
     size_t first;
     size_t count;
-    size_t io_count;
     unsigned long long sequence;
-    anbool plan_probed;
-    anbool plan_usable;
-    anbool io_submitted;
-    anbool io_ready;
-    solver_ab_io_batch_state_t state;
-} solver_ab_io_batch_t;
+    fitsbin_t* delivery_source;
+    fitsbin_payload_io_ticket_t* delivery_ticket;
+    anbool detailed;
+    solver_codekd_search_packet_state_t state;
+} solver_codekd_search_packet_t;
 
-static void solver_ab_io_batch_prepare_ready(
-    const solver_ab_descriptor_output_t* output,
-    size_t first,
-    unsigned long long sequence,
-    solver_ab_io_batch_t* batch) {
-    memset(batch, 0, sizeof(*batch));
-    batch->first = first;
-    batch->sequence = sequence;
-    if (!output || first >= output->descriptor_count) {
-        batch->state = SOLVER_AB_IO_BATCH_EMPTY;
-        return;
+typedef struct solver_codekd_packet_task_input {
+    solver_ab_descriptor_task_input_t descriptor;
+    const kdtree_t* tree;
+    anbool detailed;
+} solver_codekd_packet_task_input_t;
+
+typedef struct solver_codekd_page_plan {
+    fitsbin_t* source;
+    fitsbin_prefetch_range_t
+        ranges[SOLVER_CODEKD_DELIVERY_RANGE_CAPACITY];
+    anbool enabled;
+    size_t range_count;
+    anbool full;
+} solver_codekd_page_plan_t;
+
+static int solver_codekd_page_plan_enabled(
+    void* opaque,
+    void* mapping) {
+    solver_codekd_page_plan_t* plan = opaque;
+    fitsbin_t* source = mapping;
+
+    if (!plan || !plan->enabled || !source ||
+        plan->full || plan->source != source) {
+        return FALSE;
     }
-    batch->count = output->descriptor_count - first;
-    batch->state = SOLVER_AB_IO_BATCH_READY;
+    return TRUE;
 }
 
-static int solver_ab_io_batch_prepare(
-    solver_t* solver,
-    const solver_ab_descriptor_output_t* output,
-    size_t first,
-    size_t descriptor_limit,
-    unsigned long long sequence,
-    solver_ab_io_batch_t* batch) {
-    const kdtree_t* tree;
-    size_t target_count;
-    size_t end;
-    size_t descriptor_index;
-    solver_payload_page_plan_t plan;
-    int options =
-        KD_OPTIONS_SMALL_RADIUS |
-        KD_OPTIONS_COMPUTE_DISTS |
-        KD_OPTIONS_NO_RESIZE_RESULTS |
-        KD_OPTIONS_USE_SPLIT;
-    int submitted = 0;
+static int solver_codekd_page_plan_emit(
+    void* opaque,
+    const kdtree_prefetch_hint_t* hint) {
+    solver_codekd_page_plan_t* plan = opaque;
+    fitsbin_prefetch_range_t* range;
 
-    memset(batch, 0, sizeof(*batch));
-    batch->state = SOLVER_AB_IO_BATCH_PLANNED;
-    batch->first = first;
-    batch->sequence = sequence;
-    if (!output || first >= output->descriptor_count) {
-        batch->state = SOLVER_AB_IO_BATCH_EMPTY;
+    if (!plan || !hint || !hint->mapping ||
+        !hint->address || !hint->length) {
+        return -1;
+    }
+    if (hint->priority != KDTREE_PREFETCH_PRIORITY_LEAF ||
+        (hint->kind != KDTREE_PREFETCH_ARRAY_DATA &&
+         hint->kind != KDTREE_PREFETCH_ARRAY_PERM)) {
         return 0;
     }
-    batch->count = MIN(
-        MAX((size_t)1U, descriptor_limit),
-        output->descriptor_count - first);
-    target_count = batch->count;
-    if (!solver || !solver->index || !solver->index->codekd ||
-        !solver->index->codekd->tree) {
-        batch->plan_probed = TRUE;
-        batch->state = SOLVER_AB_IO_BATCH_READY;
+    if (!plan->source) {
+        plan->source = hint->mapping;
+    }
+    if (plan->source != hint->mapping) {
+        return -1;
+    }
+    if (plan->range_count >=
+        SOLVER_CODEKD_DELIVERY_RANGE_CAPACITY) {
+        plan->full = TRUE;
         return 0;
     }
-    tree = solver->index->codekd->tree;
-    if (!tree->io || !tree->io_is_fitsbin ||
-        (!fitsbin_payload_is_fully_resident(
-             (const fitsbin_t*)tree->io) &&
-         !solver_payload_completion_service_available())) {
-        batch->plan_probed = TRUE;
-        batch->state = SOLVER_AB_IO_BATCH_READY;
-        return 0;
-    }
-    solver_payload_page_plan_init(&plan, solver);
-    end = first + target_count;
-
-    for (descriptor_index = first;
-         descriptor_index < end;
-         descriptor_index++) {
-        const solver_ab_descriptor_t* descriptor =
-            &output->descriptors[descriptor_index];
-
-        if (solver_payload_page_plan_add_query(
-                &plan,
-                tree,
-                descriptor->code,
-                descriptor->tol2,
-                options)) {
-            break;
-        }
-    }
-    batch->plan_probed = TRUE;
-    if (!plan.failed) {
-        submitted = solver_payload_page_plan_submit(
-            &plan, &batch->delivery);
-    }
-    batch->io_count = plan.range_count;
-    solver_payload_page_plan_destroy(&plan);
-    if (submitted <= 0) {
-        solver_payload_page_delivery_cancel(&batch->delivery);
-        memset(&batch->delivery, 0, sizeof(batch->delivery));
-        batch->state = SOLVER_AB_IO_BATCH_READY;
-        return 0;
-    }
-    batch->plan_usable = TRUE;
-    batch->io_submitted = batch->delivery.ticket != NULL;
-    batch->io_ready = batch->delivery.ready;
-    batch->state = batch->delivery.ready
-        ? SOLVER_AB_IO_BATCH_READY
-        : SOLVER_AB_IO_BATCH_SUBMITTED;
+    range = &plan->ranges[plan->range_count++];
+    range->data = hint->address;
+    range->size = hint->length;
     return 0;
 }
 
-static int solver_ab_io_batch_wait(
-    solver_ab_io_batch_t* batch) {
+/*
+ * Complete a bounded exact DATA/PERM page plan before this coarse packet
+ * dereferences its sparse payload. The ticket is advisory: native CodeKD is
+ * still the authoritative reader after refusal, cancellation, or I/O error.
+ */
+static int solver_codekd_search_packet_complete_pages(
+    const solver_codekd_packet_task_input_t* input,
+    solver_codekd_search_packet_t* packet) {
+    solver_codekd_page_plan_t plan;
+    kdtree_prefetch_sink_t sink;
+    fitsbin_t* source;
+    size_t descriptor_index;
+    int submit_status;
     int wait_status;
 
-    if (!batch ||
-        batch->state != SOLVER_AB_IO_BATCH_SUBMITTED) {
+    if (!input || !packet || !input->tree ||
+        !input->tree->io || !input->tree->io_is_fitsbin ||
+        packet->state != SOLVER_CODEKD_PACKET_PLANNED ||
+        !packet->descriptors || !packet->count) {
         return 0;
     }
-    wait_status = solver_payload_page_delivery_wait(
-        &batch->delivery);
-    if (wait_status <= 0) {
-        solver_payload_page_delivery_cancel(&batch->delivery);
-        memset(&batch->delivery, 0, sizeof(batch->delivery));
-        batch->plan_usable = FALSE;
-        batch->state = SOLVER_AB_IO_BATCH_READY;
+    memset(&plan, 0, sizeof(plan));
+    source = (fitsbin_t*)input->tree->io;
+    if (fitsbin_payload_io_service_width() <= 0 ||
+        fitsbin_payload_is_fully_resident(source) ||
+        fitsbin_get_mmap_advice(source) !=
+            FITSBIN_MMAP_ADVICE_RANDOM) {
         return 0;
     }
-    batch->io_ready = TRUE;
-    batch->state = SOLVER_AB_IO_BATCH_READY;
+    memset(&sink, 0, sizeof(sink));
+    sink.userdata = &plan;
+    sink.enabled = solver_codekd_page_plan_enabled;
+    sink.emit = solver_codekd_page_plan_emit;
+    plan.source = source;
+    plan.enabled = TRUE;
+
+    for (descriptor_index = 0U;
+         descriptor_index < packet->count && !plan.full;
+         descriptor_index++) {
+        const solver_ab_descriptor_t* descriptor =
+            &packet->descriptors->descriptors[descriptor_index];
+
+        if (kdtree_rangesearch_prefetch_prepare(
+                input->tree,
+                descriptor->code,
+                descriptor->tol2,
+                SOLVER_CODEKD_SEARCH_OPTIONS,
+                &sink) < 0) {
+            return 0;
+        }
+    }
+    if (!plan.source || !plan.range_count ||
+        index_shard_worker_stop_requested()) {
+        return 0;
+    }
+
+    submit_status = fitsbin_prefetch_ranges_submit(
+        plan.source,
+        plan.ranges,
+        plan.range_count,
+        SOLVER_CODEKD_DELIVERY_BUDGET_BYTES,
+        &packet->delivery_ticket);
+    if (submit_status <= 0 || !packet->delivery_ticket) {
+        packet->delivery_ticket = NULL;
+        return 0;
+    }
+    packet->delivery_source = plan.source;
+    packet->state = SOLVER_CODEKD_PACKET_DELIVERY_SUBMITTED;
+    if (index_shard_worker_stop_requested()) {
+        wait_status = fitsbin_payload_io_ticket_cancel_and_wait(
+            packet->delivery_source,
+            packet->delivery_ticket);
+    } else {
+        wait_status = fitsbin_payload_io_ticket_wait(
+            packet->delivery_source,
+            packet->delivery_ticket);
+    }
+    fitsbin_payload_io_ticket_destroy(packet->delivery_ticket);
+    packet->delivery_ticket = NULL;
+    packet->delivery_source = NULL;
+
+    if (index_shard_worker_stop_requested()) {
+        packet->state = SOLVER_CODEKD_PACKET_STOPPED;
+        return -1;
+    }
+    packet->state = wait_status > 0
+        ? SOLVER_CODEKD_PACKET_DELIVERY_READY
+        : SOLVER_CODEKD_PACKET_DELIVERY_SKIPPED;
+    return wait_status > 0 ? 1 : 0;
+}
+
+static void solver_codekd_search_packet_cleanup(
+    solver_codekd_search_packet_t* packet) {
+    if (!packet) {
+        return;
+    }
+    if (packet->delivery_ticket && packet->delivery_source) {
+        (void)fitsbin_payload_io_ticket_cancel_and_wait(
+            packet->delivery_source,
+            packet->delivery_ticket);
+        fitsbin_payload_io_ticket_destroy(
+            packet->delivery_ticket);
+    }
+    free(packet->slots);
+    free(packet->inds);
+    free(packet->sdists);
+    memset(packet, 0, sizeof(*packet));
+}
+
+/*
+ * Return zero when the bounded output arena is ready, one for an exact native
+ * fallback, and minus one for an invalid packet request.
+ */
+static int solver_codekd_search_packet_prepare(
+    solver_codekd_search_packet_t* packet,
+    solver_ab_descriptor_output_t* descriptors,
+    const kdtree_t* tree,
+    unsigned long long sequence,
+    anbool detailed) {
+    size_t metadata_bytes;
+    size_t hit_bytes;
+
+    if (!packet || !descriptors || !tree ||
+        SOLVER_AB_DESCRIPTOR_CAPACITY >
+            SIZE_MAX / sizeof(*packet->slots)) {
+        return -1;
+    }
+    memset(packet, 0, sizeof(*packet));
+    metadata_bytes =
+        SOLVER_AB_DESCRIPTOR_CAPACITY * sizeof(*packet->slots);
+    if (metadata_bytes >= SOLVER_CODEKD_PACKET_RESULT_LIMIT_BYTES) {
+        return 1;
+    }
+    hit_bytes =
+        SOLVER_CODEKD_PACKET_RESULT_LIMIT_BYTES - metadata_bytes;
+    packet->hit_capacity =
+        hit_bytes / (sizeof(*packet->inds) + sizeof(*packet->sdists));
+    if (!packet->hit_capacity ||
+        packet->hit_capacity > SIZE_MAX / sizeof(*packet->inds) ||
+        packet->hit_capacity > SIZE_MAX / sizeof(*packet->sdists)) {
+        return 1;
+    }
+
+    packet->slots = calloc(
+        SOLVER_AB_DESCRIPTOR_CAPACITY, sizeof(*packet->slots));
+    packet->inds = malloc(
+        packet->hit_capacity * sizeof(*packet->inds));
+    packet->sdists = malloc(
+        packet->hit_capacity * sizeof(*packet->sdists));
+    if (!packet->slots || !packet->inds || !packet->sdists) {
+        solver_codekd_search_packet_cleanup(packet);
+        return 1;
+    }
+
+    packet->descriptors = descriptors;
+    packet->tree = tree;
+    packet->sequence = sequence;
+    packet->detailed = detailed;
+    packet->state = SOLVER_CODEKD_PACKET_PLANNED;
     return 0;
 }
 
-static int solver_ab_io_batch_retire(
-    solver_ab_io_batch_t* batch) {
-    if (!batch) {
-        return 0;
+/*
+ * Build one immutable descriptor range and execute its CodeKD queries on the
+ * claiming lane. The owner retains the index and mapping lifetime until this
+ * synchronous helper group is quiescent. Query hits are copied into a bounded
+ * private arena; an oversized or allocation-failed query is replayed exactly
+ * by the owner during ordered retirement.
+ */
+static index_shard_helper_task_status_t
+solver_codekd_packet_helper_execute(
+    const void* input_bytes,
+    size_t input_size,
+    void* output_bytes,
+    size_t output_size) {
+    const solver_codekd_packet_task_input_t* input = input_bytes;
+    solver_codekd_search_packet_t* packet = output_bytes;
+    kdtree_qres_t* query_result = NULL;
+    index_shard_helper_task_status_t descriptor_status;
+    size_t descriptor_index;
+    int delivery_status;
+
+    if (!input || input_size != sizeof(*input) ||
+        !packet || output_size != sizeof(*packet) ||
+        !input->tree || packet->tree != input->tree ||
+        !packet->descriptors || !packet->slots ||
+        !packet->inds || !packet->sdists ||
+        packet->sequence != input->descriptor.combination_first ||
+        packet->state != SOLVER_CODEKD_PACKET_PLANNED) {
+        return INDEX_SHARD_HELPER_TASK_ERROR;
     }
-    solver_payload_page_delivery_cancel(&batch->delivery);
-    memset(&batch->delivery, 0, sizeof(batch->delivery));
-    batch->state = SOLVER_AB_IO_BATCH_RETIRED;
-    return 0;
+
+    descriptor_status = solver_ab_descriptor_helper_execute(
+        &input->descriptor,
+        sizeof(input->descriptor),
+        packet->descriptors,
+        sizeof(*packet->descriptors));
+    if (descriptor_status != INDEX_SHARD_HELPER_TASK_OK) {
+        packet->state =
+            descriptor_status == INDEX_SHARD_HELPER_TASK_STOPPED
+                ? SOLVER_CODEKD_PACKET_STOPPED
+                : SOLVER_CODEKD_PACKET_FAILED;
+        return descriptor_status;
+    }
+    if (packet->descriptors->descriptor_count >
+        SOLVER_AB_DESCRIPTOR_CAPACITY) {
+        packet->state = SOLVER_CODEKD_PACKET_FAILED;
+        return INDEX_SHARD_HELPER_TASK_ERROR;
+    }
+
+    packet->first = 0U;
+    packet->count = packet->descriptors->descriptor_count;
+    delivery_status =
+        solver_codekd_search_packet_complete_pages(
+            input, packet);
+    if (delivery_status < 0) {
+        return INDEX_SHARD_HELPER_TASK_STOPPED;
+    }
+    packet->state = SOLVER_CODEKD_PACKET_EXECUTING;
+    for (descriptor_index = 0U;
+         descriptor_index < packet->count;
+         descriptor_index++) {
+        const solver_ab_descriptor_t* descriptor =
+            &packet->descriptors->descriptors[descriptor_index];
+        solver_codekd_result_slot_t* slot =
+            &packet->slots[descriptor_index];
+        kdtree_qres_t* previous_result = query_result;
+        double search_wall_start = 0.0;
+
+        if (index_shard_worker_stop_requested()) {
+            kdtree_free_query(query_result);
+            packet->state = SOLVER_CODEKD_PACKET_STOPPED;
+            return INDEX_SHARD_HELPER_TASK_STOPPED;
+        }
+        if (packet->detailed) {
+            search_wall_start = monotonic_seconds();
+        }
+        query_result = solver_codekd_rangesearch(
+            input->tree,
+            previous_result,
+            descriptor->code,
+            descriptor->tol2,
+            SOLVER_CODEKD_SEARCH_OPTIONS);
+        if (packet->detailed) {
+            slot->search_wall_seconds =
+                monotonic_seconds() - search_wall_start;
+        }
+        if (!query_result) {
+            kdtree_free_query(previous_result);
+            slot->state = SOLVER_CODEKD_RESULT_OWNER_REPLAY;
+            continue;
+        }
+        if ((query_result->nres &&
+             (!query_result->inds || !query_result->sdists)) ||
+            packet->hit_count > packet->hit_capacity ||
+            (size_t)query_result->nres >
+                packet->hit_capacity - packet->hit_count) {
+            slot->state = SOLVER_CODEKD_RESULT_OWNER_REPLAY;
+            continue;
+        }
+
+        slot->hit_first = packet->hit_count;
+        slot->hit_count = query_result->nres;
+        if (slot->hit_count) {
+            memcpy(
+                packet->inds + slot->hit_first,
+                query_result->inds,
+                (size_t)slot->hit_count * sizeof(*packet->inds));
+            memcpy(
+                packet->sdists + slot->hit_first,
+                query_result->sdists,
+                (size_t)slot->hit_count * sizeof(*packet->sdists));
+        }
+        packet->hit_count += slot->hit_count;
+        slot->state = SOLVER_CODEKD_RESULT_READY;
+    }
+
+    kdtree_free_query(query_result);
+    packet->state = SOLVER_CODEKD_PACKET_READY;
+    return INDEX_SHARD_HELPER_TASK_OK;
 }
 
-static int solver_ab_io_batch_cancel(
-    solver_ab_io_batch_t* batch) {
-    if (!batch) {
-        return 0;
-    }
-    solver_payload_page_delivery_cancel(&batch->delivery);
-    memset(&batch->delivery, 0, sizeof(batch->delivery));
-    batch->state = SOLVER_AB_IO_BATCH_CANCELLED;
-    return 0;
-}
+static const index_shard_helper_ops_t
+solver_codekd_packet_helper_ops = {
+    "codekd-packet",
+    solver_codekd_packet_helper_execute
+};
 
-static int solver_ab_descriptor_reduce_range(
-    solver_t* solver,
+/* Exact native execution used whenever packet admission is unavailable. */
+static int solver_codekd_descriptor_execute_owner(
     const solver_ab_descriptor_output_t* output,
-    size_t first,
-    size_t count,
+    solver_t* solver,
     int dimquads,
     kdtree_qres_t** query_result,
     unsigned long long* reduced) {
-    size_t end;
     size_t descriptor_index;
 
-    if (!solver || !output || first > output->descriptor_count ||
-        count > output->descriptor_count - first) {
+    if (!output || !solver || !query_result || !reduced) {
         return -1;
     }
-    end = first + count;
-    for (descriptor_index = first;
-         descriptor_index < end;
+    solver->profile.max_batch_hypotheses = MAX(
+        solver->profile.max_batch_hypotheses,
+        output->descriptor_count);
+    for (descriptor_index = 0U;
+         descriptor_index < output->descriptor_count;
          descriptor_index++) {
         const solver_ab_descriptor_t* descriptor =
             &output->descriptors[descriptor_index];
@@ -6717,8 +4298,7 @@ static int solver_ab_descriptor_reduce_range(
         if (solver_poll_worker_stop(solver)) {
             return 1;
         }
-        solver->rel_field_noise2 =
-            descriptor->rel_field_noise2;
+        solver->rel_field_noise2 = descriptor->rel_field_noise2;
         if (solver_ab_checked_counter_delta(
                 solver,
                 descriptor->numtries_delta,
@@ -6742,18 +4322,8 @@ static int solver_ab_descriptor_reduce_range(
             return 1;
         }
     }
-    return 0;
-}
-
-static int solver_ab_descriptor_finish_output(
-    solver_t* solver,
-    const solver_ab_descriptor_output_t* output) {
-    if (!solver || !output) {
-        return -1;
-    }
     if (output->has_final_rel_field_noise2) {
-        solver->rel_field_noise2 =
-            output->final_rel_field_noise2;
+        solver->rel_field_noise2 = output->final_rel_field_noise2;
     }
     if (solver_ab_checked_counter_delta(
             solver,
@@ -6765,149 +4335,141 @@ static int solver_ab_descriptor_finish_output(
     return 0;
 }
 
-static int solver_ab_descriptor_reduce_output(
-    solver_t* solver,
-    const solver_ab_descriptor_output_t* output,
-    int dimquads,
-    kdtree_qres_t** query_result,
-    unsigned long long* reduced) {
-    solver_ab_io_batch_t batches[SOLVER_AB_IO_BATCH_SLOTS];
-    size_t next = 0U;
-    size_t current = 0U;
-    size_t retired = 0U;
-    size_t planning_limit =
-        SOLVER_AB_IO_PROBE_DESCRIPTORS;
-    size_t slot;
-    unsigned long long sequence = 0ULL;
-    unsigned long long expected_sequence = 0ULL;
-    anbool planning_enabled = TRUE;
-    int status = 0;
+typedef struct solver_codekd_packet_retire_context {
+    solver_t* solver;
+    int dimquads;
+    kdtree_qres_t** query_result;
+    unsigned long long* reduced;
+    size_t next_task_index;
+    unsigned long long next_sequence;
+} solver_codekd_packet_retire_context_t;
 
-    if (!solver_payload_completion_service_available()) {
-        status = solver_ab_descriptor_reduce_range(
-            solver,
-            output,
-            0U,
-            output->descriptor_count,
-            dimquads,
-            query_result,
-            reduced);
-        if (status) {
-            return status;
-        }
-        return solver_ab_descriptor_finish_output(
-            solver, output);
+static index_shard_helper_retire_status_t
+solver_codekd_search_packet_retire(
+    const index_shard_helper_task_t* task,
+    size_t task_index,
+    void* owner_context) {
+    solver_codekd_packet_retire_context_t* context = owner_context;
+    const solver_codekd_packet_task_input_t* input;
+    solver_codekd_search_packet_t* packet;
+    size_t end;
+    size_t descriptor_index;
+
+    if (!task || !context || !context->solver ||
+        !context->query_result || !context->reduced ||
+        !task->input || task->input_bytes != sizeof(*input) ||
+        !task->output || task->output_bytes != sizeof(*packet) ||
+        task_index != context->next_task_index) {
+        return INDEX_SHARD_HELPER_RETIRE_ERROR;
+    }
+    input = task->input;
+    packet = task->output;
+    if (input->descriptor.combination_first != context->next_sequence ||
+        input->descriptor.combination_first >=
+            input->descriptor.combination_end ||
+        packet->sequence != input->descriptor.combination_first ||
+        packet->state != SOLVER_CODEKD_PACKET_READY ||
+        packet->descriptors == NULL ||
+        packet->count != packet->descriptors->descriptor_count ||
+        packet->first != 0U) {
+        return INDEX_SHARD_HELPER_RETIRE_ERROR;
     }
 
-    memset(batches, 0, sizeof(batches));
-    if (next < output->descriptor_count) {
-        if (solver_ab_io_batch_prepare(
-                solver,
-                output,
-                next,
-                planning_limit,
-                sequence++,
-                &batches[0])) {
-            status = -1;
-            goto cleanup;
-        }
-        next += batches[0].count;
-    }
+    packet->state = SOLVER_CODEKD_PACKET_RETIRING;
+    context->solver->profile.max_batch_hypotheses = MAX(
+        context->solver->profile.max_batch_hypotheses,
+        packet->count);
+    end = packet->first + packet->count;
+    for (descriptor_index = packet->first;
+         descriptor_index < end;
+         descriptor_index++) {
+        const solver_ab_descriptor_t* descriptor =
+            &packet->descriptors->descriptors[descriptor_index];
+        const solver_codekd_result_slot_t* slot =
+            &packet->slots[descriptor_index];
 
-    while (batches[current].state != SOLVER_AB_IO_BATCH_EMPTY) {
-        solver_ab_io_batch_t* batch = &batches[current];
-        size_t next_slot =
-            (current + 1U) % SOLVER_AB_IO_BATCH_SLOTS;
+        if (solver_poll_worker_stop(context->solver)) {
+            packet->state = SOLVER_CODEKD_PACKET_STOPPED;
+            return INDEX_SHARD_HELPER_RETIRE_STOPPED;
+        }
+        context->solver->rel_field_noise2 =
+            descriptor->rel_field_noise2;
+        if (solver_ab_checked_counter_delta(
+                context->solver,
+                descriptor->numtries_delta,
+                descriptor->cxdx_delta,
+                descriptor->meanx_delta)) {
+            packet->state = SOLVER_CODEKD_PACKET_FAILED;
+            return INDEX_SHARD_HELPER_RETIRE_ERROR;
+        }
 
-        if (!batch->count || batch->first != retired ||
-            batch->sequence != expected_sequence) {
-            status = -1;
-            break;
-        }
-        status = solver_ab_io_batch_wait(batch);
-        if (batch->state != SOLVER_AB_IO_BATCH_READY) {
-            status = -1;
-            break;
-        }
-        if (status) {
-            break;
-        }
-        if (batch->plan_probed) {
-            if (batch->plan_usable &&
-                (!batch->io_count ||
-                 (batch->io_submitted && batch->io_ready))) {
-                planning_limit = MIN(
-                    (size_t)SOLVER_AB_IO_BATCH_DESCRIPTORS,
-                    MAX(
-                        (size_t)SOLVER_AB_IO_PROBE_DESCRIPTORS,
-                        batch->count * 2U));
-            } else {
-                planning_enabled = FALSE;
+        if (slot->state == SOLVER_CODEKD_RESULT_READY) {
+            kdtree_qres_t result_view;
+
+            if (slot->hit_first > packet->hit_count ||
+                (size_t)slot->hit_count >
+                    packet->hit_count - slot->hit_first) {
+                packet->state = SOLVER_CODEKD_PACKET_FAILED;
+                return INDEX_SHARD_HELPER_RETIRE_ERROR;
             }
-        }
-        if (next < output->descriptor_count) {
-            if (planning_enabled) {
-                if (solver_ab_io_batch_prepare(
-                        solver,
-                        output,
-                        next,
-                        planning_limit,
-                        sequence++,
-                        &batches[next_slot])) {
-                    (void)solver_ab_io_batch_retire(batch);
-                    status = -1;
-                    break;
-                }
-            } else {
-                solver_ab_io_batch_prepare_ready(
-                    output,
-                    next,
-                    sequence++,
-                    &batches[next_slot]);
-            }
-            next += batches[next_slot].count;
+            memset(&result_view, 0, sizeof(result_view));
+            result_view.nres = slot->hit_count;
+            result_view.capacity = slot->hit_count;
+            result_view.inds = packet->inds + slot->hit_first;
+            result_view.sdists = packet->sdists + slot->hit_first;
+            solver_execute_prepared_hypothesis_owner(
+                descriptor->stars,
+                descriptor->code,
+                context->dimquads,
+                context->solver,
+                descriptor->current_parity,
+                &result_view,
+                slot->search_wall_seconds);
+        } else if (slot->state ==
+                   SOLVER_CODEKD_RESULT_OWNER_REPLAY) {
+            solver_execute_hypothesis_owner(
+                descriptor->stars,
+                descriptor->code,
+                context->dimquads,
+                context->solver,
+                descriptor->current_parity,
+                descriptor->tol2,
+                context->query_result);
         } else {
-            memset(&batches[next_slot], 0,
-                   sizeof(batches[next_slot]));
+            packet->state = SOLVER_CODEKD_PACKET_FAILED;
+            return INDEX_SHARD_HELPER_RETIRE_ERROR;
         }
-        batch->state = SOLVER_AB_IO_BATCH_EXECUTING;
-        status = solver_ab_descriptor_reduce_range(
-            solver,
-            output,
-            batch->first,
-            batch->count,
-            dimquads,
-            query_result,
-            reduced);
-        if (solver_ab_io_batch_retire(batch)) {
-            status = -1;
+
+        (*context->reduced)++;
+        if (context->solver->profile.execution_failed) {
+            packet->state = SOLVER_CODEKD_PACKET_FAILED;
+            return INDEX_SHARD_HELPER_RETIRE_ERROR;
         }
-        if (status) {
-            break;
+        if (context->solver->quit_now) {
+            packet->state = SOLVER_CODEKD_PACKET_STOPPED;
+            return INDEX_SHARD_HELPER_RETIRE_STOPPED;
         }
-        retired += batch->count;
-        expected_sequence++;
-        current = next_slot;
     }
 
- cleanup:
-    for (slot = 0U; slot < SOLVER_AB_IO_BATCH_SLOTS; slot++) {
-        if (solver_ab_io_batch_cancel(&batches[slot]) && !status) {
-            status = -1;
-        }
+    if (packet->descriptors->has_final_rel_field_noise2) {
+        context->solver->rel_field_noise2 =
+            packet->descriptors->final_rel_field_noise2;
     }
-    if (status) {
-        return status;
+    if (solver_ab_checked_counter_delta(
+            context->solver,
+            packet->descriptors->trailing_numtries,
+            packet->descriptors->trailing_cxdx,
+            packet->descriptors->trailing_meanx)) {
+        packet->state = SOLVER_CODEKD_PACKET_FAILED;
+        return INDEX_SHARD_HELPER_RETIRE_ERROR;
     }
-    return solver_ab_descriptor_finish_output(
-        solver, output);
+
+    packet->state = SOLVER_CODEKD_PACKET_RETIRED;
+    context->next_task_index++;
+    context->next_sequence = input->descriptor.combination_end;
+    return INDEX_SHARD_HELPER_RETIRE_OK;
 }
 
-/*
- * Generate only index-free hypothesis descriptors on helper threads. The
- * owning worker retains every CodeKD, QuadFile, StarKD, verification and
- * reducer operation and consumes completed descriptors in canonical order.
- */
 static int solver_ab_descriptor_execute_phase(
     solver_t* solver,
     solver_ab_phase_kind_t phase,
@@ -6919,7 +4481,7 @@ static int solver_ab_descriptor_execute_phase(
     kdtree_qres_t** query_result,
     solver_ab_phase_mode_t* mode_out) {
     solver_ab_descriptor_workspace_t* workspace;
-    solver_ab_executor_t* planner;
+    solver_ab_descriptor_planner_t* planner;
     solver_ab_pair_t* pairs = NULL;
     size_t pair_count = 0U;
     unsigned long long total_combinations = 0U;
@@ -6937,7 +4499,9 @@ static int solver_ab_descriptor_execute_phase(
         *mode_out = SOLVER_AB_MODE_NATIVE;
     }
     if (!solver || !field_geometry || !query_result ||
-        solver->ab_executor || solver->maxquads != 0 ||
+        !solver->index || !solver->index->codekd ||
+        !solver->index->codekd->tree ||
+        solver->maxquads != 0 ||
         solver->maxmatches != 0 ||
         pl_size(solver->indexes) != 1U ||
         !index_shard_worker_context_active()) {
@@ -6993,8 +4557,10 @@ static int solver_ab_descriptor_execute_phase(
     }
 
     while (combination_cursor < total_combinations) {
-        solver_ab_descriptor_task_input_t
+        solver_codekd_packet_task_input_t
             inputs[SOLVER_AB_DESCRIPTOR_MAX_TASKS];
+        solver_codekd_search_packet_t
+            packets[SOLVER_AB_DESCRIPTOR_MAX_TASKS];
         index_shard_helper_task_t
             tasks[SOLVER_AB_DESCRIPTOR_MAX_TASKS];
         unsigned long long remaining =
@@ -7012,9 +4578,11 @@ static int solver_ab_descriptor_execute_phase(
                       max_task_combinations - 1U) /
                      max_task_combinations);
         size_t task_index;
+        size_t prepared_packets = 0U;
         index_shard_helper_run_status_t run_status =
             INDEX_SHARD_HELPER_UNAVAILABLE;
         index_shard_helper_run_stats_t run_stats;
+        solver_codekd_packet_retire_context_t retire_context;
         anbool run_inline = FALSE;
         anbool wave_assisted = FALSE;
         unsigned long long reduced_before = reduced;
@@ -7033,11 +4601,21 @@ static int solver_ab_descriptor_execute_phase(
         remainder = wave_combinations %
             (unsigned long long)task_count;
         memset(inputs, 0, sizeof(inputs));
+        memset(packets, 0, sizeof(packets));
         memset(tasks, 0, sizeof(tasks));
         memset(&run_stats, 0, sizeof(run_stats));
+        memset(&retire_context, 0, sizeof(retire_context));
+        retire_context.solver = solver;
+        retire_context.dimquads = dimquads;
+        retire_context.query_result = query_result;
+        retire_context.reduced = &reduced;
+        retire_context.next_sequence = combination_cursor;
+
         for (task_index = 0U;
              task_index < task_count;
              task_index++) {
+            solver_ab_descriptor_task_input_t* descriptor_input =
+                &inputs[task_index].descriptor;
             unsigned long long task_combinations =
                 base + (task_index < remainder ? 1U : 0U);
             unsigned long long work_units;
@@ -7047,112 +4625,36 @@ static int solver_ab_descriptor_execute_phase(
                 result = -1;
                 goto fail;
             }
-            inputs[task_index].field_geometry = field_geometry;
-            inputs[task_index].pairs = pairs;
-            inputs[task_index].pair_count = pair_count;
-            inputs[task_index].combination_first = task_cursor;
+            descriptor_input->field_geometry = field_geometry;
+            descriptor_input->pairs = pairs;
+            descriptor_input->pair_count = pair_count;
+            descriptor_input->combination_first = task_cursor;
             task_cursor += task_combinations;
-            inputs[task_index].combination_end = task_cursor;
-            inputs[task_index].phase = phase;
-            inputs[task_index].newpoint = newpoint;
-            inputs[task_index].dimquads = dimquads;
-            inputs[task_index].parity = solver->parity;
-            inputs[task_index].cx_less_than_dx =
+            descriptor_input->combination_end = task_cursor;
+            descriptor_input->phase = phase;
+            descriptor_input->newpoint = newpoint;
+            descriptor_input->dimquads = dimquads;
+            descriptor_input->parity = solver->parity;
+            descriptor_input->cx_less_than_dx =
                 solver->index->cx_less_than_dx;
-            inputs[task_index].meanx_less_than_half =
+            descriptor_input->meanx_less_than_half =
                 solver->index->meanx_less_than_half;
-            inputs[task_index].cxdx_margin =
-                solver->cxdx_margin;
+            descriptor_input->cxdx_margin = solver->cxdx_margin;
+            inputs[task_index].tree = solver->index->codekd->tree;
+            inputs[task_index].detailed = solver->profile.detailed;
+
             work_units = task_combinations *
                 (unsigned long long)expansion;
             tasks[task_index].input = &inputs[task_index];
-            tasks[task_index].input_bytes =
-                sizeof(inputs[task_index]);
-            tasks[task_index].output =
-                &workspace->outputs[task_index];
-            tasks[task_index].output_bytes =
-                sizeof(workspace->outputs[task_index]);
+            tasks[task_index].input_bytes = sizeof(inputs[task_index]);
+            tasks[task_index].output = &packets[task_index];
+            tasks[task_index].output_bytes = sizeof(packets[task_index]);
             tasks[task_index].work_units = work_units;
         }
         if (task_cursor !=
             combination_cursor + wave_combinations) {
             result = -1;
             goto fail;
-        }
-
-        if (task_count > 1U && available) {
-            run_status = index_shard_helper_run(
-                &solver_ab_descriptor_helper_ops,
-                tasks,
-                task_count,
-                &run_stats);
-            if (run_status == INDEX_SHARD_HELPER_UNAVAILABLE) {
-                run_inline = TRUE;
-            } else if (run_status == INDEX_SHARD_HELPER_STOPPED) {
-                (void)solver_poll_worker_stop(solver);
-                solver->quit_now = TRUE;
-                result = 1;
-                goto cleanup;
-            } else if (run_status != INDEX_SHARD_HELPER_OK) {
-                result = -1;
-                goto fail;
-            } else {
-                if (run_stats.owner_tasks +
-                        run_stats.foreign_tasks != task_count ||
-                    !run_stats.owner_tasks ||
-                    run_stats.foreign_work_units %
-                        (unsigned long long)expansion) {
-                    result = -1;
-                    goto fail;
-                }
-                solver->profile.task_ranges_inline +=
-                    run_stats.owner_tasks;
-                if (run_stats.foreign_tasks) {
-                    wave_assisted = TRUE;
-                    assisted = TRUE;
-                    solver->profile.parallel_batches++;
-                    solver->profile.parallel_batches_observed++;
-                    solver->profile.ab_helper_tasks =
-                        solver_ab_saturating_add(
-                            solver->profile.ab_helper_tasks,
-                            run_stats.foreign_tasks);
-                    solver->profile.ab_helper_combinations =
-                        solver_ab_saturating_add(
-                            solver->profile.ab_helper_combinations,
-                            run_stats.foreign_work_units /
-                                (unsigned long long)expansion);
-                    solver->profile.max_parallel_ranges = MAX(
-                        solver->profile.max_parallel_ranges,
-                        run_stats.max_concurrent_tasks);
-                }
-            }
-        } else {
-            run_inline = TRUE;
-        }
-        if (run_inline) {
-            solver->profile.task_ranges_inline += task_count;
-            for (task_index = 0U;
-                 task_index < task_count;
-                 task_index++) {
-                index_shard_helper_task_status_t task_status =
-                    solver_ab_descriptor_helper_execute(
-                        &inputs[task_index],
-                        sizeof(inputs[task_index]),
-                        &workspace->outputs[task_index],
-                        sizeof(workspace->outputs[task_index]));
-
-                if (task_status ==
-                    INDEX_SHARD_HELPER_TASK_STOPPED) {
-                    (void)solver_poll_worker_stop(solver);
-                    result = 1;
-                    goto cleanup;
-                }
-                if (task_status !=
-                    INDEX_SHARD_HELPER_TASK_OK) {
-                    result = -1;
-                    goto fail;
-                }
-            }
         }
 
         solver->profile.hypothesis_batches++;
@@ -7162,32 +4664,161 @@ static int solver_ab_descriptor_execute_phase(
         solver->profile.max_task_ranges = MAX(
             solver->profile.max_task_ranges,
             task_count);
-        for (task_index = 0U;
-             task_index < task_count;
-             task_index++) {
-            int reduce_status =
-                solver_ab_descriptor_reduce_output(
-                    solver,
-                    &workspace->outputs[task_index],
-                    dimquads,
-                    query_result,
-                    &reduced);
 
-            if (reduce_status < 0) {
+        if (task_count > 1U && available) {
+            int packet_prepare_status = 0;
+
+            for (task_index = 0U;
+                 task_index < task_count;
+                 task_index++) {
+                packet_prepare_status =
+                    solver_codekd_search_packet_prepare(
+                        &packets[task_index],
+                        &workspace->outputs[task_index],
+                        inputs[task_index].tree,
+                        inputs[task_index].descriptor.combination_first,
+                        inputs[task_index].detailed);
+                if (packet_prepare_status) {
+                    break;
+                }
+                prepared_packets++;
+            }
+            if (packet_prepare_status < 0) {
+                for (task_index = 0U;
+                     task_index < prepared_packets;
+                     task_index++) {
+                    solver_codekd_search_packet_cleanup(
+                        &packets[task_index]);
+                }
                 result = -1;
                 goto fail;
             }
-            if (reduce_status > 0) {
-                solver->profile.hypothesis_batches_stopped++;
-                result = 1;
-                goto cleanup;
+            if (packet_prepare_status > 0) {
+                solver->profile.allocation_failures++;
+                for (task_index = 0U;
+                     task_index < prepared_packets;
+                     task_index++) {
+                    solver_codekd_search_packet_cleanup(
+                        &packets[task_index]);
+                }
+                run_inline = TRUE;
+            } else {
+                run_status = index_shard_helper_run_ordered(
+                    &solver_codekd_packet_helper_ops,
+                    tasks,
+                    task_count,
+                    solver_codekd_search_packet_retire,
+                    &retire_context,
+                    &run_stats);
+                for (task_index = 0U;
+                     task_index < prepared_packets;
+                     task_index++) {
+                    solver_codekd_search_packet_cleanup(
+                        &packets[task_index]);
+                }
+
+                if (run_status == INDEX_SHARD_HELPER_UNAVAILABLE) {
+                    run_inline = TRUE;
+                } else if (run_status == INDEX_SHARD_HELPER_STOPPED) {
+                    (void)solver_poll_worker_stop(solver);
+                    solver->quit_now = TRUE;
+                    solver->profile.hypothesis_batches_stopped++;
+                    result = 1;
+                    goto cleanup;
+                } else if (run_status != INDEX_SHARD_HELPER_OK) {
+                    result = -1;
+                    goto fail;
+                } else {
+                    if (run_stats.owner_tasks +
+                            run_stats.foreign_tasks != task_count ||
+                        !run_stats.owner_tasks ||
+                        run_stats.foreign_work_units %
+                            (unsigned long long)expansion) {
+                        result = -1;
+                        goto fail;
+                    }
+                    solver->profile.task_ranges_inline +=
+                        run_stats.owner_tasks;
+                    if (run_stats.foreign_tasks) {
+                        wave_assisted = TRUE;
+                        assisted = TRUE;
+                        solver->profile.parallel_batches++;
+                        solver->profile.parallel_batches_observed++;
+                        solver->profile.ab_helper_tasks =
+                            solver_ab_saturating_add(
+                                solver->profile.ab_helper_tasks,
+                                run_stats.foreign_tasks);
+                        solver->profile.ab_helper_combinations =
+                            solver_ab_saturating_add(
+                                solver->profile.ab_helper_combinations,
+                                run_stats.foreign_work_units /
+                                    (unsigned long long)expansion);
+                        solver->profile.max_parallel_ranges = MAX(
+                            solver->profile.max_parallel_ranges,
+                            run_stats.max_concurrent_tasks);
+                    }
+                }
+            }
+        } else {
+            run_inline = TRUE;
+        }
+
+        if (run_inline) {
+            solver->profile.task_ranges_inline += task_count;
+            for (task_index = 0U;
+                 task_index < task_count;
+                 task_index++) {
+                const solver_ab_descriptor_task_input_t* descriptor_input =
+                    &inputs[task_index].descriptor;
+                index_shard_helper_task_status_t task_status;
+                int owner_status;
+
+                task_status = solver_ab_descriptor_helper_execute(
+                    descriptor_input,
+                    sizeof(*descriptor_input),
+                    &workspace->outputs[task_index],
+                    sizeof(workspace->outputs[task_index]));
+                if (task_status == INDEX_SHARD_HELPER_TASK_STOPPED) {
+                    (void)solver_poll_worker_stop(solver);
+                    solver->profile.hypothesis_batches_stopped++;
+                    result = 1;
+                    goto cleanup;
+                }
+                if (task_status != INDEX_SHARD_HELPER_TASK_OK) {
+                    result = -1;
+                    goto fail;
+                }
+                owner_status = solver_codekd_descriptor_execute_owner(
+                    &workspace->outputs[task_index],
+                    solver,
+                    dimquads,
+                    query_result,
+                    &reduced);
+                if (owner_status < 0) {
+                    result = -1;
+                    goto fail;
+                }
+                if (owner_status > 0) {
+                    solver->profile.hypothesis_batches_stopped++;
+                    result = 1;
+                    goto cleanup;
+                }
+                retire_context.next_task_index++;
+                retire_context.next_sequence =
+                    descriptor_input->combination_end;
             }
         }
+
+        if (retire_context.next_task_index != task_count ||
+            retire_context.next_sequence != task_cursor) {
+            result = -1;
+            goto fail;
+        }
+
         if (wave_assisted) {
-            parallel_reduced =
-                solver_ab_saturating_add(
-                    parallel_reduced,
-                    reduced - reduced_before);
+            parallel_reduced = solver_ab_saturating_add(
+                parallel_reduced,
+                reduced - reduced_before);
         }
         solver->profile.hypothesis_batches_completed++;
         combination_cursor += wave_combinations;
@@ -7206,2129 +4837,49 @@ cleanup:
         solver_ab_saturating_add(
             solver->profile.parallel_hypotheses,
             parallel_reduced);
-    if (mode_out && assisted) {
-        *mode_out = SOLVER_AB_MODE_ASSISTED;
+    if (mode_out && result > 0) {
+        *mode_out = assisted
+            ? SOLVER_AB_MODE_ASSISTED
+            : SOLVER_AB_MODE_FLATTENED_OWNER;
     }
     solver_ab_descriptor_release_pairs(workspace);
     return result;
 }
 
-static int solver_ab_plan_tasks(
-    solver_ab_executor_t* executor,
-    size_t pair_count,
-    unsigned long long total_combinations,
-    int participants,
-    solver_ab_task_t** tasks_out,
-    size_t* task_count_out) {
-    size_t desired;
-    solver_ab_task_t* tasks;
-    size_t task_count;
-    unsigned long long base;
-    unsigned long long remainder;
-    unsigned long long cursor = 0U;
-    size_t task_index;
-
-    if (!executor || executor->tasks ||
-        executor->task_count != 0U ||
-        participants < 2 ||
-        !pair_count ||
-        total_combinations == ULLONG_MAX) {
-        return 0;
-    }
-    if ((size_t)participants >
-        SIZE_MAX / SOLVER_AB_BLOCKS_PER_WORKER) {
-        return 0;
-    }
-    desired =
-        (size_t)participants *
-            SOLVER_AB_BLOCKS_PER_WORKER;
-#if defined(SOLVER_AB_TEST_MAX_BLOCKS)
-    if (SOLVER_AB_TEST_MAX_BLOCKS > 0) {
-        desired = MIN(
-            desired,
-            (size_t)SOLVER_AB_TEST_MAX_BLOCKS);
-    }
-#endif
-    if (total_combinations <
-        (unsigned long long)desired) {
-        desired = (size_t)total_combinations;
-    }
-    task_count = desired;
-    if (task_count < 2U ||
-        total_combinations < 2U) {
-        return 0;
-    }
-    if (solver_ab_reserve_task_buffer(
-            executor, task_count)) {
-        return -1;
-    }
-    tasks = executor->tasks;
-    memset(tasks, 0, task_count * sizeof(*tasks));
-
-    base = total_combinations /
-        (unsigned long long)task_count;
-    remainder = total_combinations %
-        (unsigned long long)task_count;
-    for (task_index = 0;
-         task_index < task_count;
-         task_index++) {
-        unsigned long long task_weight =
-            base +
-            (task_index < (size_t)remainder ? 1U : 0U);
-
-        tasks[task_index].combination_first = cursor;
-        cursor += task_weight;
-        tasks[task_index].combination_end = cursor;
-        tasks[task_index].state = SOLVER_AB_TASK_PENDING;
-        tasks[task_index].worker_id = -1;
-        tasks[task_index].producer_done = FALSE;
-    }
-    if (cursor != total_combinations) {
-        return -1;
-    }
-
-    *tasks_out = tasks;
-    *task_count_out = task_count;
-    return 1;
-}
-
-static anbool solver_ab_plan_is_canonical(
-    const solver_ab_pair_t* pairs,
-    size_t pair_count,
-    const solver_ab_task_t* tasks,
-    size_t task_count,
-    unsigned long long total_combinations) {
-    unsigned long long cursor = 0U;
-    size_t i;
-
-    if (!pairs || !pair_count ||
-        !tasks || !task_count ||
-        !total_combinations ||
-        total_combinations == ULLONG_MAX) {
-        return FALSE;
-    }
-    for (i = 0; i < pair_count; i++) {
-        if (!pairs[i].combination_count ||
-            pairs[i].combination_first != cursor ||
-            ULLONG_MAX - cursor <
-                pairs[i].combination_count) {
-            return FALSE;
-        }
-        cursor += pairs[i].combination_count;
-    }
-    if (cursor != total_combinations) {
-        return FALSE;
-    }
-    cursor = 0U;
-    for (i = 0; i < task_count; i++) {
-        if (tasks[i].combination_first != cursor ||
-            tasks[i].combination_end <= cursor) {
-            return FALSE;
-        }
-        cursor = tasks[i].combination_end;
-    }
-    return cursor == total_combinations;
-}
-
-static size_t solver_ab_count_intra_pair_splits(
-    const solver_ab_pair_t* pairs,
-    size_t pair_count,
-    const solver_ab_task_t* tasks,
-    size_t task_count) {
-    size_t pair_index = 0U;
-    size_t task_index;
-    size_t splits = 0U;
-
-    if (!pairs || !pair_count || !tasks || task_count < 2U) {
-        return 0U;
-    }
-    for (task_index = 0U;
-         task_index + 1U < task_count;
-         task_index++) {
-        unsigned long long boundary =
-            tasks[task_index].combination_end;
-        unsigned long long pair_end;
-
-        while (pair_index < pair_count) {
-            pair_end =
-                pairs[pair_index].combination_first +
-                pairs[pair_index].combination_count;
-            if (boundary <= pair_end) {
-                break;
-            }
-            pair_index++;
-        }
-        if (pair_index >= pair_count) {
-            break;
-        }
-        pair_end =
-            pairs[pair_index].combination_first +
-            pairs[pair_index].combination_count;
-        if (boundary < pair_end) {
-            splits++;
-        }
-    }
-    return splits;
-}
-
-/*
- * Keep persistent executor memory proportional to the fixed pool, not P^2.
- *
- * At every phase boundary all helpers have left and every channel is empty.
- * Working packets may grow to the per-packet production bound while active,
- * but only a pool-scaled share is retained. Eligible-combination workspaces
- * are allocated lazily per participating lane and trimmed by the same rule.
- */
-static void solver_ab_trim_epoch_buffers(
-    solver_ab_executor_t* executor) {
-    size_t packet_bytes;
-    size_t eligible_bytes = 0U;
-    int worker_id;
-
-    if (!executor) {
-        return;
-    }
-    solver_ab_configure_plan_cache_limits(executor);
-    packet_bytes =
-        executor->drain_packet.allocated_bytes;
-    for (worker_id = 0;
-         worker_id < executor->worker_count;
-         worker_id++) {
-        if (executor->channels) {
-            size_t channel_bytes =
-                executor->channels[worker_id]
-                    .packet.allocated_bytes;
-
-            if (packet_bytes >
-                SIZE_MAX - channel_bytes) {
-                packet_bytes = SIZE_MAX;
-            } else {
-                packet_bytes += channel_bytes;
-            }
-        }
-        if (executor->combination_eligible &&
-            executor->combination_eligible_capacity &&
-            executor->combination_eligible_capacity[
-                worker_id] <=
-            SIZE_MAX / sizeof(int)) {
-            size_t workspace_bytes =
-                executor->combination_eligible_capacity[
-                    worker_id] *
-                sizeof(int);
-
-            if (eligible_bytes >
-                SIZE_MAX - workspace_bytes) {
-                eligible_bytes = SIZE_MAX;
-            } else {
-                eligible_bytes += workspace_bytes;
-            }
-        } else {
-            eligible_bytes = SIZE_MAX;
-        }
-    }
-    for (worker_id = executor->worker_count - 1;
-         executor->channels &&
-             worker_id >= 0 &&
-             packet_bytes >
-                 executor->packet_cache_limit_bytes;
-         worker_id--) {
-        solver_ab_packet_t* packet =
-            &executor->channels[worker_id].packet;
-        size_t released;
-
-        if (executor->channels[worker_id].ready) {
-            continue;
-        }
-        released = packet->allocated_bytes;
-        solver_ab_packet_free(packet);
-        packet_bytes -= MIN(
-            packet_bytes,
-            released);
-        if (released) {
-            executor->packet_cache_trims++;
-        }
-    }
-    if (packet_bytes >
-            executor->packet_cache_limit_bytes) {
-        size_t released =
-            executor->drain_packet.allocated_bytes;
-
-        solver_ab_packet_free(
-            &executor->drain_packet);
-        packet_bytes -= MIN(
-            packet_bytes,
-            released);
-        if (released) {
-            executor->packet_cache_trims++;
-        }
-    }
-    for (worker_id = executor->worker_count - 1;
-         executor->combination_eligible &&
-             executor->combination_eligible_capacity &&
-             worker_id >= 0 &&
-             eligible_bytes >
-                 executor->eligible_cache_limit_bytes;
-         worker_id--) {
-        size_t released =
-            executor->combination_eligible_capacity[
-                worker_id] *
-            sizeof(int);
-
-        free(executor->combination_eligible[
-            worker_id]);
-        executor->combination_eligible[worker_id] =
-            NULL;
-        executor->combination_eligible_capacity[
-            worker_id] = 0U;
-        eligible_bytes -= MIN(
-            eligible_bytes,
-            released);
-        if (released) {
-            executor->eligible_cache_trims++;
-        }
-    }
-}
-
-static void solver_ab_free_phase(
-    solver_ab_executor_t* executor) {
-    if (!executor) {
-        return;
-    }
-    if (executor->pairs_transient) {
-        free(executor->pairs);
-    }
-    if (executor->tasks_transient) {
-        free(executor->tasks);
-    }
-    executor->pairs = NULL;
-    executor->pair_capacity = 0U;
-    executor->pairs_transient = FALSE;
-    executor->tasks = NULL;
-    executor->task_capacity = 0U;
-    executor->tasks_transient = FALSE;
-    executor->task_count = 0U;
-    executor->pair_count = 0U;
-    solver_ab_trim_epoch_buffers(executor);
-}
-
-static void solver_ab_cancel_phase(
-    solver_ab_executor_t* executor) {
-    size_t i;
-    int worker_id;
-
-    pthread_mutex_lock(&executor->mutex);
-    __atomic_store_n(
-        &executor->cancel_requested,
-        TRUE,
-        __ATOMIC_RELEASE);
-    for (i = executor->next_task;
-         i < executor->task_count;
-         i++) {
-        solver_ab_task_t* task = &executor->tasks[i];
-
-        if (task->state != SOLVER_AB_TASK_PENDING) {
-            continue;
-        }
-        solver_ab_complete_task_locked(executor, i);
-    }
-    executor->next_task = executor->task_count;
-    for (worker_id = 1;
-         worker_id < executor->worker_count;
-         worker_id++) {
-        solver_ab_channel_t* channel =
-            &executor->channels[worker_id];
-
-        if (!channel->ready) {
-            continue;
-        }
-        channel->ready = FALSE;
-        channel->final = FALSE;
-        solver_ab_packet_reset(&channel->packet);
-    }
-    pthread_cond_broadcast(&executor->work_cv);
-    pthread_cond_broadcast(&executor->done_cv);
-    pthread_mutex_unlock(&executor->mutex);
-}
-
-static void solver_ab_timespec_after_wait(
-    struct timespec* deadline) {
-    clock_gettime(CLOCK_REALTIME, deadline);
-    deadline->tv_nsec += SOLVER_AB_WAIT_NANOSECONDS;
-    if (deadline->tv_nsec >= 1000000000L) {
-        deadline->tv_sec++;
-        deadline->tv_nsec -= 1000000000L;
-    }
-}
-
-static anbool solver_ab_poll_phase_stop(
-    solver_t* solver,
-    time_t* next_timer_callback_time) {
-    time_t delay;
-    time_t now;
-
-    if (solver->quit_now ||
-        solver_poll_worker_stop(solver)) {
-        return TRUE;
-    }
-    if (!solver->timer_callback ||
-        !next_timer_callback_time) {
-        return FALSE;
-    }
-    now = time(NULL);
-    if (now <= *next_timer_callback_time) {
-        return FALSE;
-    }
-    update_timeused(solver);
-    delay = solver->timer_callback(solver->userdata);
-    if (!delay || solver->quit_now) {
-        solver->quit_now = TRUE;
-        return TRUE;
-    }
-    *next_timer_callback_time = now + delay;
-    return FALSE;
-}
-
-static void solver_ab_apply_latched_failures(
-    solver_ab_executor_t* executor,
-    solver_t* solver) {
-    unsigned long long allocation_failures;
-    unsigned long long search_failures;
-    anbool evaluation_failure;
-
-    if (!executor || !solver) {
-        return;
-    }
-    pthread_mutex_lock(&executor->mutex);
-    allocation_failures =
-        executor->pending_allocation_failures;
-    search_failures =
-        executor->pending_search_failures;
-    evaluation_failure =
-        executor->pending_evaluation_failure;
-    executor->pending_allocation_failures = 0U;
-    executor->pending_search_failures = 0U;
-    executor->pending_evaluation_failure = FALSE;
-    pthread_mutex_unlock(&executor->mutex);
-
-    solver->profile.allocation_failures +=
-        allocation_failures;
-    solver->profile.search_failures += search_failures;
-    if (allocation_failures ||
-        search_failures ||
-        evaluation_failure) {
-        solver->profile.execution_failed = TRUE;
-        solver->quit_now = TRUE;
-    }
-}
-
-static int solver_ab_executor_available_lenders(
-    const solver_ab_executor_t* executor) {
-    int lenders;
-
-    if (!executor || !executor->available_lenders) {
-        return 0;
-    }
-    /*
-     * This is a performance hint only. The callback is deliberately invoked
-     * without executor->mutex because the fixed pool scans lanes under its
-     * queue mutex before trying the executor lock.
-     */
-    lenders = executor->available_lenders(
-        executor->work_notify_opaque);
-    return lenders > 0 ? lenders : 0;
-}
-
-static unsigned long long solver_ab_publish_threshold(
-    int participants) {
-    unsigned long long threshold;
-
-    if (participants <= 0) {
-        return 0U;
-    }
-    if ((unsigned long long)participants >
-        ULLONG_MAX /
-            (unsigned long long)SOLVER_AB_BLOCKS_PER_WORKER) {
-        threshold = ULLONG_MAX;
-    } else {
-        threshold =
-            (unsigned long long)participants *
-            (unsigned long long)SOLVER_AB_BLOCKS_PER_WORKER;
-    }
-    return MIN(
-        threshold,
-        (unsigned long long)SOLVER_AB_INLINE_PUBLISH_MAX);
-}
-
-static anbool solver_ab_phase_is_publishable(
-    unsigned long long total_combinations,
-    int participants,
-    int available_lenders) {
-    if (!total_combinations || participants < 2) {
-        return FALSE;
-    }
-    return available_lenders > 0 ||
-        total_combinations >
-            solver_ab_publish_threshold(participants);
-}
-
-static int solver_ab_execute_phase(
-    solver_t* solver,
-    solver_ab_phase_kind_t phase,
-    int newpoint,
-    const solver_field_geometry_t* field_geometry,
-    int dimquads,
-    double min_ab2,
-    double max_ab2,
-    time_t* next_timer_callback_time,
-    solver_ab_phase_mode_t* mode_out) {
-    solver_ab_executor_t* executor = solver->ab_executor;
-    solver_ab_pair_t* pairs = NULL;
-    solver_ab_task_t* tasks = NULL;
-    size_t pair_count = 0U;
-    size_t task_count = 0U;
-    unsigned long long total_combinations = 0U;
-    size_t task_index;
-    solver_ab_reduce_state_t reduce_state;
-    int plan_result;
-    int participants;
-    int rc = 0;
-    anbool helper_observed = FALSE;
-    size_t participants_observed = 1U;
-    double phase_wall_start;
-    double planning_wall_start;
-    unsigned long long hypotheses_before;
-
-    if (mode_out) {
-        *mode_out = SOLVER_AB_MODE_NATIVE;
-    }
-    if (!executor ||
-        !field_geometry ||
-        solver->maxquads != 0 ||
-        solver->maxmatches != 0 ||
-        pl_size(solver->indexes) != 1U) {
-        return 0;
-    }
-    pthread_mutex_lock(&executor->mutex);
-    if (!executor->bound ||
-        executor->stopping ||
-        executor->join_closed ||
-        executor->fatal_error ||
-        __atomic_load_n(
-            &executor->cancel_requested,
-            __ATOMIC_ACQUIRE)) {
-        anbool failed = executor->fatal_error;
-
-        pthread_mutex_unlock(&executor->mutex);
-        if (failed) {
-            solver->profile.execution_failed = TRUE;
-            solver->quit_now = TRUE;
-            return -1;
-        }
-        return 0;
-    }
-    pthread_mutex_unlock(&executor->mutex);
-    /*
-     * Plan against the fixed pool width, not the number of idle workers at
-     * this instant. The owner can retire the same canonical task ranges
-     * alone, while workers that finish outer index work later can join the
-     * still-live phase. This prevents a phase from becoming permanently
-     * serial merely because all workers were busy at its first instruction.
-     */
-    participants = executor->worker_count;
-    if (participants < 2) {
-        return 0;
-    }
-    planning_wall_start = monotonic_seconds();
-    if (solver_ab_capture_snapshot(executor, solver)) {
-        solver->profile.allocation_failures++;
-        solver->profile.ab_planning_wall_seconds +=
-            monotonic_seconds() - planning_wall_start;
-        solver_ab_free_phase(executor);
-        return 0;
-    }
-    if (solver_ab_collect_pairs(
-            executor,
-            phase,
-            newpoint,
-            dimquads,
-            field_geometry,
-            min_ab2,
-            max_ab2,
-            &pairs,
-            &pair_count,
-            &total_combinations)) {
-        solver->profile.allocation_failures++;
-        solver->profile.ab_planning_wall_seconds +=
-            monotonic_seconds() - planning_wall_start;
-        /*
-         * A failed growth may leave either the retained cache or a transient
-         * overflow buffer selected as this phase's active view.  Retire that
-         * view before falling back so the next frontier remains eligible for
-         * assistance.
-         */
-        solver_ab_free_phase(executor);
-        return 0;
-    }
-    if (!pair_count) {
-        solver->profile.ab_planning_wall_seconds +=
-            monotonic_seconds() - planning_wall_start;
-        solver_ab_free_phase(executor);
-        if (mode_out) {
-            *mode_out = SOLVER_AB_MODE_EMPTY;
-        }
-        return 1;
-    }
-    /*
-     * With no worker currently scanning/waiting for a loan, a plan containing
-     * at most one combination per prospective task cannot amortize task
-     * publication and retirement. Run that exact work through the native
-     * canonical loop. Larger measured work stays publishable so a worker that
-     * finishes an outer index later can still migrate into the live phase.
-     */
-    if (solver_ab_phase_is_publishable(
-            total_combinations,
-            participants,
-            solver_ab_executor_available_lenders(executor))) {
-        plan_result = solver_ab_plan_tasks(
-            executor,
-            pair_count,
-            total_combinations,
-            participants,
-            &tasks,
-            &task_count);
-    } else {
-        plan_result = 0;
-    }
-    if (plan_result <= 0) {
-        /*
-         * Compact geometry has no mutable pquad fallback. Keep tiny phases
-         * and task-plan allocation pressure on the same exact flattened
-         * sequence, using one owner task when helper publication cannot
-         * amortize itself.
-         */
-        if (executor->tasks ||
-            solver_ab_reserve_task_buffer(executor, 1U)) {
-            solver->profile.allocation_failures++;
-            solver->profile.execution_failed = TRUE;
-            solver->quit_now = TRUE;
-            solver->profile.ab_planning_wall_seconds +=
-                monotonic_seconds() - planning_wall_start;
-            solver_ab_free_phase(executor);
-            return -1;
-        }
-        tasks = executor->tasks;
-        task_count = 1U;
-        memset(tasks, 0, sizeof(*tasks));
-        tasks[0].combination_first = 0U;
-        tasks[0].combination_end = total_combinations;
-        tasks[0].state = SOLVER_AB_TASK_PENDING;
-        tasks[0].worker_id = -1;
-        tasks[0].producer_done = FALSE;
-    }
-    if (!solver_ab_plan_is_canonical(
-            pairs,
-            pair_count,
-            tasks,
-            task_count,
-            total_combinations)) {
-        logerr("[solver-ab] non-canonical combination plan\n");
-        solver_ab_free_phase(executor);
-        solver->profile.execution_failed = TRUE;
-        solver->quit_now = TRUE;
-        solver->profile.ab_planning_wall_seconds +=
-            monotonic_seconds() - planning_wall_start;
-        return -1;
-    }
-
-    pthread_mutex_lock(&executor->mutex);
-    if (!executor->bound ||
-        executor->stopping ||
-        executor->phase_active ||
-        executor->fatal_error ||
-        __atomic_load_n(
-            &executor->cancel_requested,
-            __ATOMIC_ACQUIRE)) {
-        pthread_mutex_unlock(&executor->mutex);
-        solver_ab_free_phase(executor);
-        solver->profile.execution_failed = TRUE;
-        solver->quit_now = TRUE;
-        solver->profile.ab_planning_wall_seconds +=
-            monotonic_seconds() - planning_wall_start;
-        return -1;
-    }
-    executor->field_geometry = field_geometry;
-    executor->newpoint = newpoint;
-    executor->dimquads = dimquads;
-    executor->phase = phase;
-    executor->min_ab2 = min_ab2;
-    executor->max_ab2 = max_ab2;
-    executor->detailed = solver->profile.detailed;
-    executor->pair_count = pair_count;
-    executor->task_count = task_count;
-    executor->next_task = 1U;
-    executor->next_reduce = 0U;
-    executor->reorder_window = MIN(
-        task_count,
-        (size_t)participants *
-            SOLVER_AB_REORDER_WINDOWS_PER_WORKER);
-    executor->remaining_tasks = task_count;
-    tasks[0].state = SOLVER_AB_TASK_RUNNING;
-    tasks[0].worker_id = 0;
-    __atomic_store_n(
-        &executor->cancel_requested,
-        FALSE,
-        __ATOMIC_RELEASE);
-    executor->phase_active = TRUE;
-    executor->generation++;
-    if (mode_out) {
-        *mode_out = SOLVER_AB_MODE_FLATTENED_OWNER;
-    }
-    pthread_cond_broadcast(&executor->work_cv);
-    pthread_mutex_unlock(&executor->mutex);
-    solver->profile.ab_planning_wall_seconds +=
-        monotonic_seconds() - planning_wall_start;
-    solver_ab_executor_notify_work(executor);
-
-    solver->profile.ab_blocks_planned += task_count;
-    solver->profile.ab_pairs_planned += pair_count;
-    solver->profile.ab_combinations_planned +=
-        total_combinations;
-    solver->profile.ab_intra_pair_splits +=
-        solver_ab_count_intra_pair_splits(
-            pairs,
-            pair_count,
-            tasks,
-            task_count);
-    for (task_index = 0U;
-         task_index < pair_count;
-         task_index++) {
-        solver->profile.ab_max_pair_combinations =
-            MAX(solver->profile.ab_max_pair_combinations,
-                pairs[task_index].combination_count);
-    }
-    solver->profile.hypothesis_batches++;
-    solver->profile.task_ranges_planned += task_count;
-    solver->profile.task_ranges_submitted += task_count;
-    solver->profile.parallel_batches++;
-    solver->profile.max_task_ranges =
-        MAX(solver->profile.max_task_ranges, task_count);
-    hypotheses_before =
-        solver->profile.hypotheses_executed;
-    phase_wall_start = monotonic_seconds();
-    memset(&reduce_state, 0, sizeof(reduce_state));
-
-    rc = solver_ab_run_task_inline(executor, &tasks[0]);
-    pthread_mutex_lock(&executor->mutex);
-    solver_ab_complete_task_locked(executor, 0U);
-    executor->next_reduce = 1U;
-    pthread_cond_broadcast(&executor->work_cv);
-    pthread_cond_broadcast(&executor->done_cv);
-    pthread_mutex_unlock(&executor->mutex);
-    solver->profile.ab_blocks_retired++;
-    solver->profile.task_ranges_executed++;
-    solver->profile.task_ranges_inline++;
-    solver_ab_executor_notify_work(executor);
-
-    if (!rc &&
-        !solver->quit_now &&
-        solver_ab_poll_phase_stop(
-            solver,
-            next_timer_callback_time)) {
-        solver_ab_cancel_phase(executor);
-    } else if (rc || solver->quit_now) {
-        solver_ab_cancel_phase(executor);
-    }
-
-    while (!rc &&
-           !solver->quit_now &&
-           executor->next_reduce < task_count) {
-        size_t owner_task_index = SIZE_MAX;
-        anbool owner_claimed;
-        anbool final = FALSE;
-        int retire_result;
-
-        pthread_mutex_lock(&executor->mutex);
-        owner_claimed =
-            solver_ab_claim_owner_task_locked(
-                executor,
-                &owner_task_index);
-        pthread_mutex_unlock(&executor->mutex);
-        if (owner_claimed) {
-            rc = solver_ab_run_task_inline(
-                executor,
-                &tasks[owner_task_index]);
-            pthread_mutex_lock(&executor->mutex);
-            if (owner_task_index !=
-                executor->next_reduce) {
-                executor->fatal_error = TRUE;
-                __atomic_store_n(
-                    &executor->cancel_requested,
-                    TRUE,
-                    __ATOMIC_RELEASE);
-                rc = -1;
-            }
-            solver_ab_complete_task_locked(
-                executor,
-                owner_task_index);
-            executor->next_reduce++;
-            pthread_cond_broadcast(
-                &executor->work_cv);
-            pthread_cond_broadcast(
-                &executor->done_cv);
-            pthread_mutex_unlock(&executor->mutex);
-            solver->profile.ab_blocks_retired++;
-            solver->profile.task_ranges_executed++;
-            solver->profile.task_ranges_inline++;
-            solver_ab_executor_notify_work(executor);
-            if (rc || solver->quit_now ||
-                solver_ab_poll_phase_stop(
-                    solver,
-                    next_timer_callback_time)) {
-                solver_ab_cancel_phase(executor);
-                break;
-            }
-            continue;
-        }
-
-        retire_result = solver_ab_retire_segment(
-            executor,
-            executor->next_reduce,
-            &reduce_state,
-            &final);
-
-        if (retire_result < 0) {
-            rc = -1;
-            solver_ab_cancel_phase(executor);
-            break;
-        }
-        if (retire_result == 0) {
-            if (solver_ab_poll_phase_stop(
-                    solver,
-                    next_timer_callback_time)) {
-                solver_ab_cancel_phase(executor);
-                break;
-            }
-            if (final) {
-                pthread_mutex_lock(&executor->mutex);
-                executor->next_reduce++;
-                pthread_cond_broadcast(&executor->work_cv);
-                pthread_mutex_unlock(&executor->mutex);
-                solver_ab_executor_notify_work(executor);
-            }
-            continue;
-        }
-
-        {
-            struct timespec deadline;
-            anbool executor_cancelled;
-            anbool executor_failed;
-            anbool segment_ready;
-            int wait_result;
-
-            solver_ab_timespec_after_wait(&deadline);
-            pthread_mutex_lock(&executor->mutex);
-            executor_failed = executor->fatal_error;
-            executor_cancelled = __atomic_load_n(
-                &executor->cancel_requested,
-                __ATOMIC_ACQUIRE);
-            segment_ready =
-                solver_ab_canonical_segment_ready_locked(
-                    executor,
-                    executor->next_reduce);
-            if (!executor_failed &&
-                !executor_cancelled &&
-                !segment_ready) {
-                wait_result = pthread_cond_timedwait(
-                    &executor->done_cv,
-                    &executor->mutex,
-                    &deadline);
-            } else {
-                wait_result = 0;
-            }
-            pthread_mutex_unlock(&executor->mutex);
-
-            if (executor_failed ||
-                (executor_cancelled &&
-                 !index_shard_worker_stop_requested())) {
-                solver->profile.execution_failed = TRUE;
-                solver->quit_now = TRUE;
-                rc = -1;
-                solver_ab_cancel_phase(executor);
-                break;
-            }
-            if (executor_cancelled) {
-                (void)solver_poll_worker_stop(solver);
-                solver_ab_cancel_phase(executor);
-                break;
-            }
-            if (wait_result == ETIMEDOUT) {
-                if (solver_ab_poll_phase_stop(
-                        solver,
-                        next_timer_callback_time)) {
-                    solver_ab_cancel_phase(executor);
-                    break;
-                }
-            } else if (wait_result) {
-                solver->profile.execution_failed = TRUE;
-                solver->quit_now = TRUE;
-                rc = -1;
-                solver_ab_cancel_phase(executor);
-                break;
-            }
-        }
-    }
-
-    if (!rc && !solver->quit_now) {
-        anbool executor_cancelled;
-        anbool executor_failed;
-
-        pthread_mutex_lock(&executor->mutex);
-        executor_failed = executor->fatal_error;
-        executor_cancelled = __atomic_load_n(
-            &executor->cancel_requested,
-            __ATOMIC_ACQUIRE);
-        pthread_mutex_unlock(&executor->mutex);
-        if (executor_failed ||
-            (executor_cancelled &&
-             !index_shard_worker_stop_requested())) {
-            solver->profile.execution_failed = TRUE;
-            solver->quit_now = TRUE;
-            rc = -1;
-            solver_ab_cancel_phase(executor);
-        } else if (executor_cancelled) {
-            (void)solver_poll_worker_stop(solver);
-            solver_ab_cancel_phase(executor);
-        }
-    }
-
-    pthread_mutex_lock(&executor->mutex);
-    while (executor->remaining_tasks > 0U) {
-        int wait_result = pthread_cond_wait(
-            &executor->done_cv,
-            &executor->mutex);
-
-        if (wait_result) {
-            size_t pending;
-
-            executor->fatal_error = TRUE;
-            __atomic_store_n(
-                &executor->cancel_requested,
-                TRUE,
-                __ATOMIC_RELEASE);
-            rc = -1;
-            for (pending = executor->next_task;
-                 pending < executor->task_count;
-                 pending++) {
-                if (executor->tasks[pending].state ==
-                    SOLVER_AB_TASK_PENDING) {
-                    solver_ab_complete_task_locked(
-                        executor,
-                        pending);
-                }
-            }
-            executor->next_task =
-                executor->task_count;
-            pthread_cond_broadcast(
-                &executor->work_cv);
-            pthread_cond_broadcast(
-                &executor->done_cv);
-        }
-    }
-    executor->phase_active = FALSE;
-    pthread_cond_broadcast(&executor->work_cv);
-    pthread_cond_broadcast(&executor->done_cv);
-    while (executor->helpers_exited <
-           executor->helpers_arrived) {
-        int wait_result = pthread_cond_wait(
-            &executor->done_cv,
-            &executor->mutex);
-
-        if (wait_result) {
-            executor->fatal_error = TRUE;
-            rc = -1;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&executor->mutex);
-    solver_ab_apply_latched_failures(
-        executor, solver);
-    if (solver->profile.execution_failed) {
-        rc = -1;
-    }
-    solver_ab_executor_notify_work(executor);
-
-    {
-        int worker_id;
-
-        for (worker_id = 1;
-             worker_id < executor->worker_count;
-             worker_id++) {
-            anbool worker_observed = FALSE;
-
-            for (task_index = 0;
-                 task_index < task_count;
-                 task_index++) {
-                if (tasks[task_index].worker_id ==
-                    worker_id) {
-                    unsigned long long helper_combinations =
-                        tasks[task_index].combination_end -
-                        tasks[task_index].combination_first;
-
-                    helper_observed = TRUE;
-                    worker_observed = TRUE;
-                    solver->profile.ab_helper_tasks++;
-                    solver->profile.ab_helper_combinations =
-                        solver_ab_saturating_add(
-                            solver->profile.ab_helper_combinations,
-                            helper_combinations);
-                }
-            }
-            if (worker_observed) {
-                participants_observed++;
-            }
-        }
-        solver->profile.max_parallel_ranges =
-            MAX(
-                solver->profile.max_parallel_ranges,
-                participants_observed);
-    }
-    if (helper_observed) {
-        solver->profile.parallel_batches_observed++;
-        solver->profile.parallel_hypotheses +=
-            solver->profile.hypotheses_executed -
-            hypotheses_before;
-        if (mode_out) {
-            *mode_out = SOLVER_AB_MODE_ASSISTED;
-        }
-    } else if (mode_out) {
-        *mode_out = SOLVER_AB_MODE_FLATTENED_OWNER;
-    }
-
-    if (!solver->quit_now && !rc) {
-        solver->profile.hypothesis_batches_completed++;
-    } else if (rc || solver->profile.execution_failed) {
-        solver->profile.hypothesis_batches_failed++;
-    } else {
-        solver->profile.hypothesis_batches_stopped++;
-    }
-    solver->profile.hypothesis_wave_wall_seconds +=
-        monotonic_seconds() - phase_wall_start;
-    solver_ab_free_phase(executor);
-    return rc ? -1 : 1;
-}
-
-solver_ab_executor_t* solver_ab_executor_create(
-    int worker_count) {
-    solver_ab_executor_t* executor;
-
-    if (worker_count < 2) {
-        return NULL;
-    }
-    executor = calloc(1, sizeof(*executor));
-    if (!executor) {
-        return NULL;
-    }
-    executor->worker_count = worker_count;
-    solver_ab_configure_plan_cache_limits(executor);
-    executor->query_results = calloc(
-        (size_t)worker_count,
-        sizeof(*executor->query_results));
-    executor->combination_eligible = calloc(
-        (size_t)worker_count,
-        sizeof(*executor->combination_eligible));
-    executor->combination_eligible_capacity = calloc(
-        (size_t)worker_count,
-        sizeof(*executor->combination_eligible_capacity));
-    executor->channels = calloc(
-        (size_t)worker_count,
-        sizeof(*executor->channels));
-    executor->helper_state = calloc(
-        (size_t)worker_count,
-        sizeof(*executor->helper_state));
-    if (!executor->query_results ||
-        !executor->combination_eligible ||
-        !executor->combination_eligible_capacity ||
-        !executor->channels ||
-        !executor->helper_state) {
-        free(executor->helper_state);
-        free(executor->channels);
-        free(executor->combination_eligible_capacity);
-        free(executor->combination_eligible);
-        free(executor->query_results);
-        free(executor);
-        return NULL;
-    }
-    if (pthread_mutex_init(&executor->mutex, NULL)) {
-        free(executor->helper_state);
-        free(executor->channels);
-        free(executor->combination_eligible_capacity);
-        free(executor->combination_eligible);
-        free(executor->query_results);
-        free(executor);
-        return NULL;
-    }
-    if (pthread_cond_init(&executor->work_cv, NULL)) {
-        pthread_mutex_destroy(&executor->mutex);
-        free(executor->helper_state);
-        free(executor->channels);
-        free(executor->combination_eligible_capacity);
-        free(executor->combination_eligible);
-        free(executor->query_results);
-        free(executor);
-        return NULL;
-    }
-    if (pthread_cond_init(&executor->done_cv, NULL)) {
-        pthread_cond_destroy(&executor->work_cv);
-        pthread_mutex_destroy(&executor->mutex);
-        free(executor->helper_state);
-        free(executor->channels);
-        free(executor->combination_eligible_capacity);
-        free(executor->combination_eligible);
-        free(executor->query_results);
-        free(executor);
-        return NULL;
-    }
-    return executor;
-}
-
-int solver_ab_executor_set_lending_callbacks(
-    solver_ab_executor_t* executor,
-    void (*work_notify)(void*),
-    int (*available_lenders)(void*),
-    void* opaque) {
-    if (!executor) {
-        return -1;
-    }
-    pthread_mutex_lock(&executor->mutex);
-    if (executor->bound ||
-        executor->phase_active ||
-        executor->stopping ||
-        executor->work_notify_inflight) {
-        pthread_mutex_unlock(&executor->mutex);
-        return -1;
-    }
-    executor->work_notify = work_notify;
-    executor->available_lenders = available_lenders;
-    executor->work_notify_opaque = opaque;
-    pthread_mutex_unlock(&executor->mutex);
-    return 0;
-}
-
-static anbool solver_ab_executor_begin_notify_locked(
-    solver_ab_executor_t* executor,
-    void (**notify)(void*),
-    void** opaque) {
-    if (!executor || !notify || !opaque ||
-        !executor->work_notify) {
-        return FALSE;
-    }
-    if (executor->work_notify_inflight == INT_MAX) {
-        executor->fatal_error = TRUE;
-        __atomic_store_n(
-            &executor->cancel_requested,
-            TRUE,
-            __ATOMIC_RELEASE);
-        pthread_cond_broadcast(&executor->done_cv);
-        pthread_cond_broadcast(&executor->work_cv);
-        return FALSE;
-    }
-    executor->work_notify_inflight++;
-    *notify = executor->work_notify;
-    *opaque = executor->work_notify_opaque;
-    return TRUE;
-}
-
-static void solver_ab_executor_complete_notify(
-    solver_ab_executor_t* executor,
-    void (*notify)(void*),
-    void* opaque) {
-    if (!executor || !notify) {
-        return;
-    }
-    notify(opaque);
-    pthread_mutex_lock(&executor->mutex);
-    if (executor->work_notify_inflight <= 0) {
-        logerr("[solver-ab] work notification underflow\n");
-        executor->fatal_error = TRUE;
-    } else {
-        executor->work_notify_inflight--;
-    }
-    pthread_cond_broadcast(&executor->done_cv);
-    pthread_mutex_unlock(&executor->mutex);
-}
-
-static void solver_ab_executor_notify_work(
-    solver_ab_executor_t* executor) {
-    void (*notify)(void*) = NULL;
-    void* opaque = NULL;
-
-    if (!executor) {
-        return;
-    }
-    pthread_mutex_lock(&executor->mutex);
-    (void)solver_ab_executor_begin_notify_locked(
-        executor, &notify, &opaque);
-    pthread_mutex_unlock(&executor->mutex);
-    if (notify) {
-        solver_ab_executor_complete_notify(
-            executor, notify, opaque);
-    }
-}
-
-int solver_ab_executor_bind(
-    solver_ab_executor_t* executor,
-    solver_t* owner,
-    index_t* index) {
-    int numxy;
-    int worker_id;
-
-    if (!executor || !owner || !owner->fieldxy || !index) {
-        return -1;
-    }
-    numxy = solver_field_geometry_numxy(owner);
-    /*
-     * A published lane must be able to accept compact tasks.  Geometry
-     * refusal/allocation failure and owner-only maxquads/maxmatches semantics
-     * are valid native fallbacks, but advertising them as lendable would park
-     * queued indexes behind an executor that can never publish work.
-     */
-    if (numxy <= 0 ||
-        !solver_field_geometry_compatible(owner, numxy) ||
-        owner->maxquads != 0 ||
-        owner->maxmatches != 0) {
-        return -1;
-    }
-    pthread_mutex_lock(&executor->mutex);
-    if (executor->bound ||
-        executor->stopping ||
-        executor->fatal_error ||
-        executor->phase_active ||
-        executor->pairs ||
-        executor->tasks ||
-        executor->remaining_tasks != 0U ||
-        executor->task_count != 0U ||
-        executor->pair_count != 0U ||
-        executor->helpers_arrived != 0 ||
-        executor->helpers_exited != 0 ||
-        executor->helpers_failed != 0 ||
-        executor->work_notify_inflight != 0 ||
-        executor->pending_allocation_failures != 0U ||
-        executor->pending_search_failures != 0U ||
-        executor->pending_evaluation_failure) {
-        pthread_mutex_unlock(&executor->mutex);
-        return -1;
-    }
-    if (!solver_ab_reserve_eligible_workspace(
-            executor,
-            0,
-            (size_t)numxy)) {
-        pthread_mutex_unlock(&executor->mutex);
-        return -1;
-    }
-    for (worker_id = 1;
-         worker_id < executor->worker_count;
-         worker_id++) {
-        if (executor->helper_state[worker_id] !=
-            SOLVER_AB_HELPER_NEW) {
-            pthread_mutex_unlock(&executor->mutex);
-            return -1;
-        }
-    }
-    executor->owner = owner;
-    executor->index = index;
-    executor->detailed = owner->profile.detailed;
-    executor->join_closed = FALSE;
-    executor->starkd_initializing = FALSE;
-    executor->starkd_ready = FALSE;
-    __atomic_store_n(
-        &executor->cancel_requested,
-        FALSE,
-        __ATOMIC_RELEASE);
-    executor->bound = TRUE;
-    executor->index_epochs_started++;
-    logverb(
-        "[solver-ab] starkd-permutation index=%s "
-        "present=%i inverse_ready=%i\n",
-        index->indexname ? index->indexname : "(unnamed)",
-        index->starkd && index->starkd->tree &&
-            index->starkd->tree->perm,
-        index->starkd && index->starkd->inverse_perm);
-    pthread_cond_broadcast(&executor->work_cv);
-    pthread_mutex_unlock(&executor->mutex);
-    return 0;
-}
-
-int solver_ab_executor_try_join(
-    solver_ab_executor_t* executor,
-    int* worker_id) {
-    int slot;
-    size_t task_index;
-
-    if (!executor || !worker_id) {
-        return -1;
-    }
-    pthread_mutex_lock(&executor->mutex);
-    if (!executor->bound ||
-        executor->join_closed ||
-        executor->stopping ||
-        executor->fatal_error ||
-        !executor->phase_active ||
-        __atomic_load_n(
-            &executor->cancel_requested,
-            __ATOMIC_ACQUIRE) ||
-        executor->next_task >=
-            executor->task_count) {
-        pthread_mutex_unlock(&executor->mutex);
-        return 0;
-    }
-    for (slot = 1; slot < executor->worker_count; slot++) {
-        if (executor->helper_state[slot] ==
-                SOLVER_AB_HELPER_NEW &&
-            solver_ab_task_claimable_locked(
-                executor,
-                slot)) {
-            if (executor->helpers_arrived == INT_MAX) {
-                executor->fatal_error = TRUE;
-                __atomic_store_n(
-                    &executor->cancel_requested,
-                    TRUE,
-                    __ATOMIC_RELEASE);
-                pthread_cond_broadcast(
-                    &executor->done_cv);
-                pthread_cond_broadcast(
-                    &executor->work_cv);
-                pthread_mutex_unlock(
-                    &executor->mutex);
-                return -1;
-            }
-            if (!solver_ab_claim_task_locked(
-                    executor,
-                    slot,
-                    &task_index)) {
-                executor->fatal_error = TRUE;
-                __atomic_store_n(
-                    &executor->cancel_requested,
-                    TRUE,
-                    __ATOMIC_RELEASE);
-                pthread_cond_broadcast(
-                    &executor->done_cv);
-                pthread_cond_broadcast(
-                    &executor->work_cv);
-                pthread_mutex_unlock(
-                    &executor->mutex);
-                return -1;
-            }
-            executor->helper_state[slot] =
-                SOLVER_AB_HELPER_ACTIVE;
-            executor->helpers_arrived++;
-            *worker_id = slot;
-            pthread_cond_broadcast(&executor->done_cv);
-            pthread_cond_broadcast(&executor->work_cv);
-            pthread_mutex_unlock(&executor->mutex);
-            return 1;
-        }
-    }
-    pthread_mutex_unlock(&executor->mutex);
-    return 0;
-}
-
-int solver_ab_executor_run_joined(
-    solver_ab_executor_t* executor,
-    int worker_id) {
-    size_t task_index = SIZE_MAX;
-    void (*notify)(void*) = NULL;
-    void* notify_opaque = NULL;
-    int rc = 0;
-
-    if (!executor) {
-        return -1;
-    }
-    if (worker_id <= 0 ||
-        worker_id >= executor->worker_count) {
-        pthread_mutex_lock(&executor->mutex);
-        executor->helpers_failed++;
-        executor->fatal_error = TRUE;
-        __atomic_store_n(
-            &executor->cancel_requested,
-            TRUE,
-            __ATOMIC_RELEASE);
-        pthread_cond_broadcast(&executor->done_cv);
-        pthread_cond_broadcast(&executor->work_cv);
-        pthread_mutex_unlock(&executor->mutex);
-        return -1;
-    }
-
-    pthread_mutex_lock(&executor->mutex);
-    if (executor->helper_state[worker_id] !=
-        SOLVER_AB_HELPER_ACTIVE) {
-        /*
-         * A non-active slot carries no reservation owned by this call.
-         * Do not guess from a stale/default channel index and do not account
-         * another helper's exit; either could release phase storage while a
-         * real producer is still using it.
-         */
-        executor->helpers_failed++;
-        executor->fatal_error = TRUE;
-        __atomic_store_n(
-            &executor->cancel_requested,
-            TRUE,
-            __ATOMIC_RELEASE);
-        pthread_cond_broadcast(&executor->done_cv);
-        pthread_cond_broadcast(&executor->work_cv);
-        pthread_mutex_unlock(&executor->mutex);
-        return -1;
-    }
-
-    task_index =
-        executor->channels[worker_id].task_index;
-    if (task_index >= executor->task_count ||
-        executor->tasks[task_index].state !=
-            SOLVER_AB_TASK_RUNNING ||
-        executor->tasks[task_index].worker_id !=
-            worker_id ||
-        executor->channels[worker_id].ready) {
-        executor->helpers_failed++;
-        executor->fatal_error = TRUE;
-        /*
-         * The ACTIVE slot proves that this call owns one reservation.  Close
-         * its task only if the task and channel both prove the same ownership;
-         * otherwise cancellation drains the corrupted phase without
-         * completing an unrelated owner/helper task.
-         */
-        if (task_index < executor->task_count &&
-            executor->channels[worker_id].task_index ==
-                task_index &&
-            executor->tasks[task_index].state ==
-                SOLVER_AB_TASK_RUNNING &&
-            executor->tasks[task_index].worker_id ==
-                worker_id) {
-            solver_ab_complete_task_locked(
-                executor, task_index);
-        }
-        executor->helper_state[worker_id] =
-            SOLVER_AB_HELPER_FAILED;
-        executor->helpers_exited++;
-        __atomic_store_n(
-            &executor->cancel_requested,
-            TRUE,
-            __ATOMIC_RELEASE);
-        rc = -1;
-    }
-    pthread_mutex_unlock(&executor->mutex);
-
-    if (!rc && task_index != SIZE_MAX &&
-        solver_ab_evaluate_task(
-            executor,
-            task_index,
-            worker_id) &&
-        !solver_ab_cancelled(executor)) {
-        pthread_mutex_lock(&executor->mutex);
-        executor->helpers_failed++;
-        executor->fatal_error = TRUE;
-        __atomic_store_n(
-            &executor->cancel_requested,
-            TRUE,
-            __ATOMIC_RELEASE);
-        pthread_cond_broadcast(&executor->done_cv);
-        pthread_cond_broadcast(&executor->work_cv);
-        pthread_mutex_unlock(&executor->mutex);
-        rc = -1;
-    }
-
-    pthread_mutex_lock(&executor->mutex);
-    if (executor->helper_state[worker_id] ==
-        SOLVER_AB_HELPER_FAILED) {
-        rc = -1;
-    } else if (executor->helper_state[worker_id] !=
-        SOLVER_AB_HELPER_ACTIVE) {
-        logerr(
-            "[solver-ab] invalid leave state for helper %i\n",
-            worker_id);
-        executor->helpers_failed++;
-        executor->fatal_error = TRUE;
-        rc = -1;
-    } else {
-        executor->helper_state[worker_id] =
-            SOLVER_AB_HELPER_NEW;
-        executor->helpers_exited++;
-        (void)solver_ab_executor_begin_notify_locked(
-            executor,
-            &notify,
-            &notify_opaque);
-    }
-    pthread_cond_broadcast(&executor->done_cv);
-    pthread_cond_broadcast(&executor->work_cv);
-    if (executor->fatal_error) {
-        rc = -1;
-    }
-    pthread_mutex_unlock(&executor->mutex);
-    if (notify) {
-        solver_ab_executor_complete_notify(
-            executor,
-            notify,
-            notify_opaque);
-    }
-    return rc;
-}
-
-/*
- * Retire one clean index epoch without destroying tree-neutral capacity.
- *
- * The lane must already be unpublished by the outer scheduler. This closes
- * new joins, waits for every reserved helper and callback to leave, proves
- * the phase is empty, then rearms the shell for another index. KD query
- * results are tree-dependent and are therefore released at every epoch
- * boundary; planner buffers, packet capacity, and eligibility workspaces are
- * retained under their existing limits.
- */
-int solver_ab_executor_quiesce(
-    solver_ab_executor_t* executor) {
-    int worker_id;
-    int rc;
-
-    if (!executor) {
-        return -1;
-    }
-    pthread_mutex_lock(&executor->mutex);
-    executor->join_closed = TRUE;
-    __atomic_store_n(
-        &executor->cancel_requested,
-        TRUE,
-        __ATOMIC_RELEASE);
-    pthread_cond_broadcast(&executor->work_cv);
-    pthread_cond_broadcast(&executor->done_cv);
-    while (executor->helpers_exited <
-               executor->helpers_arrived ||
-           executor->work_notify_inflight > 0) {
-        int wait_result = pthread_cond_wait(
-            &executor->done_cv,
-            &executor->mutex);
-
-        if (wait_result) {
-            executor->fatal_error = TRUE;
-            pthread_cond_broadcast(
-                &executor->work_cv);
-        }
-    }
-    if (!executor->fatal_error) {
-        if (!executor->bound ||
-            executor->stopping ||
-            executor->phase_active ||
-            executor->pairs ||
-            executor->tasks ||
-            executor->remaining_tasks != 0U ||
-            executor->task_count != 0U ||
-            executor->pair_count != 0U ||
-            executor->starkd_initializing ||
-            executor->work_notify_inflight != 0 ||
-            executor->pending_allocation_failures != 0U ||
-            executor->pending_search_failures != 0U ||
-            executor->pending_evaluation_failure) {
-            executor->fatal_error = TRUE;
-        }
-        for (worker_id = 0;
-             !executor->fatal_error &&
-                 worker_id < executor->worker_count;
-             worker_id++) {
-            if (executor->channels[worker_id].ready ||
-                (worker_id > 0 &&
-                 executor->helper_state[worker_id] !=
-                     SOLVER_AB_HELPER_NEW)) {
-                executor->fatal_error = TRUE;
-            }
-        }
-    }
-    rc = executor->fatal_error ? -1 : 0;
-    if (rc) {
-        logerr(
-            "[solver-ab] executor quiesce failed: arrived=%i "
-            "exited=%i failed=%i remaining=%zu\n",
-            executor->helpers_arrived,
-            executor->helpers_exited,
-            executor->helpers_failed,
-            executor->remaining_tasks);
-        /*
-         * No owner or helper can still execute after the wait above. Clear
-         * stale phase views before the index mapping is released; the caller
-         * will destroy this non-reusable shell.
-         */
-        solver_ab_free_phase(executor);
-        executor->phase_active = FALSE;
-        executor->remaining_tasks = 0U;
-        executor->next_task = 0U;
-        executor->next_reduce = 0U;
-    }
-    for (worker_id = 0;
-         worker_id < executor->worker_count;
-         worker_id++) {
-        kdtree_free_query(
-            executor->query_results[worker_id]);
-        executor->query_results[worker_id] = NULL;
-    }
-    executor->bound = FALSE;
-    executor->owner = NULL;
-    executor->index = NULL;
-    memset(
-        &executor->snapshot,
-        0,
-        sizeof(executor->snapshot));
-    executor->snapshot_ready = FALSE;
-    executor->starkd_initializing = FALSE;
-    executor->starkd_ready = FALSE;
-    if (!rc) {
-        executor->helpers_arrived = 0;
-        executor->helpers_exited = 0;
-        executor->helpers_failed = 0;
-        for (worker_id = 1;
-             worker_id < executor->worker_count;
-             worker_id++) {
-            executor->helper_state[worker_id] =
-                SOLVER_AB_HELPER_NEW;
-        }
-        executor->join_closed = FALSE;
-        __atomic_store_n(
-            &executor->cancel_requested,
-            FALSE,
-            __ATOMIC_RELEASE);
-        executor->index_epochs_quiesced++;
-    }
-    logverb(
-        "[solver-ab] executor-epoch started=%llu quiesced=%llu "
-        "owner_query_reuses=%llu pair_bytes=%zu task_bytes=%zu "
-        "pair_grows=%llu pair_reuses=%llu "
-        "task_grows=%llu task_reuses=%llu "
-        "packet_cache_limit=%zu packet_trims=%llu "
-        "eligible_cache_limit=%zu eligible_trims=%llu\n",
-        executor->index_epochs_started,
-        executor->index_epochs_quiesced,
-        executor->owner_query_reuses,
-        executor->pair_cache_capacity *
-            sizeof(*executor->pair_cache),
-        executor->task_cache_capacity *
-            sizeof(*executor->task_cache),
-        executor->pair_cache_grows,
-        executor->pair_cache_reuses,
-        executor->task_cache_grows,
-        executor->task_cache_reuses,
-        executor->packet_cache_limit_bytes,
-        executor->packet_cache_trims,
-        executor->eligible_cache_limit_bytes,
-        executor->eligible_cache_trims);
-    pthread_mutex_unlock(&executor->mutex);
-    return rc;
-}
-
-int solver_ab_executor_finish(
-    solver_ab_executor_t* executor) {
-    int worker_id;
-    int rc;
-
-    if (!executor) {
-        return -1;
-    }
-    pthread_mutex_lock(&executor->mutex);
-    executor->join_closed = TRUE;
-    executor->stopping = TRUE;
-    __atomic_store_n(
-        &executor->cancel_requested,
-        TRUE,
-        __ATOMIC_RELEASE);
-    pthread_cond_broadcast(&executor->work_cv);
-    pthread_cond_broadcast(&executor->done_cv);
-    while (executor->helpers_exited <
-               executor->helpers_arrived ||
-           executor->work_notify_inflight > 0) {
-        int wait_result = pthread_cond_wait(
-            &executor->done_cv,
-            &executor->mutex);
-
-        if (wait_result) {
-            executor->fatal_error = TRUE;
-            pthread_cond_broadcast(
-                &executor->work_cv);
-        }
-    }
-    if (!executor->fatal_error) {
-        if (executor->phase_active ||
-            executor->pairs ||
-            executor->tasks ||
-            executor->remaining_tasks != 0U ||
-            executor->task_count != 0U ||
-            executor->pair_count != 0U ||
-            executor->starkd_initializing ||
-            executor->work_notify_inflight != 0 ||
-            executor->pending_allocation_failures != 0U ||
-            executor->pending_search_failures != 0U ||
-            executor->pending_evaluation_failure) {
-            executor->fatal_error = TRUE;
-        }
-        for (worker_id = 0;
-             !executor->fatal_error &&
-                 worker_id < executor->worker_count;
-             worker_id++) {
-            if (executor->channels[worker_id].ready ||
-                (worker_id > 0 &&
-                 executor->helper_state[worker_id] !=
-                    SOLVER_AB_HELPER_NEW)) {
-                executor->fatal_error = TRUE;
-            }
-        }
-    }
-    rc = executor->fatal_error ? -1 : 0;
-    if (executor->fatal_error) {
-        logerr(
-            "[solver-ab] executor finish failed: arrived=%i "
-            "exited=%i failed=%i remaining=%zu\n",
-            executor->helpers_arrived,
-            executor->helpers_exited,
-            executor->helpers_failed,
-            executor->remaining_tasks);
-    }
-    logverb(
-        "[solver-ab] plan-cache pair_bytes=%zu task_bytes=%zu "
-        "pair_limit=%zu task_limit=%zu pair_grows=%llu "
-        "pair_reuses=%llu task_grows=%llu task_reuses=%llu "
-        "transient_allocations=%llu transient_peak=%zu\n",
-        executor->pair_cache_capacity *
-            sizeof(*executor->pair_cache),
-        executor->task_cache_capacity *
-            sizeof(*executor->task_cache),
-        executor->pair_cache_limit_bytes,
-        executor->task_cache_limit_bytes,
-        executor->pair_cache_grows,
-        executor->pair_cache_reuses,
-        executor->task_cache_grows,
-        executor->task_cache_reuses,
-        executor->plan_transient_allocations,
-        executor->plan_transient_peak_bytes);
-    executor->bound = FALSE;
-    executor->owner = NULL;
-    executor->index = NULL;
-    memset(
-        &executor->snapshot,
-        0,
-        sizeof(executor->snapshot));
-    executor->snapshot_ready = FALSE;
-    executor->starkd_initializing = FALSE;
-    executor->starkd_ready = FALSE;
-    executor->work_notify = NULL;
-    executor->available_lenders = NULL;
-    executor->work_notify_opaque = NULL;
-    pthread_mutex_unlock(&executor->mutex);
-    return rc;
-}
-
-void solver_ab_executor_abort(
-    solver_ab_executor_t* executor) {
-    if (!executor) {
-        return;
-    }
-    pthread_mutex_lock(&executor->mutex);
-    executor->fatal_error = TRUE;
-    pthread_mutex_unlock(&executor->mutex);
-    (void)solver_ab_executor_finish(executor);
-}
-
-void solver_ab_executor_destroy(
-    solver_ab_executor_t* executor) {
-    int i;
-
-    if (!executor) {
-        return;
-    }
-    solver_ab_free_phase(executor);
-    free(executor->task_cache);
-    free(executor->pair_cache);
-    for (i = 0; i < executor->worker_count; i++) {
-        kdtree_free_query(executor->query_results[i]);
-        free(executor->combination_eligible[i]);
-        solver_ab_packet_free(
-            &executor->channels[i].packet);
-    }
-    solver_ab_packet_free(&executor->drain_packet);
-    free(executor->helper_state);
-    free(executor->channels);
-    free(executor->combination_eligible_capacity);
-    free(executor->combination_eligible);
-    free(executor->query_results);
-    pthread_cond_destroy(&executor->done_cv);
-    pthread_cond_destroy(&executor->work_cv);
-    pthread_mutex_destroy(&executor->mutex);
-    free(executor);
-}
-
 #if defined(TESTING_TRYPERMUTATIONS)
-int solver_test_ab_packet_bounds(void) {
-    solver_ab_packet_t packet;
+int solver_test_verification_packet_bounds(void) {
+    solver_verification_packet_t packet;
     size_t impossible_candidates =
         SOLVER_AB_CANDIDATE_LIMIT_BYTES /
             sizeof(solver_ab_candidate_t) +
         1U;
-    solver_ab_reserve_result_t reserve_result;
+    solver_packet_reserve_result_t reserve_result;
 
     memset(&packet, 0, sizeof(packet));
-    if (solver_ab_packet_reserve_hypotheses(
+    if (solver_verification_packet_reserve(
             &packet,
-            1U) != SOLVER_AB_RESERVE_OK ||
-        solver_ab_packet_reserve_candidates(
-            &packet,
-            1U) != SOLVER_AB_RESERVE_OK ||
-        packet.allocated_bytes >
-            SOLVER_AB_PACKET_LIMIT_BYTES) {
-        solver_ab_packet_free(&packet);
+            1U) != SOLVER_PACKET_RESERVE_OK ||
+        packet.candidate_capacity >
+            SOLVER_AB_CANDIDATE_LIMIT_BYTES /
+                sizeof(*packet.candidates)) {
+        solver_verification_packet_free(&packet);
         return -1;
     }
-    reserve_result = solver_ab_packet_reserve_candidates(
+    reserve_result = solver_verification_packet_reserve(
         &packet,
         impossible_candidates);
-    if (reserve_result != SOLVER_AB_RESERVE_FULL ||
+    if (reserve_result != SOLVER_PACKET_RESERVE_FULL ||
         packet.allocation_failed ||
-        packet.allocated_bytes >
-            SOLVER_AB_PACKET_LIMIT_BYTES) {
-        solver_ab_packet_free(&packet);
+        packet.candidate_capacity >
+            SOLVER_AB_CANDIDATE_LIMIT_BYTES /
+                sizeof(*packet.candidates)) {
+        solver_verification_packet_free(&packet);
         return -1;
     }
-    solver_ab_packet_free(&packet);
+    solver_verification_packet_free(&packet);
     return 0;
 }
 
-int solver_test_ab_planner_invariants(void) {
-    static const unsigned long long totals[] = {
-        1U, 2U, 3U, 15U, 16U, 17U
-    };
-    static const size_t expected_tasks[] = {
-        0U, 2U, 3U, 15U, 16U, 16U
-    };
-    solver_ab_executor_t executor;
-    solver_ab_pair_t pair;
-    solver_ab_pair_t split_pairs[3];
-    solver_ab_task_t* tasks;
-    size_t task_count;
-    size_t i;
-    int plan_result;
-    int rc = -1;
-
-    memset(&executor, 0, sizeof(executor));
-    executor.worker_count = 4;
-    memset(&pair, 0, sizeof(pair));
-    for (i = 0U; i < sizeof(totals) / sizeof(totals[0]); i++) {
-        pair.combination_count = totals[i];
-        tasks = NULL;
-        task_count = 0U;
-        plan_result = solver_ab_plan_tasks(
-            &executor,
-            1U,
-            totals[i],
-            executor.worker_count,
-            &tasks,
-            &task_count);
-        if ((totals[i] == 1U && plan_result != 0) ||
-            (totals[i] > 1U && plan_result != 1) ||
-            task_count != expected_tasks[i] ||
-            (plan_result == 1 &&
-             !solver_ab_plan_is_canonical(
-                 &pair,
-                 1U,
-                 tasks,
-                 task_count,
-                 totals[i]))) {
-            goto cleanup;
-        }
-        solver_ab_free_phase(&executor);
-    }
-
-    memset(split_pairs, 0, sizeof(split_pairs));
-    split_pairs[0].combination_first = 0U;
-    split_pairs[0].combination_count = 1U;
-    split_pairs[1].combination_first = 1U;
-    split_pairs[1].combination_count = 100U;
-    split_pairs[2].combination_first = 101U;
-    split_pairs[2].combination_count = 2U;
-    tasks = NULL;
-    task_count = 0U;
-    if (solver_ab_plan_tasks(
-            &executor,
-            3U,
-            103U,
-            executor.worker_count,
-            &tasks,
-            &task_count) != 1 ||
-        task_count != 16U ||
-        !solver_ab_plan_is_canonical(
-            split_pairs,
-            3U,
-            tasks,
-            task_count,
-            103U) ||
-        solver_ab_count_intra_pair_splits(
-            split_pairs,
-            3U,
-            tasks,
-            task_count) != 15U) {
-        goto cleanup;
-    }
-    solver_ab_free_phase(&executor);
-
-    if (solver_ab_publish_threshold(4) != 16U ||
-        solver_ab_phase_is_publishable(16U, 4, 0) ||
-        !solver_ab_phase_is_publishable(17U, 4, 0) ||
-        !solver_ab_phase_is_publishable(2U, 4, 1) ||
-        solver_ab_publish_threshold(1024) !=
-            SOLVER_AB_INLINE_PUBLISH_MAX) {
-        goto cleanup;
-    }
-
-    executor.pair_cache_limit_bytes =
-        2U * sizeof(solver_ab_pair_t);
-    executor.task_cache_limit_bytes =
-        16U * sizeof(solver_ab_task_t);
-    solver_ab_begin_pair_buffer(&executor);
-    if (solver_ab_reserve_pair_buffer(&executor, 2U) ||
-        executor.pairs_transient ||
-        executor.pair_cache_capacity != 2U ||
-        solver_ab_reserve_pair_buffer(&executor, 3U) ||
-        !executor.pairs_transient ||
-        executor.pair_cache_capacity != 2U) {
-        goto cleanup;
-    }
-    solver_ab_free_phase(&executor);
-    solver_ab_begin_pair_buffer(&executor);
-    if (executor.pairs != executor.pair_cache ||
-        executor.pair_capacity != 2U ||
-        executor.pairs_transient) {
-        goto cleanup;
-    }
-    rc = 0;
-
-cleanup:
-    solver_ab_free_phase(&executor);
-    free(executor.task_cache);
-    free(executor.pair_cache);
-    return rc;
-}
-
-int solver_test_ab_blocks_serial(
-    solver_t* solver,
-    int worker_count) {
-    solver_ab_executor_t executor;
-    const solver_field_geometry_t* geometry;
-    index_t* index;
-    double min_ab;
-    double max_ab;
-    int numxy;
-    int newpoint;
-    int worker_id;
-
-    if (!solver ||
-        worker_count < 1 ||
-        pl_size(solver->indexes) != 1U) {
-        return -1;
-    }
-    numxy = solver_field_geometry_numxy(solver);
-    if (!solver_field_geometry_compatible(solver, numxy)) {
-        return -1;
-    }
-    geometry = solver->field_geometry;
-    index = pl_get(solver->indexes, 0);
-    solver_compute_quad_range(
-        solver,
-        index,
-        &min_ab,
-        &max_ab);
-    solver->minminAB2 =
-        MAX(square(min_ab), square(solver->quadsize_min));
-    solver->maxmaxAB2 = square(max_ab);
-    if (solver->quadsize_max != 0.0) {
-        solver->maxmaxAB2 =
-            MIN(
-                solver->maxmaxAB2,
-                square(solver->quadsize_max));
-    }
-    if (index->cx_less_than_dx) {
-        solver->cxdx_margin =
-            1.5 * solver->codetol;
-    }
-    set_index(solver, index);
-
-    memset(&executor, 0, sizeof(executor));
-    executor.worker_count = worker_count;
-    executor.query_results = calloc(
-        (size_t)worker_count,
-        sizeof(*executor.query_results));
-    executor.combination_eligible = calloc(
-        (size_t)worker_count,
-        sizeof(*executor.combination_eligible));
-    executor.combination_eligible_capacity = calloc(
-        (size_t)worker_count,
-        sizeof(*executor.combination_eligible_capacity));
-    if (!executor.query_results ||
-        !executor.combination_eligible ||
-        !executor.combination_eligible_capacity) {
-        free(executor.combination_eligible_capacity);
-        free(executor.combination_eligible);
-        free(executor.query_results);
-        return -1;
-    }
-    executor.owner = solver;
-    executor.index = index;
-    executor.field_geometry = geometry;
-    executor.dimquads = index_dimquads(index);
-    executor.min_ab2 = square(min_ab);
-    executor.max_ab2 = square(max_ab);
-    if (solver_ab_capture_snapshot(&executor, solver)) {
-        free(executor.combination_eligible_capacity);
-        free(executor.combination_eligible);
-        free(executor.query_results);
-        return -1;
-    }
-    for (worker_id = 0;
-         worker_id < worker_count;
-         worker_id++) {
-        if (!solver_ab_reserve_eligible_workspace(
-                &executor,
-                worker_id,
-                (size_t)numxy)) {
-            goto fail;
-        }
-    }
-
-    for (newpoint = solver->startobj;
-         newpoint < numxy;
-         newpoint++) {
-        solver_ab_phase_kind_t phase;
-
-        solver->last_examined_object = newpoint;
-        for (phase = SOLVER_AB_PHASE_DIAGONAL;
-             phase <= SOLVER_AB_PHASE_OFF_DIAGONAL;
-             phase++) {
-            solver_ab_pair_t* pairs = NULL;
-            solver_ab_task_t* tasks = NULL;
-            size_t pair_count = 0U;
-            size_t task_count = 0U;
-            unsigned long long total_combinations = 0U;
-            int plan_result;
-            size_t task_index;
-            solver_ab_reduce_state_t reduce_state;
-
-            if (solver_ab_collect_pairs(
-                    &executor,
-                    phase,
-                    newpoint,
-                    executor.dimquads,
-                    executor.field_geometry,
-                    executor.min_ab2,
-                    executor.max_ab2,
-                    &pairs,
-                    &pair_count,
-                    &total_combinations)) {
-                goto fail;
-            }
-            if (!pair_count) {
-                solver_ab_free_phase(&executor);
-                continue;
-            }
-            plan_result = solver_ab_plan_tasks(
-                &executor,
-                pair_count,
-                total_combinations,
-                worker_count,
-                &tasks,
-                &task_count);
-            if (plan_result < 0) {
-                goto fail;
-            }
-            if (!plan_result) {
-                if (solver_ab_reserve_task_buffer(
-                        &executor, 1U)) {
-                    goto fail;
-                }
-                tasks = executor.tasks;
-                memset(tasks, 0, sizeof(*tasks));
-                tasks[0].combination_first = 0U;
-                tasks[0].combination_end =
-                    total_combinations;
-                task_count = 1U;
-            }
-            if (!solver_ab_plan_is_canonical(
-                    pairs,
-                    pair_count,
-                    tasks,
-                    task_count,
-                    total_combinations)) {
-                goto fail;
-            }
-
-            executor.newpoint = newpoint;
-            executor.phase = phase;
-            executor.pair_count = pair_count;
-            executor.task_count = task_count;
-            memset(&reduce_state, 0, sizeof(reduce_state));
-            for (task_index = 0;
-                 task_index < task_count;
-                 task_index++) {
-                solver_ab_packet_t packet;
-                solver_ab_builder_t builder;
-                int visit_result;
-
-                memset(&packet, 0, sizeof(packet));
-                memset(&builder, 0, sizeof(builder));
-                builder.executor = &executor;
-                builder.packet = &packet;
-                builder.query_result =
-                    &executor.query_results[0];
-                visit_result = solver_ab_walk_task_ranges(
-                    &executor,
-                    &tasks[task_index],
-                    0,
-                    solver_ab_builder_visit_pair_range,
-                    &builder);
-                if (visit_result < 0) {
-                    builder.fatal_error = TRUE;
-                    packet.evaluation_failed = TRUE;
-                }
-                solver_ab_stage_pending_deltas(&builder);
-                if (builder.fatal_error ||
-                    packet.cancelled ||
-                    solver_ab_reduce_packet(
-                        &executor,
-                        &packet,
-                        &reduce_state) ||
-                    reduce_state.in_hypothesis) {
-                    solver_ab_packet_free(&packet);
-                    solver_ab_free_phase(&executor);
-                    goto fail;
-                }
-                solver_ab_packet_free(&packet);
-            }
-            solver_ab_free_phase(&executor);
-        }
-    }
-    for (worker_id = 0;
-         worker_id < worker_count;
-         worker_id++) {
-        free(executor.combination_eligible[worker_id]);
-    }
-    free(executor.combination_eligible_capacity);
-    free(executor.combination_eligible);
-    free(executor.query_results);
-    free(executor.task_cache);
-    free(executor.pair_cache);
-    return 0;
-
-fail:
-    solver_ab_free_phase(&executor);
-    for (worker_id = 0;
-         worker_id < worker_count;
-         worker_id++) {
-        free(executor.combination_eligible[worker_id]);
-    }
-    free(executor.combination_eligible_capacity);
-    free(executor.combination_eligible);
-    free(executor.query_results);
-    free(executor.task_cache);
-    free(executor.pair_cache);
-    return -1;
-}
 #endif
 
 
@@ -9341,7 +4892,6 @@ int solver_run(solver_t* solver) {
     time_t next_timer_callback_time = time(NULL) + 1;
     pquad* pquads = NULL;
     const solver_field_geometry_t* field_geometry = NULL;
-    anbool shared_field_geometry = FALSE;
     size_t i, num_indexes;
     double tol2;
     int field[DQMAX];
@@ -9385,22 +4935,6 @@ int solver_run(solver_t* solver) {
     num_indexes = pl_size(solver->indexes);
     if (solver_field_geometry_compatible(solver, numxy)) {
         field_geometry = solver->field_geometry;
-        /*
-         * Compact geometry is advisory for index-free descriptor work. Only
-         * the dormant flattened executor replaces native pquad state with
-         * it; descriptor and fallback paths retain owner-private pquads.
-         */
-        shared_field_geometry =
-            solver->ab_executor &&
-            num_indexes == 1U &&
-            solver->maxquads == 0 &&
-            solver->maxmatches == 0;
-        if (shared_field_geometry) {
-            __atomic_fetch_add(
-                &solver->field_geometry->reused_solver_runs,
-                1,
-                __ATOMIC_RELAXED);
-        }
     }
     {
         double minAB2s[num_indexes];
@@ -9444,7 +4978,7 @@ int solver_run(solver_t* solver) {
          MIN(M_PI, arcsec2rad(field_diag * solver->funits_upper)) ...
          */
 
-        if (!shared_field_geometry) {
+        {
             pquads = calloc(
                 (size_t)numxy * (size_t)numxy,
                 sizeof(pquad));
@@ -9476,7 +5010,7 @@ int solver_run(solver_t* solver) {
         /* (See explanatory paragraph below) If "solver->startobj" isn't zero,
          * then we need to initialize the triangle of "pquads" up to
          * A=startobj-2, B=startobj-1. */
-        if (!shared_field_geometry && solver->startobj) {
+        if (solver->startobj) {
             debug("startobj > 0; priming pquad arrays.\n");
             for (field[B] = 0; field[B] < solver->startobj; field[B]++) {
                 for (field[A] = 0; field[A] < field[B]; field[A]++) {
@@ -9544,7 +5078,7 @@ int solver_run(solver_t* solver) {
             debug("Trying quads with B=%i\n", newpoint);
 
             // first do an index-independent scale check...
-            if (!shared_field_geometry) {
+            {
                 for (field[A] = 0; field[A] < newpoint; field[A]++) {
                     // initialize the "pquad" struct for this AB combo.
                     pquad* pq = pquads + field[B] * numxy + field[A];
@@ -9589,7 +5123,6 @@ int solver_run(solver_t* solver) {
                     solver,
                     &phase_telemetry);
                 if (num_indexes == 1U &&
-                    !solver->ab_executor &&
                     field_geometry) {
                     ab_phase_result =
                         solver_ab_descriptor_execute_phase(
@@ -9609,45 +5142,6 @@ int solver_run(solver_t* solver) {
                             newpoint,
                             SOLVER_AB_PHASE_DIAGONAL,
                             phase_mode);
-                        goto quitnow;
-                    }
-                    if (ab_phase_result > 0) {
-                        solver_ab_phase_telemetry_report(
-                            solver,
-                            &phase_telemetry,
-                            newpoint,
-                            SOLVER_AB_PHASE_DIAGONAL,
-                            phase_mode);
-                        continue;
-                    }
-                }
-                if (num_indexes == 1U &&
-                    solver->ab_executor) {
-                    ab_phase_result = solver_ab_execute_phase(
-                        solver,
-                        SOLVER_AB_PHASE_DIAGONAL,
-                        newpoint,
-                        field_geometry,
-                        dimquads,
-                        minAB2s[i],
-                        maxAB2s[i],
-                        &next_timer_callback_time,
-                        &phase_mode);
-                    if (ab_phase_result < 0) {
-                        solver_ab_phase_telemetry_report(
-                            solver,
-                            &phase_telemetry,
-                            newpoint,
-                            SOLVER_AB_PHASE_DIAGONAL,
-                            phase_mode);
-                        goto quitnow;
-                    }
-                    if (shared_field_geometry &&
-                        ab_phase_result == 0) {
-                        logerr("[solver-ab] compact diagonal phase "
-                               "declined after geometry commit\n");
-                        solver->profile.execution_failed = TRUE;
-                        solver->quit_now = TRUE;
                         goto quitnow;
                     }
                     if (ab_phase_result > 0) {
@@ -9712,8 +5206,7 @@ int solver_run(solver_t* solver) {
                 int ab_phase_result = 0;
                 solver_ab_phase_mode_t phase_mode =
                     SOLVER_AB_MODE_NATIVE;
-                anbool phase_pquads_prepared =
-                    shared_field_geometry;
+                anbool phase_pquads_prepared = FALSE;
                 solver_ab_phase_telemetry_t phase_telemetry;
 
                 if (num_indexes == 1U) {
@@ -9726,7 +5219,6 @@ int solver_run(solver_t* solver) {
                     &phase_telemetry);
 
                 if (num_indexes == 1U &&
-                    !solver->ab_executor &&
                     field_geometry) {
                     index_t* index = pl_get(solver->indexes, 0);
                     int dimquads;
@@ -9789,79 +5281,6 @@ int solver_run(solver_t* solver) {
                             }
                         }
                         phase_pquads_prepared = TRUE;
-                    }
-                }
-                if (num_indexes == 1U &&
-                    solver->ab_executor) {
-                    index_t* index = pl_get(solver->indexes, 0);
-                    int dimquads;
-
-                    set_index(solver, index);
-                    dimquads = index_dimquads(index);
-                    /*
-                     * Off-diagonal AB assistance consumes the current C
-                     * membership as an immutable phase snapshot. Shared
-                     * whole-field geometry already contains it. The native
-                     * owner-private pquad path prepares the same rows once
-                     * before helpers are exposed, so geometry allocation is
-                     * a cache decision rather than a scheduler gate.
-                     */
-                    if (!phase_pquads_prepared) {
-                        for (field[A] = 0;
-                             field[A] < newpoint;
-                             field[A]++) {
-                            if (solver_ab_poll_phase_stop(
-                                    solver,
-                                    &next_timer_callback_time)) {
-                                goto quitnow;
-                            }
-                            for (field[B] = field[A] + 1;
-                                 field[B] < newpoint;
-                                 field[B]++) {
-                                pquad* pq =
-                                    pquads +
-                                    field[B] * numxy +
-                                    field[A];
-
-                                if (!pq->scale_ok) {
-                                    continue;
-                                }
-                                pq->inbox[field[C]] = TRUE;
-                                pq->ninbox = field[C] + 1;
-                                check_inbox(
-                                    pq,
-                                    field[C],
-                                    solver);
-                            }
-                        }
-                        phase_pquads_prepared = TRUE;
-                    }
-                    ab_phase_result = solver_ab_execute_phase(
-                        solver,
-                        SOLVER_AB_PHASE_OFF_DIAGONAL,
-                        newpoint,
-                        field_geometry,
-                        dimquads,
-                        minAB2s[0],
-                        maxAB2s[0],
-                        &next_timer_callback_time,
-                        &phase_mode);
-                    if (ab_phase_result < 0) {
-                        solver_ab_phase_telemetry_report(
-                            solver,
-                            &phase_telemetry,
-                            newpoint,
-                            SOLVER_AB_PHASE_OFF_DIAGONAL,
-                            phase_mode);
-                        goto quitnow;
-                    }
-                    if (shared_field_geometry &&
-                        ab_phase_result == 0) {
-                        logerr("[solver-ab] compact off-diagonal phase "
-                               "declined after geometry commit\n");
-                        solver->profile.execution_failed = TRUE;
-                        solver->quit_now = TRUE;
-                        goto quitnow;
                     }
                 }
                 if (ab_phase_result <= 0) {
@@ -9980,7 +5399,7 @@ int solver_run(solver_t* solver) {
     quitnow:
         kdtree_free_query(codekd_result);
 
-        if (!shared_field_geometry) {
+        {
             for (i = 0; i < (numxy*numxy); i++) {
                 pquad* pq = pquads + i;
                 free(pq->inbox);
@@ -10228,30 +5647,16 @@ static void try_permutations(const int* origstars, int dimquad,
     }
 }
 
-static void solver_execute_hypothesis_owner(
+static void solver_begin_hypothesis_owner(
     const int* stars,
     const double* code,
     int dimquad,
     solver_t* solver,
-    anbool current_parity,
-    double tol2,
-    kdtree_qres_t** presult) {
-    int options =
-        KD_OPTIONS_SMALL_RADIUS |
-        KD_OPTIONS_COMPUTE_DISTS |
-        KD_OPTIONS_NO_RESIZE_RESULTS |
-        KD_OPTIONS_USE_SPLIT;
-    double search_wall_start = 0.0;
-
-    if (solver_poll_worker_stop(solver)) {
-        return;
-    }
-
-    // Search with the code we've built.
+    anbool current_parity) {
     solver->profile.hypotheses_generated++;
-    if (solver->profile.max_batch_hypotheses < 1)
-        solver->profile.max_batch_hypotheses = 1;
-
+    if (solver->profile.max_batch_hypotheses < 1U) {
+        solver->profile.max_batch_hypotheses = 1U;
+    }
     if (solver->profile.detailed) {
         uint64_t hypothesis_digest =
             solver_hypothesis_order_digest(
@@ -10264,25 +5669,122 @@ static void solver_execute_hypothesis_owner(
             solver_order_hash_mix(
                 solver->profile.hypothesis_order_hash,
                 hypothesis_digest);
+    }
+}
+
+static void solver_reduce_codekd_result_owner(
+    const int* stars,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity,
+    kdtree_qres_t* result,
+    double search_wall_seconds) {
+    solver->profile.codekd_calls++;
+    solver->profile.hypotheses_executed++;
+    if (solver->profile.detailed) {
+        uint64_t kd_result_digest =
+            solver_kd_result_order_digest(result);
+
+        solver->profile.codekd_wall_seconds += search_wall_seconds;
+        solver->profile.kd_result_order_hash =
+            solver_order_hash_mix(
+                solver->profile.kd_result_order_hash,
+                kd_result_digest);
+    }
+    solver->profile.codekd_hits +=
+        (unsigned long long)result->nres;
+
+    if (solver_poll_worker_stop(solver)) {
+        return;
+    }
+    if (result->nres) {
+        double pixvals[DQMAX * 2];
+        double resolve_wall_start = 0.0;
+        int j;
+
+        for (j = 0; j < dimquad; j++) {
+            setx(pixvals, j, field_getx(solver, stars[j]));
+            sety(pixvals, j, field_gety(solver, stars[j]));
+        }
+        if (solver->profile.detailed) {
+            resolve_wall_start = monotonic_seconds();
+        }
+        resolve_matches(
+            result,
+            pixvals,
+            stars,
+            dimquad,
+            solver->numtries,
+            solver,
+            current_parity);
+        solver->profile.resolve_calls++;
+        if (solver->profile.detailed) {
+            solver->profile.resolve_wall_seconds +=
+                monotonic_seconds() - resolve_wall_start;
+        }
+    }
+    solver->profile.hypotheses_reduced++;
+}
+
+static void solver_execute_prepared_hypothesis_owner(
+    const int* stars,
+    const double* code,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity,
+    kdtree_qres_t* result,
+    double search_wall_seconds) {
+    if (!result || solver_poll_worker_stop(solver)) {
+        return;
+    }
+    solver_begin_hypothesis_owner(
+        stars, code, dimquad, solver, current_parity);
+    solver_reduce_codekd_result_owner(
+        stars,
+        dimquad,
+        solver,
+        current_parity,
+        result,
+        search_wall_seconds);
+}
+
+static void solver_execute_hypothesis_owner(
+    const int* stars,
+    const double* code,
+    int dimquad,
+    solver_t* solver,
+    anbool current_parity,
+    double tol2,
+    kdtree_qres_t** presult) {
+    double search_wall_seconds = 0.0;
+    double search_wall_start = 0.0;
+
+    if (solver_poll_worker_stop(solver)) {
+        return;
+    }
+    solver_begin_hypothesis_owner(
+        stars, code, dimquad, solver, current_parity);
+    if (solver->profile.detailed) {
         search_wall_start = monotonic_seconds();
     }
-
     *presult = solver_codekd_rangesearch(
         solver->index->codekd->tree,
         *presult,
         code,
         tol2,
-        options);
-
-    solver->profile.codekd_calls++;
-    solver->profile.hypotheses_executed++;
-
+        SOLVER_CODEKD_SEARCH_OPTIONS);
     if (solver->profile.detailed) {
-        solver->profile.codekd_wall_seconds +=
+        search_wall_seconds =
             monotonic_seconds() - search_wall_start;
     }
 
     if (!*presult) {
+        solver->profile.codekd_calls++;
+        solver->profile.hypotheses_executed++;
+        if (solver->profile.detailed) {
+            solver->profile.codekd_wall_seconds +=
+                search_wall_seconds;
+        }
         if (errno == ECANCELED &&
             solver_poll_worker_stop(solver)) {
             solver->quit_now = TRUE;
@@ -10293,46 +5795,14 @@ static void solver_execute_hypothesis_owner(
         solver->quit_now = TRUE;
         return;
     }
-    if (solver->profile.detailed) {
-        uint64_t kd_result_digest =
-            solver_kd_result_order_digest(*presult);
 
-        solver->profile.kd_result_order_hash =
-            solver_order_hash_mix(
-                solver->profile.kd_result_order_hash,
-                kd_result_digest);
-    }
-    solver->profile.codekd_hits +=
-        (unsigned long long)(*presult)->nres;
-
-    if (solver_poll_worker_stop(solver)) {
-        return;
-    }
-
-    if ((*presult)->nres) {
-        double pixvals[DQMAX*2];
-        double resolve_wall_start = 0.0;
-        int j;
-        for (j=0; j<dimquad; j++) {
-            setx(pixvals, j, field_getx(solver, stars[j]));
-            sety(pixvals, j, field_gety(solver, stars[j]));
-        }
-
-        if (solver->profile.detailed)
-            resolve_wall_start = monotonic_seconds();
-
-        resolve_matches(*presult, pixvals, stars, dimquad,
-                        solver->numtries, solver,
-                        current_parity);
-        solver->profile.resolve_calls++;
-
-        if (solver->profile.detailed) {
-            solver->profile.resolve_wall_seconds +=
-                monotonic_seconds() - resolve_wall_start;
-        }
-    }
-
-    solver->profile.hypotheses_reduced++;
+    solver_reduce_codekd_result_owner(
+        stars,
+        dimquad,
+        solver,
+        current_parity,
+        *presult,
+        search_wall_seconds);
 }
 
 static void solver_index_payload_failure(
@@ -10353,8 +5823,7 @@ static void resolve_matches_native_range(
     solver_t* solver,
     anbool current_parity,
     int candidate_first,
-    int candidate_end,
-    size_t payload_prepared) {
+    int candidate_end) {
     int jj, thisquadno;
     MatchObj mo;
 
@@ -10370,20 +5839,6 @@ static void resolve_matches_native_range(
 
         if (solver_poll_worker_stop(solver)) {
             return;
-        }
-
-        if (index_shard_worker_context_active() &&
-            (size_t)jj >= payload_prepared &&
-            !((size_t)jj % SOLVER_PAYLOAD_CANDIDATE_BATCH)) {
-            solver_payload_prepare_candidate_rows(
-                krez,
-                (size_t)jj,
-                (size_t)candidate_end,
-                dimquads,
-                solver);
-            if (solver_poll_worker_stop(solver)) {
-                return;
-            }
         }
 
         solver->nummatches++;
@@ -10551,42 +6006,18 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
                             const int* fieldstars, int dimquads,
                             int quads_tried,
                             solver_t* solver, anbool current_parity) {
-    // "field_xy" contains the xy pixel coordinates of stars A,B,C,D forming the quad
-    //    [x_A,y_A, x_B,y_B, x_C,y_C, ...]
-    solver_payload_candidate_window_t windows[2];
     size_t window_first;
-    size_t current_slot = 0U;
 
+    /*
+     * field_xy contains [x_A, y_A, x_B, y_B, ...]. Cold payloads remain on
+     * the original owner-local path. Prepared verification is permitted only
+     * when its complete Quad/Star input is already resident.
+     */
     assert(krez);
     assert(dimquads > 0);
     assert(dimquads <= DQMAX);
 
-    if (krez->nres && solver->ab_executor) {
-        int starkd_status =
-            solver_ab_ensure_starkd_ready(
-                solver->ab_executor,
-                0,
-                0U);
-
-        if (starkd_status > 0) {
-            solver->quit_now = TRUE;
-            return;
-        }
-        if (starkd_status < 0) {
-            logerr("[solver-ab] failed to initialize StarKD lookup state\n");
-            solver->profile.execution_failed = TRUE;
-            solver->quit_now = TRUE;
-            return;
-        }
-    }
-
-    /*
-     * Do not enter the completion-window state machine when its only
-     * nonresident provider is absent. The native range is the authoritative
-     * fallback and preserves the original candidate order and access path.
-     */
-    if (!solver_payload_completion_service_available() &&
-        !solver_payload_candidate_data_fully_resident(solver)) {
+    if (!solver_payload_candidate_data_fully_resident(solver)) {
         resolve_matches_native_range(
             krez,
             field_xy,
@@ -10596,76 +6027,28 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
             solver,
             current_parity,
             0,
-            krez->nres,
-            (size_t)krez->nres);
+            krez->nres);
         return;
     }
 
-    memset(windows, 0, sizeof(windows));
     window_first = 0U;
     while (window_first < (size_t)krez->nres) {
-        solver_payload_candidate_window_t* current =
-            &windows[current_slot];
-        size_t next_slot = (current_slot + 1U) % 2U;
-        solver_payload_candidate_window_t* next =
-            &windows[next_slot];
         size_t window_end = MIN(
             (size_t)krez->nres,
             window_first +
-                (size_t)SOLVER_PAYLOAD_CANDIDATE_BATCH);
-        size_t next_end = MIN(
-            (size_t)krez->nres,
-            window_end +
-                (size_t)SOLVER_PAYLOAD_CANDIDATE_BATCH);
-        size_t payload_prepared = window_end;
-        anbool payload_ready = FALSE;
-        int handled = 0;
+                (size_t)SOLVER_VERIFICATION_WINDOW_CANDIDATES);
+        int handled = solver_ab_try_verification_wave(
+            krez,
+            field_xy,
+            fieldstars,
+            dimquads,
+            quads_tried,
+            solver,
+            current_parity,
+            (int)window_first,
+            (int)window_end);
 
-        if (current->state == SOLVER_PAYLOAD_CANDIDATE_EMPTY) {
-            (void)solver_payload_candidate_window_begin(
-                current,
-                krez,
-                window_first,
-                window_end,
-                dimquads,
-                solver);
-        }
-        if (current->state != SOLVER_PAYLOAD_CANDIDATE_FAILED &&
-            solver_payload_candidate_window_submit_stars(
-                current, solver)) {
-            if (window_end < (size_t)krez->nres &&
-                next->state == SOLVER_PAYLOAD_CANDIDATE_EMPTY) {
-                (void)solver_payload_candidate_window_begin(
-                    next,
-                    krez,
-                    window_end,
-                    next_end,
-                    dimquads,
-                    solver);
-            }
-            payload_ready =
-                solver_payload_candidate_window_wait(
-                    current, solver);
-        }
-        if (payload_ready) {
-            handled = solver_ab_try_verification_wave(
-                krez,
-                field_xy,
-                fieldstars,
-                dimquads,
-                quads_tried,
-                solver,
-                current_parity,
-                (int)window_first,
-                (int)window_end,
-                &payload_prepared);
-        }
-        if (handled) {
-            if (solver->quit_now ||
-                solver_poll_worker_stop(solver)) {
-                goto cleanup;
-            }
-        } else {
+        if (!handled) {
             resolve_matches_native_range(
                 krez,
                 field_xy,
@@ -10675,20 +6058,13 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
                 solver,
                 current_parity,
                 (int)window_first,
-                (int)window_end,
-                window_end);
+                (int)window_end);
         }
-        solver_payload_candidate_window_cancel(current);
         if (solver->quit_now || solver_poll_worker_stop(solver)) {
-            goto cleanup;
+            return;
         }
         window_first = window_end;
-        current_slot = next_slot;
     }
-
-cleanup:
-    solver_payload_candidate_window_cancel(&windows[0]);
-    solver_payload_candidate_window_cancel(&windows[1]);
 }
 
 void solver_inject_match(solver_t* solver, MatchObj* mo, sip_t* sip) {

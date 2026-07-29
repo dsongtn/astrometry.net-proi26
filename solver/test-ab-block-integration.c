@@ -442,25 +442,44 @@ typedef struct canonical_index_order_test {
 
 static canonical_index_order_test_t canonical_index_order_test;
 
-static index_t* canonical_index_order_get_index(
-    onefield_t* bp,
-    size_t index_order) {
-    (void)bp;
+static index_shard_hook_result_t canonical_index_order_hook_result(
+    index_shard_hook_outcome_t outcome,
+    int error_code) {
+    index_shard_hook_result_t result = {outcome, error_code};
 
-    if (index_order >= 2U) {
-        return NULL;
-    }
-    return &canonical_index_order_test.indexes[index_order];
+    return result;
 }
 
-static int canonical_index_order_done_with_index(
+static index_shard_hook_result_t canonical_index_order_get_index(
+    onefield_t* bp,
+    size_t index_order,
+    index_t** index_out) {
+    (void)bp;
+
+    if (!index_out || index_order >= 2U) {
+        return canonical_index_order_hook_result(
+            INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE,
+            -1);
+    }
+
+    *index_out =
+        &canonical_index_order_test.indexes[index_order];
+    return canonical_index_order_hook_result(
+        INDEX_SHARD_HOOK_COMPLETED_UNSOLVED,
+        0);
+}
+
+static index_shard_hook_result_t
+canonical_index_order_done_with_index(
     onefield_t* bp,
     size_t index_order,
     index_t* index) {
     (void)bp;
     (void)index_order;
     (void)index;
-    return 0;
+    return canonical_index_order_hook_result(
+        INDEX_SHARD_HOOK_COMPLETED_UNSOLVED,
+        0);
 }
 
 static int canonical_index_order_report_solution(
@@ -484,12 +503,28 @@ static int canonical_index_order_report_solution(
     return 0;
 }
 
+static int canonical_index_order_create_worker_view(
+    onefield_t* master_bp,
+    const solver_t* base_sp,
+    void** worker_view_out) {
+    if (!master_bp || !base_sp || !worker_view_out) {
+        return -1;
+    }
+    *worker_view_out = master_bp;
+    return 0;
+}
+
+static void canonical_index_order_destroy_worker_view(
+    void* worker_view) {
+    (void)worker_view;
+}
+
 static int canonical_index_order_prepare_local(
     onefield_t* local_bp,
-    onefield_t* master_bp,
-    const solver_t* base_sp) {
-    (void)master_bp;
-    (void)base_sp;
+    const void* worker_view) {
+    if (!local_bp || !worker_view) {
+        return -1;
+    }
 
     memset(local_bp, 0, sizeof(*local_bp));
     local_bp->fieldnum = -1;
@@ -538,7 +573,8 @@ static void canonical_index_order_cleanup_local(
     local_bp->solutions = NULL;
 }
 
-static int canonical_index_order_solve_one(
+static index_shard_hook_result_t
+canonical_index_order_solve_one(
     onefield_t* local_bp,
     index_t* index) {
     canonical_index_order_test_t* test =
@@ -548,12 +584,16 @@ static int canonical_index_order_solve_one(
     int wait_status = 0;
 
     if (!local_bp || !local_bp->solutions || !index) {
-        return -1;
+        return canonical_index_order_hook_result(
+            INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE,
+            -1);
     }
 
     index_order = index->indexid;
     if (index_order < 0 || index_order >= 2) {
-        return -1;
+        return canonical_index_order_hook_result(
+            INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE,
+            -1);
     }
     local_bp->fieldnum = index_order;
 
@@ -570,7 +610,9 @@ static int canonical_index_order_solve_one(
         }
         pthread_mutex_unlock(&test->mutex);
         if (wait_status) {
-            return -1;
+            return canonical_index_order_hook_result(
+                INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE,
+                wait_status);
         }
     }
 
@@ -579,12 +621,16 @@ static int canonical_index_order_solve_one(
     match.indexid = index_order;
     match.logodds = 100.0;
     if (!bl_append(local_bp->solutions, &match)) {
-        return -1;
+        return canonical_index_order_hook_result(
+            INDEX_SHARD_HOOK_TASK_LOCAL_FAILURE,
+            -1);
     }
-    return 0;
+    return canonical_index_order_hook_result(
+        INDEX_SHARD_HOOK_COMPLETED_UNSOLVED,
+        0);
 }
 
-static anbool canonical_index_order_analyze(
+static index_shard_hook_result_t canonical_index_order_analyze(
     onefield_t* master_bp,
     bl* solutions,
     double* best_logodds,
@@ -597,12 +643,16 @@ static anbool canonical_index_order_analyze(
     (void)master_bp;
 
     if (!solutions || bl_size(solutions) != 1U) {
-        return FALSE;
+        return canonical_index_order_hook_result(
+            INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE,
+            -1);
     }
     match = bl_access(solutions, 0);
     index_order = match->indexid;
     if (index_order < 0 || index_order >= 2) {
-        return FALSE;
+        return canonical_index_order_hook_result(
+            INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE,
+            -1);
     }
 
     pthread_mutex_lock(&test->mutex);
@@ -615,7 +665,9 @@ static anbool canonical_index_order_analyze(
     if (best_fieldnum) {
         *best_fieldnum = match->fieldnum;
     }
-    return TRUE;
+    return canonical_index_order_hook_result(
+        INDEX_SHARD_HOOK_COMPLETED_SOLVED,
+        0);
 }
 
 static int canonical_index_order_merge(
@@ -658,7 +710,7 @@ static void canonical_index_order_free_solutions(
         MatchObj* match = bl_access(solutions, 0);
 
         pthread_mutex_lock(&test->mutex);
-        if (match->indexid == 1) {
+        if (match->indexid == 0) {
             test->loser_freed++;
         } else {
             test->failed = TRUE;
@@ -673,16 +725,22 @@ static void canonical_index_order_free_solutions(
 }
 
 static const index_shard_hooks_t canonical_index_order_hooks = {
-    canonical_index_order_get_index,
-    canonical_index_order_done_with_index,
-    canonical_index_order_report_solution,
-    canonical_index_order_prepare_local,
-    canonical_index_order_reset_local,
-    canonical_index_order_cleanup_local,
-    canonical_index_order_solve_one,
-    canonical_index_order_analyze,
-    canonical_index_order_merge,
-    canonical_index_order_free_solutions};
+    .get_index = canonical_index_order_get_index,
+    .done_with_index = canonical_index_order_done_with_index,
+    .report_committed_solution =
+        canonical_index_order_report_solution,
+    .create_worker_view =
+        canonical_index_order_create_worker_view,
+    .destroy_worker_view =
+        canonical_index_order_destroy_worker_view,
+    .prepare_local_context = canonical_index_order_prepare_local,
+    .reset_local_context_for_task =
+        canonical_index_order_reset_local,
+    .cleanup_local_context = canonical_index_order_cleanup_local,
+    .solve_one_index = canonical_index_order_solve_one,
+    .analyze_solutions = canonical_index_order_analyze,
+    .merge_solutions = canonical_index_order_merge,
+    .free_solutions = canonical_index_order_free_solutions};
 
 static int run_canonical_index_order_test(void) {
     canonical_index_order_test_t* test =
@@ -742,9 +800,9 @@ static int run_canonical_index_order_test(void) {
         test->analyzed[0] != 1 ||
         test->analyzed[1] != 1 ||
         test->merge_count != 1 ||
-        test->merged_order != 0 ||
+        test->merged_order != 1 ||
         test->report_count != 1 ||
-        test->reported_order != 0U ||
+        test->reported_order != 1U ||
         test->loser_freed != 1 ||
         !bp.single_field_solved) {
         fprintf(
@@ -772,7 +830,7 @@ static int run_canonical_index_order_test(void) {
     printf(
         "INDEX_SHARD_CANONICAL_ORDER_OK "
         "completion=1,0 analyzed=1,1 "
-        "merged=0 reported=0 loser_freed=1\n");
+        "merged=1 reported=1 loser_freed=1\n");
     result = 0;
 
 cleanup:

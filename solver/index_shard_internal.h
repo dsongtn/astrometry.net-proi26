@@ -49,11 +49,38 @@ typedef enum index_shard_solve_status {
   INDEX_SHARD_SOLVE_UNAVAILABLE = 1
 } index_shard_solve_status_t;
 
+/*
+ * Typed worker-hook outcome.
+ *
+ * The hook that observes an error owns its scope classification. The shard
+ * scheduler must not infer task-local versus global-integrity failure from
+ * winner timing or from a generic nonzero return value.
+ */
+typedef enum index_shard_hook_outcome {
+  INDEX_SHARD_HOOK_COMPLETED_UNSOLVED = 0,
+  INDEX_SHARD_HOOK_COMPLETED_SOLVED,
+  INDEX_SHARD_HOOK_CANCELLED,
+  INDEX_SHARD_HOOK_WALL_LIMIT,
+  INDEX_SHARD_HOOK_CPU_LIMIT,
+  INDEX_SHARD_HOOK_TASK_LOCAL_FAILURE,
+  INDEX_SHARD_HOOK_GLOBAL_INTEGRITY_FAILURE
+} index_shard_hook_outcome_t;
+
+typedef struct index_shard_hook_result {
+  index_shard_hook_outcome_t outcome;
+  int error_code;
+} index_shard_hook_result_t;
+
 typedef struct index_shard_hooks {
-  index_t *(*get_index)(onefield_t *bp, size_t index_order);
-  int (*done_with_index)(onefield_t *bp,
-                         size_t index_order,
-                         index_t *index);
+  index_shard_hook_result_t (*get_index)(
+      onefield_t *bp,
+      size_t index_order,
+      index_t **index_out);
+
+  index_shard_hook_result_t (*done_with_index)(
+      onefield_t *bp,
+      size_t index_order,
+      index_t *index);
 
   /*
    * Report the one reducer-owned solution only after the pass is quiescent
@@ -67,25 +94,40 @@ typedef struct index_shard_hooks {
   /*
    * Worker-local context lifecycle.
    *
+   * create_worker_view() freezes one pass-owned immutable view before the
+   * generation is published. prepare_local_context() receives only that view,
+   * never the reducer-owned onefield_t or its mutable solver. Narrow index
+   * acquisition and terminal-limit services remain separate synchronized
+   * pass boundaries.
+   *
    * prepare_local_context() runs once per worker per submitted pass.
    * reset_local_context_for_task() runs before every one-index solve.
    * cleanup_local_context() runs once when the worker finishes the pass.
+   * destroy_worker_view() runs only after every worker has quiesced.
    */
+  int (*create_worker_view)(onefield_t *master_bp,
+                            const solver_t *base_sp,
+                            void **worker_view_out);
+
+  void (*destroy_worker_view)(void *worker_view);
+
   int (*prepare_local_context)(onefield_t *local_bp,
-                               onefield_t *master_bp,
-                               const solver_t *base_sp);
+                               const void *worker_view);
 
   void (*reset_local_context_for_task)(onefield_t *local_bp,
                                        bl *local_solutions);
 
   void (*cleanup_local_context)(onefield_t *local_bp);
 
-  int (*solve_one_index)(onefield_t *local_bp, index_t *index);
+  index_shard_hook_result_t (*solve_one_index)(
+      onefield_t *local_bp,
+      index_t *index);
 
-  anbool (*analyze_solutions)(onefield_t *master_bp,
-                              bl *solutions,
-                              double *best_logodds,
-                              int *best_fieldnum);
+  index_shard_hook_result_t (*analyze_solutions)(
+      onefield_t *master_bp,
+      bl *solutions,
+      double *best_logodds,
+      int *best_fieldnum);
 
   int (*merge_solutions)(onefield_t *master_bp,
                          bl *solutions,
@@ -115,10 +157,12 @@ anbool index_shard_worker_stop_requested(void);
  * ranges are pairwise disjoint, do not alias any input, and are invalid when
  * the group returns TASK_FAILED or STOPPED. Inputs may point into explicitly
  * immutable, index-free package arenas whose lifetime covers the group. No
- * range may point to mutable owner state, an index, a FITS mapping, a solver,
- * a callback, or a reducer. execute() must be reentrant and thread-safe and
- * must not mutate global state or retain either byte-range pointer after it
- * returns.
+ * range may point to an immutable package arena. No range may point to
+ * mutable owner state, an index_t, a solver, a callback, or a reducer. A task
+ * may borrow a const read-only payload view when the
+ * outer owner retains its source lease until the synchronous group is fully
+ * quiescent. execute() must be reentrant and thread-safe and must not mutate
+ * global state or retain any task or source pointer after it returns.
  */
 typedef enum index_shard_helper_run_status {
   INDEX_SHARD_HELPER_FATAL = -3,
@@ -159,6 +203,22 @@ typedef struct index_shard_helper_task {
   unsigned char scheduler_state;
   int execute_status;
 } index_shard_helper_task_t;
+
+typedef enum index_shard_helper_retire_status {
+  INDEX_SHARD_HELPER_RETIRE_ERROR = -1,
+  INDEX_SHARD_HELPER_RETIRE_OK = 0,
+  INDEX_SHARD_HELPER_RETIRE_STOPPED = 1
+} index_shard_helper_retire_status_t;
+
+/*
+ * Called only by the outer owner, never by a foreign helper. Completed tasks
+ * retire in increasing task_index order while later tasks may still execute.
+ */
+typedef index_shard_helper_retire_status_t
+(*index_shard_helper_retire_fn)(
+    const index_shard_helper_task_t *task,
+    size_t task_index,
+    void *owner_context);
 
 typedef struct index_shard_helper_run_stats {
   size_t owner_tasks;
@@ -201,33 +261,27 @@ index_shard_helper_run(
     size_t task_count,
     index_shard_helper_run_stats_t *stats);
 
+/*
+ * Ordered continuation form of index_shard_helper_run(). The owner retires a
+ * completed canonical prefix before claiming more local work. READY work is
+ * never abandoned while the owner waits for a later completion. Once retire()
+ * mutates owner state, a later task failure is terminal for that packet group;
+ * callers must not replay the group through a native fallback.
+ */
+index_shard_helper_run_status_t
+index_shard_helper_run_ordered(
+    const index_shard_helper_ops_t *ops,
+    index_shard_helper_task_t *tasks,
+    size_t task_count,
+    index_shard_helper_retire_fn retire,
+    void *owner_context,
+    index_shard_helper_run_stats_t *stats);
+
 index_shard_solve_status_t
 index_shard_solve(onefield_t *bp,
                   solver_t *base_sp,
                   size_t nindexes,
                   const index_shard_hooks_t *hooks);
-
-/*
- * Dormant compatibility executor retained for focused solver seams. The
- * production bounded-producer scheduler never creates, binds, or joins it.
- */
-solver_ab_executor_t* solver_ab_executor_create(int worker_count);
-void solver_ab_executor_destroy(solver_ab_executor_t* executor);
-int solver_ab_executor_set_lending_callbacks(
-    solver_ab_executor_t* executor,
-    void (*work_notify)(void*),
-    int (*available_lenders)(void*),
-    void* opaque);
-int solver_ab_executor_bind(solver_ab_executor_t* executor,
-                            solver_t* owner,
-                            index_t* index);
-int solver_ab_executor_try_join(solver_ab_executor_t* executor,
-                                int* worker_id);
-int solver_ab_executor_run_joined(solver_ab_executor_t* executor,
-                                  int worker_id);
-int solver_ab_executor_quiesce(solver_ab_executor_t* executor);
-int solver_ab_executor_finish(solver_ab_executor_t* executor);
-void solver_ab_executor_abort(solver_ab_executor_t* executor);
 
 /*
  * Apply reducer-owned traversal deltas atomically. A signed counter boundary

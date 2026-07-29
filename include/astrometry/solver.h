@@ -41,8 +41,6 @@ enum {
 struct verify_field_t;
 struct solver_field_geometry;
 typedef struct solver_field_geometry solver_field_geometry_t;
-struct solver_ab_executor;
-typedef struct solver_ab_executor solver_ab_executor_t;
 
 /*
  * Aggregate profiling for one solver_run() invocation.
@@ -59,8 +57,6 @@ typedef struct solver_profile {
     double codekd_wall_seconds;
     double resolve_wall_seconds;
     double verify_wall_seconds;
-    double hypothesis_wave_wall_seconds;
-    double ab_planning_wall_seconds;
 
     unsigned long long codekd_calls;
     unsigned long long codekd_hits;
@@ -82,15 +78,6 @@ typedef struct solver_profile {
     unsigned long long parallel_hypotheses;
     unsigned long long allocation_failures;
     unsigned long long search_failures;
-    unsigned long long ab_blocks_planned;
-    unsigned long long ab_blocks_retired;
-    unsigned long long ab_blocks_owner;
-    unsigned long long ab_segments_retired;
-    unsigned long long ab_segment_payload_bytes;
-    unsigned long long ab_pairs_planned;
-    unsigned long long ab_combinations_planned;
-    unsigned long long ab_intra_pair_splits;
-    unsigned long long ab_max_pair_combinations;
     unsigned long long ab_helper_tasks;
     unsigned long long ab_helper_combinations;
     unsigned long long hypothesis_order_hash;
@@ -289,12 +276,6 @@ struct solver_t {
      * Reset whenever solver_set_field() installs a new field.
      */
     fitsbin_mmap_advice_state_t index_mmap_policy;
-
-    /*
-     * Optional phase-local AB executor supplied by the existing index-shard
-     * pool for one pinned index. The executor owns no solver or index data.
-     */
-    solver_ab_executor_t* ab_executor;
 
     /* Output from the most recent solver_run() invocation. */
     solver_profile_t profile;
