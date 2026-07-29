@@ -3359,10 +3359,10 @@ static int index_shard_claim_outer_locked(
 /*
  * Select work from the current band without transferring index ownership.
  *
- * At most producer_width workers own cold index tasks. Remaining compute
- * workers execute coarse index-free packages published by those owners. New
- * canonical outer work has priority whenever a producer slot is free. The
- * reducer remains the only authority for ordered result publication.
+ * New canonical outer work has priority whenever a producer slot is free.
+ * Helper packages become eligible only when no outer task is immediately
+ * claimable. The reducer remains the only authority for ordered result
+ * publication.
  */
 static index_shard_work_selection_t
 index_shard_select_work(
@@ -4532,7 +4532,6 @@ static void index_shard_pool_release_pass(index_shard_pool_t *pool) {
 int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   index_shard_pool_t *pool;
   int i;
-  int payload_lanes = 0;
   int tls_status;
   int worker_count;
 
@@ -4715,24 +4714,14 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
 
   index_shard_global_pool = pool;
   fitsbin_payload_io_configure_workers(worker_count);
-  if (worker_count > 1) {
-    if (fitsbin_payload_io_service_start(MIN(worker_count, 2))) {
-      logverb("[index-shard] payload loader unavailable; "
-              "using synchronous fallback\n");
-    }
-    payload_lanes = fitsbin_payload_io_service_width();
-    pool->producer_width = MIN(
-        (size_t)worker_count - 1U,
-        (size_t)MAX(payload_lanes, 1));
-  }
+  pool->producer_width = (size_t)worker_count;
 
   logverb("[index-shard] workers=%i mode=pthread "
-          "compute_width=%i producer_width=%zu payload_lanes=%i "
+          "compute_width=%i producer_width=%zu "
           "inverse_cache_budget=%zu\n",
           worker_count,
           worker_count,
           pool->producer_width,
-          payload_lanes,
           pool->inverse_cache_budget);
 
   pthread_mutex_unlock(&index_shard_global_pool_mutex);
@@ -4794,7 +4783,6 @@ void index_shard_pool_stop(onefield_t *bp) {
   for (i = 0; i < pool->worker_count; i++) {
     pthread_join(pool->threads[i], NULL);
   }
-  fitsbin_payload_io_service_stop();
   fitsbin_payload_io_configure_workers(1);
 
   free(pool->threads);
@@ -4867,7 +4855,6 @@ static int index_shard_pool_submit(
     unsigned char *completed,
     unsigned char *outer_states) {
   index_shard_thread_state_t *shared = &pool->shared;
-  int loader_lanes = fitsbin_payload_io_service_width();
   int worker_count = pool->worker_count;
   int i;
 
@@ -5007,9 +4994,9 @@ static int index_shard_pool_submit(
           "scheduler=canonical-ready inner_scheduler=prepared-groups "
           "mmap_pass=%u mmap_advice=%s mmap_scope=all-chunks "
           "mmap_policy=parallel-random-serial-normal "
-          "page_delivery=bounded-pread-broker loader_lanes=%i "
-          "payload_io=batched-pread-mmap-fallback credits=%i "
-          "outer_admission=bounded-producer-canonical\n",
+          "page_delivery=native-mmap-demand "
+          "payload_io=kernel-page-cache credits=%i "
+          "outer_admission=full-width-canonical\n",
           worker_count,
           shared->producer_width,
           nindexes,
@@ -5020,7 +5007,6 @@ static int index_shard_pool_submit(
           base_sp->endobj,
           shared->mmap_pass_number,
           fitsbin_mmap_advice_name(shared->mmap_advice),
-          loader_lanes,
           worker_count);
 
   return 0;

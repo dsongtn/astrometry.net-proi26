@@ -360,15 +360,14 @@ ALL_TEST_FILES = test_bl test_bt test_endian test_fitstable test_xylist \
 
 ALL_TEST_EXTRA_OBJS =
 ALL_TEST_LIBS = $(ANFILES_SLIB)
-ALL_TEST_EXTRA_LDFLAGS = \
-	-Wl,--wrap=pread64 -Wl,--wrap=madvise
+ALL_TEST_EXTRA_LDFLAGS = -Wl,--wrap=pread64
 
 include $(COMMON)/makefile.tests
 
 test_fitsbin_payload_io: test_fitsbin_payload_io-main.o \
 	test_fitsbin_payload_io.o $(COMMON)/cutest.o $(ALL_TEST_LIBS)
 	$(CC) -o $@ $(CFLAGS) $(LDFLAGS) \
-		-Wl,--wrap=pread64 -Wl,--wrap=madvise $^ $(LDLIBS)
+		-Wl,--wrap=pread64 $^ $(LDLIBS)
 
 DEP_OBJ += $(ALL_TEST_FILES_O)
 

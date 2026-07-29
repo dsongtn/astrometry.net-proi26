@@ -462,8 +462,9 @@ int fitsbin_prefetch_ranges(
 
 /*
  * Submit one complete current-index mapped-page population to the bounded
- * loader. The loader retains validated page-aligned spans and their fitsbin
- * owner until the ticket reaches a terminal state.
+ * loader. The source must first be initialized by
+ * fitsbin_configure_index_mmap(). The loader retains validated page-aligned
+ * spans and their fitsbin owner until the ticket reaches a terminal state.
  *
  * Return 1 when queued, zero when the optional service or bounded capacity is
  * unavailable, and -1 for an invalid or failed preparation. The caller must
