@@ -330,6 +330,9 @@ void fitsbin_payload_io_configure_workers(int worker_count);
 int fitsbin_payload_io_service_start(int lane_count);
 void fitsbin_payload_io_service_stop(void);
 
+/* Return the live loader width, or zero while the service is unavailable. */
+int fitsbin_payload_io_service_width(void);
+
 /*
  * Cheap advisory predicate for optional work that may compete with payload
  * demand. It is nonzero while all reader credits are occupied or any demand

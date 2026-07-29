@@ -51,8 +51,6 @@ typedef enum index_shard_solve_status {
 
 typedef struct index_shard_hooks {
   index_t *(*get_index)(onefield_t *bp, size_t index_order);
-  const char *(*get_index_identity)(onefield_t *bp,
-                                    size_t index_order);
   int (*done_with_index)(onefield_t *bp,
                          size_t index_order,
                          index_t *index);
@@ -218,7 +216,7 @@ index_shard_solve(onefield_t *bp,
 
 /*
  * Dormant compatibility executor retained for focused solver seams. The
- * production affinity-owner scheduler never creates, binds, or joins it.
+ * production bounded-producer scheduler never creates, binds, or joins it.
  */
 solver_ab_executor_t* solver_ab_executor_create(int worker_count);
 void solver_ab_executor_destroy(solver_ab_executor_t* executor);

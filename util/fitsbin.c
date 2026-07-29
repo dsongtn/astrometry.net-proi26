@@ -568,15 +568,19 @@ struct fitsbin_payload_io_ticket {
     fitsbin_payload_io_ticket_kind_t kind;
     fitsbin_payload_io_priority_t priority;
     struct fitsbin_payload_io_ticket* next;
+    struct fitsbin_payload_io_ticket* wait_next;
+    pthread_cond_t completion_cv;
     int fd;
     int saved_errno;
     anbool cancel_requested;
     anbool counters_applied;
+    anbool wait_registered;
+    anbool helper_waiter;
 };
 
 static pthread_mutex_t fitsbin_payload_io_mutex =
     PTHREAD_MUTEX_INITIALIZER;
-/* Queue and ticket state changes. */
+/* Loader queue publication and service lifecycle changes. */
 static pthread_cond_t fitsbin_payload_io_cv =
     PTHREAD_COND_INITIALIZER;
 /* Reader-credit availability, kept separate from ticket waiters. */
@@ -596,6 +600,9 @@ static fitsbin_payload_io_ticket_t*
     fitsbin_payload_io_queue_head[FITSBIN_PAYLOAD_IO_PRIORITY_COUNT];
 static fitsbin_payload_io_ticket_t*
     fitsbin_payload_io_queue_tail[FITSBIN_PAYLOAD_IO_PRIORITY_COUNT];
+/* Registered waiters are linked only while holding payload_io_mutex. */
+static fitsbin_payload_io_ticket_t*
+    fitsbin_payload_io_wait_head = NULL;
 static size_t fitsbin_payload_io_service_jobs = 0U;
 static size_t fitsbin_payload_io_service_bytes = 0U;
 static unsigned long long fitsbin_payload_io_next_sequence = 0ULL;
@@ -746,6 +753,8 @@ size_t fitsbin_payload_io_wait_helper_count(void) {
 }
 
 void fitsbin_payload_io_notify_wait_helpers(void) {
+    fitsbin_payload_io_ticket_t* ticket;
+
     __atomic_add_fetch(
         &fitsbin_payload_io_work_epoch,
         1ULL,
@@ -756,7 +765,13 @@ void fitsbin_payload_io_notify_wait_helpers(void) {
     pthread_mutex_lock(&fitsbin_payload_io_mutex);
     if (fitsbin_payload_io_wait_helper_count()) {
         pthread_cond_broadcast(&fitsbin_payload_io_credit_cv);
-        pthread_cond_broadcast(&fitsbin_payload_io_cv);
+        for (ticket = fitsbin_payload_io_wait_head;
+             ticket;
+             ticket = ticket->wait_next) {
+            if (ticket->helper_waiter) {
+                pthread_cond_signal(&ticket->completion_cv);
+            }
+        }
     }
     pthread_mutex_unlock(&fitsbin_payload_io_mutex);
 }
@@ -2047,7 +2062,7 @@ static void fitsbin_payload_io_cancel_queued_locked(
     }
     ticket->state = FITSBIN_PAYLOAD_IO_CANCELLED;
     fitsbin_payload_io_service_cancelled++;
-    pthread_cond_broadcast(&fitsbin_payload_io_cv);
+    pthread_cond_signal(&ticket->completion_cv);
 }
 
 /* fitsbin_payload_io_mutex must be held. */
@@ -2086,16 +2101,71 @@ static void fitsbin_payload_io_enqueue_locked(
     fitsbin_payload_io_queue_tail[priority] = ticket;
 }
 
+static fitsbin_payload_io_ticket_t*
+fitsbin_payload_io_ticket_alloc(void) {
+    fitsbin_payload_io_ticket_t* ticket =
+        calloc(1, sizeof(*ticket));
+    int status;
+
+    if (!ticket) {
+        return NULL;
+    }
+    ticket->fd = -1;
+    status = pthread_cond_init(&ticket->completion_cv, NULL);
+    if (status) {
+        free(ticket);
+        errno = status;
+        return NULL;
+    }
+    return ticket;
+}
+
 static void fitsbin_payload_io_ticket_free_storage(
     fitsbin_payload_io_ticket_t* ticket) {
     if (!ticket) {
         return;
     }
+    assert(!ticket->wait_registered);
     if (ticket->fd >= 0) {
         close(ticket->fd);
     }
     free(ticket->ranges);
+    pthread_cond_destroy(&ticket->completion_cv);
     free(ticket);
+}
+
+/* fitsbin_payload_io_mutex must be held. */
+static int fitsbin_payload_io_register_waiter_locked(
+    fitsbin_payload_io_ticket_t* ticket) {
+    if (!ticket || ticket->wait_registered) {
+        return -1;
+    }
+    ticket->wait_next = fitsbin_payload_io_wait_head;
+    fitsbin_payload_io_wait_head = ticket;
+    ticket->wait_registered = TRUE;
+    return 0;
+}
+
+/* fitsbin_payload_io_mutex must be held. */
+static int fitsbin_payload_io_unregister_waiter_locked(
+    fitsbin_payload_io_ticket_t* ticket) {
+    fitsbin_payload_io_ticket_t** link;
+
+    if (!ticket || !ticket->wait_registered) {
+        return -1;
+    }
+    link = &fitsbin_payload_io_wait_head;
+    while (*link && *link != ticket) {
+        link = &(*link)->wait_next;
+    }
+    if (!*link) {
+        return -1;
+    }
+    *link = ticket->wait_next;
+    ticket->wait_next = NULL;
+    ticket->wait_registered = FALSE;
+    ticket->helper_waiter = FALSE;
+    return 0;
 }
 
 static void* fitsbin_payload_io_service_worker(void* opaque) {
@@ -2274,7 +2344,7 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
                 fitsbin_payload_io_service_direct_ready++;
             }
         }
-        pthread_cond_broadcast(&fitsbin_payload_io_cv);
+        pthread_cond_signal(&ticket->completion_cv);
         pthread_mutex_unlock(&fitsbin_payload_io_mutex);
     }
     return NULL;
@@ -2383,6 +2453,19 @@ void fitsbin_payload_io_service_stop(void) {
     pthread_mutex_unlock(&fitsbin_payload_io_mutex);
 }
 
+int fitsbin_payload_io_service_width(void) {
+    int lane_count;
+
+    pthread_mutex_lock(&fitsbin_payload_io_mutex);
+    lane_count = fitsbin_payload_io_service_running &&
+        fitsbin_payload_io_service_accepting &&
+        !fitsbin_payload_io_service_stopping
+        ? fitsbin_payload_io_service_lanes
+        : 0;
+    pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+    return lane_count;
+}
+
 static int fitsbin_payload_io_submit_ticket(
     fitsbin_payload_io_ticket_t* ticket,
     fitsbin_payload_io_ticket_t** ticket_out) {
@@ -2448,11 +2531,10 @@ int fitsbin_pread_mapped_ranges_submit(
     }
     pthread_mutex_unlock(&fitsbin_payload_io_mutex);
 
-    ticket = calloc(1, sizeof(*ticket));
+    ticket = fitsbin_payload_io_ticket_alloc();
     if (!ticket) {
         return -1;
     }
-    ticket->fd = -1;
     ticket->state = FITSBIN_PAYLOAD_IO_PLANNED;
     ticket->kind = FITSBIN_PAYLOAD_IO_TICKET_DIRECT;
     ticket->priority = priority;
@@ -2532,11 +2614,10 @@ int fitsbin_prefetch_ranges_submit(
     }
     pthread_mutex_unlock(&fitsbin_payload_io_mutex);
 
-    ticket = calloc(1, sizeof(*ticket));
+    ticket = fitsbin_payload_io_ticket_alloc();
     if (!ticket) {
         return -1;
     }
-    ticket->fd = -1;
     ticket->state = FITSBIN_PAYLOAD_IO_PLANNED;
     ticket->kind = FITSBIN_PAYLOAD_IO_TICKET_PREFETCH;
     ticket->priority = FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT;
@@ -2578,6 +2659,7 @@ static int fitsbin_payload_io_ticket_wait_internal(
     unsigned long long page_count;
     fitsbin_payload_io_ticket_kind_t kind;
     anbool helper_registered = FALSE;
+    anbool waiter_registered = FALSE;
     anbool retry_helper = TRUE;
     anbool measured;
     fitsbin_payload_io_ticket_state_t state;
@@ -2591,13 +2673,25 @@ static int fitsbin_payload_io_ticket_wait_internal(
     }
     measured = clock_gettime(CLOCK_MONOTONIC, &wait_start) == 0;
     pthread_mutex_lock(&fitsbin_payload_io_mutex);
+    if (ticket->wait_registered) {
+        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+        errno = EBUSY;
+        return -1;
+    }
     if (cancel) {
         __atomic_store_n(
             &ticket->cancel_requested,
             TRUE,
             __ATOMIC_RELEASE);
         fitsbin_payload_io_cancel_queued_locked(ticket);
-        pthread_cond_broadcast(&fitsbin_payload_io_cv);
+    }
+    if (ticket->state == FITSBIN_PAYLOAD_IO_SUBMITTED) {
+        if (fitsbin_payload_io_register_waiter_locked(ticket)) {
+            pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+            errno = EINVAL;
+            return -1;
+        }
+        waiter_registered = TRUE;
     }
     if (fitsbin_payload_io_thread_wait_helper &&
         !fitsbin_payload_io_thread_wait_active &&
@@ -2607,6 +2701,7 @@ static int fitsbin_payload_io_ticket_wait_internal(
             1U,
             __ATOMIC_RELEASE);
         helper_registered = TRUE;
+        ticket->helper_waiter = TRUE;
     }
     while (ticket->state == FITSBIN_PAYLOAD_IO_SUBMITTED) {
         if (fitsbin_payload_io_thread_stop_check &&
@@ -2617,7 +2712,6 @@ static int fitsbin_payload_io_ticket_wait_internal(
                 TRUE,
                 __ATOMIC_RELEASE);
             fitsbin_payload_io_cancel_queued_locked(ticket);
-            pthread_cond_broadcast(&fitsbin_payload_io_cv);
         }
         if (ticket->state != FITSBIN_PAYLOAD_IO_SUBMITTED) {
             continue;
@@ -2664,8 +2758,15 @@ static int fitsbin_payload_io_ticket_wait_internal(
             continue;
         }
         pthread_cond_wait(
-            &fitsbin_payload_io_cv,
+            &ticket->completion_cv,
             &fitsbin_payload_io_mutex);
+    }
+    if (waiter_registered) {
+        int unregister_status =
+            fitsbin_payload_io_unregister_waiter_locked(ticket);
+
+        (void)unregister_status;
+        assert(!unregister_status);
     }
     if (helper_registered) {
         size_t previous = __atomic_fetch_sub(

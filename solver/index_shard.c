@@ -145,20 +145,6 @@ typedef struct index_shard_result {
  * Do not store per-worker heavy data here.  Per-worker context belongs in
  * index_shard_worker_context_t.
  */
-typedef struct index_shard_affinity_entry {
-  char *identity;
-  size_t canonical_order;
-  int owner_worker;
-} index_shard_affinity_entry_t;
-
-typedef struct index_shard_affinity_domain {
-  size_t scale_index;
-  index_shard_affinity_entry_t *entries;
-  size_t count;
-  size_t capacity;
-  struct index_shard_affinity_domain *next;
-} index_shard_affinity_domain_t;
-
 typedef struct index_shard_pool index_shard_pool_t;
 typedef struct index_shard_helper_group index_shard_helper_group_t;
 
@@ -171,14 +157,12 @@ typedef struct index_shard_thread_state {
   size_t canonical_scan_cursor;
   size_t outer_unclaimed;
   size_t outer_running;
+  size_t producer_width;
   size_t queue_waiters;
   size_t helper_groups_active;
   size_t helper_preparations_active;
   size_t helper_foreign_reservations;
   unsigned char *outer_states;
-  int *preferred_owner;
-  size_t *preferred_next;
-  size_t *preferred_head;
 
   index_shard_result_t *results;
   unsigned char *completed; // result slot is visible to reducer
@@ -230,9 +214,7 @@ typedef struct index_shard_thread_state {
 
   unsigned long long reducer_work_calls;
   double reducer_work_wall_seconds;
-  unsigned long long affinity_claims;
-  unsigned long long fallback_claims;
-  unsigned long long affinity_reassignments;
+  unsigned long long outer_claims;
   unsigned long long helper_groups_published;
   unsigned long long helper_groups_completed;
   unsigned long long helper_tasks_owner;
@@ -384,6 +366,7 @@ struct index_shard_pool {
   solver_t *owner_sp;
 
   int worker_count;
+  size_t producer_width;
   pthread_t *threads;
   index_shard_worker_context_t *contexts;
 
@@ -404,7 +387,6 @@ struct index_shard_pool {
   unsigned long long inverse_cache_access_tick;
   size_t inverse_cache_peak_bytes;
   size_t inverse_combined_peak_bytes;
-  index_shard_affinity_domain_t *affinity_domains;
 
   int shutdown;
   int stopping;
@@ -418,223 +400,6 @@ struct index_shard_pool {
 } ;
 
 static index_shard_pool_t *index_shard_global_pool = NULL;
-
-static index_shard_affinity_domain_t*
-index_shard_affinity_get_domain(
-    index_shard_pool_t* pool,
-    size_t scale_index,
-    anbool create) {
-  index_shard_affinity_domain_t* domain;
-
-  if (!pool) {
-    return NULL;
-  }
-  for (domain = pool->affinity_domains;
-       domain;
-       domain = domain->next) {
-    if (domain->scale_index == scale_index) {
-      return domain;
-    }
-  }
-  if (!create) {
-    return NULL;
-  }
-  domain = calloc(1, sizeof(*domain));
-  if (!domain) {
-    return NULL;
-  }
-  domain->scale_index = scale_index;
-  domain->next = pool->affinity_domains;
-  pool->affinity_domains = domain;
-  return domain;
-}
-
-static size_t index_shard_affinity_get_entry(
-    index_shard_affinity_domain_t* domain,
-    const char* identity,
-    size_t canonical_order) {
-  index_shard_affinity_entry_t* grown;
-  char* identity_copy;
-  size_t capacity;
-  size_t i;
-
-  if (!domain || !identity || !identity[0]) {
-    return SIZE_MAX;
-  }
-  for (i = 0U; i < domain->count; i++) {
-    if (domain->entries[i].canonical_order ==
-            canonical_order &&
-        !strcmp(domain->entries[i].identity, identity)) {
-      return i;
-    }
-  }
-  identity_copy = strdup(identity);
-  if (!identity_copy) {
-    return SIZE_MAX;
-  }
-  if (domain->count == domain->capacity) {
-    capacity = domain->capacity ? 2U * domain->capacity : 32U;
-    if (capacity < domain->capacity ||
-        capacity > SIZE_MAX / sizeof(*grown)) {
-      free(identity_copy);
-      return SIZE_MAX;
-    }
-    grown = realloc(
-        domain->entries,
-        capacity * sizeof(*grown));
-    if (!grown) {
-      free(identity_copy);
-      return SIZE_MAX;
-    }
-    domain->entries = grown;
-    domain->capacity = capacity;
-  }
-  i = domain->count++;
-  domain->entries[i].identity = identity_copy;
-  domain->entries[i].canonical_order = canonical_order;
-  domain->entries[i].owner_worker = -1;
-  return i;
-}
-
-static anbool index_shard_affinity_has_retained_epochs(
-    const index_shard_pool_t* pool) {
-  (void)pool;
-  return FALSE;
-}
-
-static index_shard_affinity_domain_t*
-index_shard_affinity_prepare_pass(
-    index_shard_pool_t* pool,
-    onefield_t* bp,
-    const index_shard_hooks_t* hooks,
-    size_t nindexes,
-    size_t* affinity_slots,
-    int* preferred_owner,
-    size_t* preferred_next,
-    size_t* preferred_head,
-    size_t* preferred_tail) {
-  index_shard_affinity_domain_t* domain = NULL;
-  size_t i;
-
-  if (!pool || !affinity_slots || !preferred_owner ||
-      !preferred_next || !preferred_head || !preferred_tail) {
-    return NULL;
-  }
-  for (i = 0U; i < nindexes; i++) {
-    affinity_slots[i] = SIZE_MAX;
-    preferred_owner[i] = -1;
-    preferred_next[i] = SIZE_MAX;
-  }
-  for (i = 0U; i < (size_t)pool->worker_count; i++) {
-    preferred_head[i] = SIZE_MAX;
-    preferred_tail[i] = SIZE_MAX;
-  }
-
-  /*
-   * Index epochs are task-local: done_with_index() unmaps every source-backed
-   * index after the current band. Worker identity therefore retains no private
-   * mapping, page table, or payload cache for the next band. Prefer canonical
-   * ready work until a future scheduler owns a real retained index epoch.
-   */
-  if (!index_shard_affinity_has_retained_epochs(pool)) {
-    return NULL;
-  }
-
-  if (!bp || !hooks ||
-      !hooks->get_index_identity) {
-    return NULL;
-  }
-  domain = index_shard_affinity_get_domain(
-      pool,
-      bp->engine_scale_index,
-      TRUE);
-  if (!domain) {
-    return NULL;
-  }
-  for (i = 0U; i < nindexes; i++) {
-    const char* identity =
-        hooks->get_index_identity(bp, i);
-    size_t slot = index_shard_affinity_get_entry(
-        domain,
-        identity,
-        i);
-    int owner;
-
-    if (slot == SIZE_MAX) {
-      continue;
-    }
-    affinity_slots[i] = slot;
-    owner = domain->entries[slot].owner_worker;
-    if (owner < 0 || owner >= pool->worker_count) {
-      continue;
-    }
-    preferred_owner[i] = owner;
-    if (preferred_tail[owner] == SIZE_MAX) {
-      preferred_head[owner] = i;
-    } else {
-      preferred_next[preferred_tail[owner]] = i;
-    }
-    preferred_tail[owner] = i;
-  }
-  return domain;
-}
-
-static void index_shard_affinity_commit_pass(
-    index_shard_thread_state_t* shared,
-    index_shard_affinity_domain_t* domain,
-    const size_t* affinity_slots) {
-  size_t i;
-
-  if (!shared || !domain || !affinity_slots) {
-    return;
-  }
-  for (i = 0U; i < shared->nindexes; i++) {
-    const index_shard_result_t* result =
-        &shared->results[i];
-    size_t slot = affinity_slots[i];
-    int previous;
-
-    if (!result->task_started ||
-        !shared->completed[i] ||
-        !shared->outer_states ||
-        shared->outer_states[i] !=
-            INDEX_SHARD_OUTER_FINISHED ||
-        result->failed || result->rc ||
-        result->cancelled ||
-        result->worker_id < 0 ||
-        result->worker_id >= shared->worker_count ||
-        slot == SIZE_MAX || slot >= domain->count) {
-      continue;
-    }
-    previous = domain->entries[slot].owner_worker;
-    if (previous >= 0 && previous != result->worker_id) {
-      shared->affinity_reassignments++;
-    }
-    domain->entries[slot].owner_worker = result->worker_id;
-  }
-}
-
-static void index_shard_affinity_destroy(
-    index_shard_pool_t* pool) {
-  index_shard_affinity_domain_t* domain;
-
-  if (!pool) {
-    return;
-  }
-  domain = pool->affinity_domains;
-  while (domain) {
-    index_shard_affinity_domain_t* next = domain->next;
-    size_t i;
-
-    for (i = 0U; i < domain->count; i++) {
-      free(domain->entries[i].identity);
-    }
-    free(domain->entries);
-    free(domain);
-    domain = next;
-  }
-  pool->affinity_domains = NULL;
-}
 
 static pthread_mutex_t index_shard_global_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -2594,7 +2359,9 @@ static anbool index_shard_helper_outer_claimable_locked(
   size_t limit;
   size_t candidate;
 
-  if (!shared || !shared->outer_states) {
+  if (!shared || !shared->outer_states ||
+      !shared->producer_width ||
+      shared->outer_running >= shared->producer_width) {
     return FALSE;
   }
   limit = shared->have_solved_order ?
@@ -3553,29 +3320,20 @@ static int index_shard_claim_outer_locked(
     index_shard_worker_context_t *worker,
     index_shard_thread_state_t *shared,
     size_t candidate,
-    anbool affinity_claim,
     size_t *index_order,
     fitsbin_mmap_advice_t *mmap_advice) {
-  int preferred;
-
   if (candidate >= shared->nindexes ||
       shared->outer_states[candidate] !=
           INDEX_SHARD_OUTER_UNCLAIMED ||
       !shared->outer_unclaimed ||
-      shared->outer_running >=
-          (size_t)shared->worker_count) {
+      shared->outer_running >= shared->producer_width) {
     return -1;
   }
-  preferred = shared->preferred_owner[candidate];
   shared->outer_states[candidate] =
       INDEX_SHARD_OUTER_RUNNING;
   shared->outer_unclaimed--;
   shared->outer_running++;
-  if (affinity_claim) {
-    shared->affinity_claims++;
-  } else {
-    shared->fallback_claims++;
-  }
+  shared->outer_claims++;
   *index_order = candidate;
   *mmap_advice = shared->mmap_advice;
   if (candidate == shared->canonical_scan_cursor) {
@@ -3583,15 +3341,14 @@ static int index_shard_claim_outer_locked(
   }
 
   if (index_shard_trace_enabled()) {
-    logmsg("[index-shard] claim index_order=%zu lane=%s "
-           "worker=%i preferred=%i owners=%zu "
+    logmsg("[index-shard] claim index_order=%zu lane=producer "
+           "worker=%i owners=%zu producer_width=%zu "
            "outer_unclaimed=%zu payload=%s "
            "wall_since_pass=%.6f\n",
            candidate,
-           affinity_claim ? "affinity" : "fallback",
            worker->worker_id,
-           preferred,
            shared->outer_running,
+           shared->producer_width,
            shared->outer_unclaimed,
            fitsbin_mmap_advice_name(*mmap_advice),
            monotonic_seconds() - shared->pass_wall_start);
@@ -3600,17 +3357,12 @@ static int index_shard_claim_outer_locked(
 }
 
 /*
- * Select one whole-index owner task from the current band.
+ * Select work from the current band without transferring index ownership.
  *
- * A worker claims the canonical-lowest unstarted index in the current band.
- * Cross-band worker affinity is disabled while index epochs remain task-local;
- * process-wide page cache and retained immutable state do not depend on worker
- * identity. The explicit state map and reducer remain canonical.
- *
- * The old cross-owner AB executor is deliberately absent here. A worker with
- * no claimable outer index may claim a fixed, index-free package published by
- * a current outer owner. Neither path transfers index ownership or advances
- * the engine band independently.
+ * At most producer_width workers own cold index tasks. Remaining compute
+ * workers execute coarse index-free packages published by those owners. New
+ * canonical outer work has priority whenever a producer slot is free. The
+ * reducer remains the only authority for ordered result publication.
  */
 static index_shard_work_selection_t
 index_shard_select_work(
@@ -3619,15 +3371,12 @@ index_shard_select_work(
     size_t *index_order,
     fitsbin_mmap_advice_t *mmap_advice,
     index_shard_helper_claim_t *helper_claim) {
-  int worker_id;
-
   if (!worker || !shared || !index_order || !mmap_advice || !helper_claim ||
-      !shared->outer_states || !shared->preferred_owner ||
-      !shared->preferred_next || !shared->preferred_head) {
+      !shared->outer_states || !shared->producer_width) {
     return INDEX_SHARD_WORK_ERROR;
   }
-  worker_id = worker->worker_id;
-  if (worker_id < 0 || worker_id >= shared->worker_count) {
+  if (worker->worker_id < 0 ||
+      worker->worker_id >= shared->worker_count) {
     return INDEX_SHARD_WORK_ERROR;
   }
 
@@ -3646,41 +3395,14 @@ index_shard_select_work(
     }
 
     claim_limit = index_shard_claim_limit_locked(shared);
-    while (shared->preferred_head[worker_id] != SIZE_MAX) {
-      candidate = shared->preferred_head[worker_id];
-      if (candidate >= shared->nindexes) {
-        pthread_mutex_unlock(&shared->queue_mutex);
-        return INDEX_SHARD_WORK_ERROR;
-      }
-      shared->preferred_head[worker_id] =
-          shared->preferred_next[candidate];
-      if (candidate >= claim_limit ||
-          shared->outer_states[candidate] !=
-              INDEX_SHARD_OUTER_UNCLAIMED) {
-        continue;
-      }
-      if (index_shard_claim_outer_locked(
-              worker,
-              shared,
-              candidate,
-              TRUE,
-              index_order,
-              mmap_advice)) {
-        pthread_mutex_unlock(&shared->queue_mutex);
-        return INDEX_SHARD_WORK_ERROR;
-      }
-      pthread_mutex_unlock(&shared->queue_mutex);
-      return INDEX_SHARD_WORK_OUTER;
-    }
-
     index_shard_advance_canonical_cursor_locked(shared);
     candidate = shared->canonical_scan_cursor;
-    if (candidate < claim_limit) {
+    if (candidate < claim_limit &&
+        shared->outer_running < shared->producer_width) {
       if (index_shard_claim_outer_locked(
               worker,
               shared,
               candidate,
-              FALSE,
               index_order,
               mmap_advice)) {
         pthread_mutex_unlock(&shared->queue_mutex);
@@ -4810,6 +4532,7 @@ static void index_shard_pool_release_pass(index_shard_pool_t *pool) {
 int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   index_shard_pool_t *pool;
   int i;
+  int payload_lanes = 0;
   int tls_status;
   int worker_count;
 
@@ -4872,6 +4595,7 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   pool->owner_bp = bp;
   pool->owner_sp = sp;
   pool->worker_count = worker_count;
+  pool->producer_width = 1U;
   pool->inverse_cache_budget =
       index_shard_inverse_cache_budget();
 
@@ -4991,15 +4715,24 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
 
   index_shard_global_pool = pool;
   fitsbin_payload_io_configure_workers(worker_count);
-  if (worker_count > 1 &&
-      fitsbin_payload_io_service_start(MIN(worker_count, 2))) {
-    logverb("[index-shard] payload loader unavailable; "
-            "using synchronous fallback\n");
+  if (worker_count > 1) {
+    if (fitsbin_payload_io_service_start(MIN(worker_count, 2))) {
+      logverb("[index-shard] payload loader unavailable; "
+              "using synchronous fallback\n");
+    }
+    payload_lanes = fitsbin_payload_io_service_width();
+    pool->producer_width = MIN(
+        (size_t)worker_count - 1U,
+        (size_t)MAX(payload_lanes, 1));
   }
 
   logverb("[index-shard] workers=%i mode=pthread "
+          "compute_width=%i producer_width=%zu payload_lanes=%i "
           "inverse_cache_budget=%zu\n",
           worker_count,
+          worker_count,
+          pool->producer_width,
+          payload_lanes,
           pool->inverse_cache_budget);
 
   pthread_mutex_unlock(&index_shard_global_pool_mutex);
@@ -5084,7 +4817,6 @@ void index_shard_pool_stop(onefield_t *bp) {
           pool->inverse_combined_peak_bytes,
           pool->inverse_cache_budget);
   index_shard_inverse_cache_destroy(pool);
-  index_shard_affinity_destroy(pool);
   pthread_mutex_destroy(&pool->inverse_cache_mutex);
   pthread_cond_destroy(&pool->work_cv);
   pthread_mutex_destroy(&pool->control_mutex);
@@ -5133,16 +4865,13 @@ static int index_shard_pool_submit(
     const index_shard_hooks_t *hooks,
     index_shard_result_t *results,
     unsigned char *completed,
-    unsigned char *outer_states,
-    int *preferred_owner,
-    size_t *preferred_next,
-    size_t *preferred_head) {
+    unsigned char *outer_states) {
   index_shard_thread_state_t *shared = &pool->shared;
+  int loader_lanes = fitsbin_payload_io_service_width();
   int worker_count = pool->worker_count;
   int i;
 
-  if (!outer_states || !preferred_owner ||
-      !preferred_next || !preferred_head) {
+  if (!outer_states || !pool->producer_width) {
     return -1;
   }
 
@@ -5204,17 +4933,13 @@ static int index_shard_pool_submit(
   shared->canonical_scan_cursor = 0U;
   shared->outer_unclaimed = nindexes;
   shared->outer_running = 0U;
+  shared->producer_width = MIN(pool->producer_width, nindexes);
   shared->queue_waiters = 0U;
   shared->helper_groups_active = 0U;
   shared->helper_preparations_active = 0U;
   shared->helper_foreign_reservations = 0U;
   shared->outer_states = outer_states;
-  shared->preferred_owner = preferred_owner;
-  shared->preferred_next = preferred_next;
-  shared->preferred_head = preferred_head;
-  shared->affinity_claims = 0U;
-  shared->fallback_claims = 0U;
-  shared->affinity_reassignments = 0U;
+  shared->outer_claims = 0U;
   shared->helper_groups_published = 0U;
   shared->helper_groups_completed = 0U;
   shared->helper_tasks_owner = 0U;
@@ -5276,17 +5001,17 @@ static int index_shard_pool_submit(
   pthread_cond_broadcast(&pool->work_cv);
   pthread_mutex_unlock(&pool->control_mutex);
 
-  logverb("[index-shard] pthread-pool submit workers=%i pool_workers=%i "
-          "candidates=%zu engine_pass=%zu depth_index=%zu scale_index=%zu "
-          "startobj=%i endobj=%i scheduler=canonical-ready chunk=1 "
-          "inner_scheduler=owner-helper-groups "
+  logverb("[index-shard] pthread-pool submit compute_width=%i "
+          "producer_width=%zu candidates=%zu engine_pass=%zu "
+          "depth_index=%zu scale_index=%zu startobj=%i endobj=%i "
+          "scheduler=canonical-ready inner_scheduler=prepared-groups "
           "mmap_pass=%u mmap_advice=%s mmap_scope=all-chunks "
           "mmap_policy=parallel-random-serial-normal "
           "page_delivery=bounded-pread-broker loader_lanes=%i "
           "payload_io=batched-pread-mmap-fallback credits=%i "
-          "outer_admission=full-owner-canonical\n",
+          "outer_admission=bounded-producer-canonical\n",
           worker_count,
-          pool->worker_count,
+          shared->producer_width,
           nindexes,
           bp->engine_pass_ordinal,
           bp->engine_depth_index,
@@ -5295,7 +5020,7 @@ static int index_shard_pool_submit(
           base_sp->endobj,
           shared->mmap_pass_number,
           fitsbin_mmap_advice_name(shared->mmap_advice),
-          MIN(worker_count, 2),
+          loader_lanes,
           worker_count);
 
   return 0;
@@ -5319,12 +5044,6 @@ index_shard_solve_impl(onefield_t *bp,
                        size_t nindexes,
                        const index_shard_hooks_t *hooks) {
   index_shard_pool_t *pool;
-  index_shard_affinity_domain_t *affinity_domain = NULL;
-  size_t *affinity_slots = NULL;
-  int *preferred_owner = NULL;
-  size_t *preferred_next = NULL;
-  size_t *preferred_head = NULL;
-  size_t *preferred_tail = NULL;
   unsigned char *outer_states = NULL;
   index_shard_result_t *results = NULL;
   unsigned char *completed = NULL;
@@ -5382,26 +5101,10 @@ index_shard_solve_impl(onefield_t *bp,
   results = calloc(nindexes, sizeof(index_shard_result_t));
   completed = calloc(nindexes, sizeof(unsigned char));
   outer_states = calloc(nindexes, sizeof(*outer_states));
-  affinity_slots = calloc(nindexes, sizeof(*affinity_slots));
-  preferred_owner = calloc(nindexes, sizeof(*preferred_owner));
-  preferred_next = calloc(nindexes, sizeof(*preferred_next));
-  preferred_head = calloc(
-      (size_t)pool->worker_count,
-      sizeof(*preferred_head));
-  preferred_tail = calloc(
-      (size_t)pool->worker_count,
-      sizeof(*preferred_tail));
 
-  if (!results || !completed || !outer_states ||
-      !affinity_slots || !preferred_owner || !preferred_next ||
-      !preferred_head || !preferred_tail) {
+  if (!results || !completed || !outer_states) {
     SYSERROR("Failed to allocate index-shard pass state");
 
-    free(preferred_tail);
-    free(preferred_head);
-    free(preferred_next);
-    free(preferred_owner);
-    free(affinity_slots);
     free(outer_states);
     free(results);
     free(completed);
@@ -5409,17 +5112,6 @@ index_shard_solve_impl(onefield_t *bp,
     index_shard_pool_release_pass(pool);
     return INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
   }
-
-  affinity_domain = index_shard_affinity_prepare_pass(
-      pool,
-      bp,
-      hooks,
-      nindexes,
-      affinity_slots,
-      preferred_owner,
-      preferred_next,
-      preferred_head,
-      preferred_tail);
 
   // Submit releases the hard current-band barrier to persistent workers.
   rc = index_shard_pool_submit(
@@ -5430,17 +5122,9 @@ index_shard_solve_impl(onefield_t *bp,
       hooks,
       results,
       completed,
-      outer_states,
-      preferred_owner,
-      preferred_next,
-      preferred_head);
+      outer_states);
 
   if (rc) {
-    free(preferred_tail);
-    free(preferred_head);
-    free(preferred_next);
-    free(preferred_owner);
-    free(affinity_slots);
     free(outer_states);
     free(results);
     free(completed);
@@ -5543,23 +5227,13 @@ index_shard_solve_impl(onefield_t *bp,
   }
   pthread_mutex_unlock(&pool->shared.queue_mutex);
 
-  if (helper_quiescence_valid) {
-    index_shard_affinity_commit_pass(
-        &pool->shared,
-        affinity_domain,
-        affinity_slots);
-  } else {
-    logerr("[index-shard] affinity ownership not committed "
-           "after helper quiescence failure\n");
-  }
   logverb("[index-shard] ownership-pass generation=%lu "
-          "scale_index=%zu familiar=%llu fallback=%llu "
-          "reassigned=%llu unclaimed=%zu committed=%i\n",
+          "scale_index=%zu canonical_claims=%llu "
+          "producer_width=%zu unclaimed=%zu quiescent=%i\n",
           pool->generation,
           bp->engine_scale_index,
-          pool->shared.affinity_claims,
-          pool->shared.fallback_claims,
-          pool->shared.affinity_reassignments,
+          pool->shared.outer_claims,
+          pool->shared.producer_width,
           pool->shared.outer_unclaimed,
           helper_quiescence_valid ? 1 : 0);
 
@@ -5747,12 +5421,13 @@ index_shard_solve_impl(onefield_t *bp,
           pool->shared.helper_owner_wait_seconds);
 
   logverb("[index-shard] context-pass generation=%lu candidates=%zu "
-          "outer_workers=%i prepare_work_wall_sum=%.6f "
-          "prepare_max=%.6f cleanup_work_wall_sum=%.6f "
-          "cleanup_max=%.6f\n",
+          "compute_width=%i producer_width=%zu "
+          "prepare_work_wall_sum=%.6f prepare_max=%.6f "
+          "cleanup_work_wall_sum=%.6f cleanup_max=%.6f\n",
           pool->generation,
           nindexes,
           pool->shared.worker_count,
+          pool->shared.producer_width,
           context_prepare_wall_seconds,
           context_prepare_max_seconds,
           context_cleanup_wall_seconds,
@@ -5985,15 +5660,8 @@ index_shard_solve_impl(onefield_t *bp,
 
   pthread_mutex_lock(&pool->shared.queue_mutex);
   pool->shared.outer_states = NULL;
-  pool->shared.preferred_owner = NULL;
-  pool->shared.preferred_next = NULL;
-  pool->shared.preferred_head = NULL;
+  pool->shared.producer_width = 0U;
   pthread_mutex_unlock(&pool->shared.queue_mutex);
-  free(preferred_tail);
-  free(preferred_head);
-  free(preferred_next);
-  free(preferred_owner);
-  free(affinity_slots);
   free(outer_states);
   index_shard_pool_release_pass(pool);
   return status;

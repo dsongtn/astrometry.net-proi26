@@ -102,6 +102,52 @@ extern ssize_t __real_pread64(
     size_t size,
     off_t offset);
 
+extern int __real_madvise(
+    void* address,
+    size_t length,
+    int advice);
+
+int __wrap_madvise(
+    void* address,
+    size_t length,
+    int advice) {
+#if defined(MADV_POPULATE_READ)
+    int result;
+
+    if (advice != MADV_POPULATE_READ) {
+        return __real_madvise(address, length, advice);
+    }
+
+    pthread_mutex_lock(&payload_wrapper.mutex);
+    if (payload_wrapper.mode != PAYLOAD_WRAPPER_BLOCK) {
+        pthread_mutex_unlock(&payload_wrapper.mutex);
+        return __real_madvise(address, length, advice);
+    }
+    payload_wrapper.calls++;
+    payload_wrapper.active++;
+    if (payload_wrapper.active > payload_wrapper.max_active) {
+        payload_wrapper.max_active = payload_wrapper.active;
+    }
+    pthread_cond_broadcast(&payload_wrapper.condition);
+    while (!payload_wrapper.release) {
+        pthread_cond_wait(
+            &payload_wrapper.condition,
+            &payload_wrapper.mutex);
+    }
+    pthread_mutex_unlock(&payload_wrapper.mutex);
+
+    result = __real_madvise(address, length, advice);
+
+    pthread_mutex_lock(&payload_wrapper.mutex);
+    payload_wrapper.active--;
+    pthread_cond_broadcast(&payload_wrapper.condition);
+    pthread_mutex_unlock(&payload_wrapper.mutex);
+    return result;
+#else
+    return __real_madvise(address, length, advice);
+#endif
+}
+
 ssize_t __wrap_pread64(
     int fd,
     void* destination,
@@ -740,6 +786,10 @@ void test_fitsbin_payload_async_loader_overlap(CuTest* ct) {
     int second_wait = -1;
 
     CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
+    CuAssertIntEquals(
+        ct,
+        0,
+        fitsbin_configure_index_mmap(fixture.fitsbin));
     range.data = fixture.chunk->data;
     range.size = sizeof(fixture.bytes);
     fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);

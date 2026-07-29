@@ -1795,16 +1795,6 @@ static index_t *onefield_index_shard_get_index(onefield_t *bp,
   return pl_get(bp->indexes, index_order);
 }
 
-static const char *onefield_index_shard_get_index_identity(
-    onefield_t *bp,
-    size_t index_order) {
-  if (!bp ||
-      index_order >= (size_t)sl_size(bp->indexnames)) {
-    return NULL;
-  }
-  return sl_get(bp->indexnames, index_order);
-}
-
 // ANCHOR INDEX-SHARD: bridge-done-with-index
 static int onefield_index_shard_done_with_index(onefield_t *bp,
                                                 size_t index_order,
@@ -2395,7 +2385,6 @@ static void onefield_index_shard_free_solutions(bl *solutions) {
 // ANCHOR INDEX-SHARD: bridge-hooks
 static const index_shard_hooks_t onefield_index_shard_hooks = {
     onefield_index_shard_get_index,
-    onefield_index_shard_get_index_identity,
     onefield_index_shard_done_with_index,
     onefield_index_shard_report_committed_solution,
 
@@ -2626,7 +2615,7 @@ void onefield_run(onefield_t* bp) {
         goto cleanup;
       }
 
-      profile_mode = "pthread-affinity-owner";
+      profile_mode = "pthread-data-ready";
       shard_status =
           index_shard_solve(
               bp,

@@ -672,24 +672,8 @@ static void canonical_index_order_free_solutions(
     bl_free(solutions);
 }
 
-static const char* canonical_index_order_get_identity(
-    onefield_t* bp,
-    size_t index_order) {
-    static const char* identities[] = {
-        "canonical-index-0",
-        "canonical-index-1"
-    };
-
-    (void)bp;
-    if (index_order >= sizeof(identities) / sizeof(identities[0])) {
-        return NULL;
-    }
-    return identities[index_order];
-}
-
 static const index_shard_hooks_t canonical_index_order_hooks = {
     canonical_index_order_get_index,
-    canonical_index_order_get_identity,
     canonical_index_order_done_with_index,
     canonical_index_order_report_solution,
     canonical_index_order_prepare_local,
@@ -732,7 +716,8 @@ static int run_canonical_index_order_test(void) {
     log_init(LOG_ALL);
     onefield_init(&bp);
     solver_set_default_values(&bp.solver);
-    bp.index_shard_workers = 2;
+    /* Two producer lanes plus one index-free helper lane. */
+    bp.index_shard_workers = 3;
 
     if (index_shard_pool_start(&bp, &bp.solver)) {
         fprintf(stderr, "failed to start canonical-order pool\n");
