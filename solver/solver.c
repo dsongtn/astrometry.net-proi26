@@ -4583,17 +4583,19 @@ typedef struct solver_payload_page_plan {
     size_t range_capacity;
     solver_t* solver;
     anbool failed;
-    anbool async_delivery;
+    anbool delivery_unavailable;
     solver_payload_page_range_t
         inline_ranges[SOLVER_PAYLOAD_PAGE_PLAN_INLINE_RANGES];
 } solver_payload_page_plan_t;
 
 static void solver_payload_page_plan_init(
-    solver_payload_page_plan_t* plan) {
+    solver_payload_page_plan_t* plan,
+    solver_t* solver) {
     if (!plan) {
         return;
     }
     memset(plan, 0, sizeof(*plan));
+    plan->solver = solver;
     plan->ranges = plan->inline_ranges;
     plan->range_capacity =
         SOLVER_PAYLOAD_PAGE_PLAN_INLINE_RANGES;
@@ -4610,21 +4612,35 @@ static void solver_payload_page_plan_destroy(
     memset(plan, 0, sizeof(*plan));
 }
 
-static void solver_payload_page_plan_init_async(
-    solver_payload_page_plan_t* plan,
-    solver_t* solver) {
-    solver_payload_page_plan_init(plan);
-    if (plan) {
-        plan->solver = solver;
-        plan->async_delivery = TRUE;
-    }
-}
-
 static void solver_payload_page_plan_fail(
     solver_payload_page_plan_t* plan) {
     if (plan) {
         plan->failed = TRUE;
     }
+}
+
+/*
+ * A nonresident page plan has exactly one optional completion provider. The
+ * solver never starts that provider implicitly: when it is absent, callers
+ * abandon planning before walking payload topology and use native mmap demand.
+ */
+static anbool solver_payload_completion_service_available(void) {
+    return fitsbin_payload_io_service_width() > 0;
+}
+
+static anbool solver_payload_candidate_data_fully_resident(
+    const solver_t* solver) {
+    if (!solver || !solver->index || !solver->index->quads ||
+        !solver->index->quads->fb || !solver->index->starkd ||
+        !solver->index->starkd->tree ||
+        !solver->index->starkd->tree->io ||
+        !solver->index->starkd->tree->io_is_fitsbin) {
+        return FALSE;
+    }
+    return fitsbin_payload_is_fully_resident(
+               solver->index->quads->fb) &&
+        fitsbin_payload_is_fully_resident(
+               (const fitsbin_t*)solver->index->starkd->tree->io);
 }
 
 static int solver_payload_page_plan_enabled(
@@ -4633,8 +4649,7 @@ static int solver_payload_page_plan_enabled(
     solver_payload_page_plan_t* plan = userdata;
 
     if (!plan || !mapping || plan->failed ||
-        (!plan->async_delivery &&
-         fitsbin_payload_io_demand_busy())) {
+        plan->delivery_unavailable) {
         return FALSE;
     }
     if (plan->fitsbin && plan->fitsbin != mapping) {
@@ -4800,6 +4815,15 @@ static int solver_payload_page_plan_add_query(
             (const fitsbin_t*)tree->io)) {
         return 0;
     }
+    if (!solver_payload_completion_service_available()) {
+        if (plan->fitsbin && plan->fitsbin != tree->io) {
+            solver_payload_page_plan_fail(plan);
+            return -1;
+        }
+        plan->fitsbin = tree->io;
+        plan->delivery_unavailable = TRUE;
+        return 0;
+    }
     memset(&sink, 0, sizeof(sink));
     sink.userdata = plan;
     sink.enabled = solver_payload_page_plan_enabled;
@@ -4892,37 +4916,33 @@ static int solver_payload_page_plan_deliver_chunk(
     if (fitsbin_payload_is_fully_resident(plan->fitsbin)) {
         return 1;
     }
-    if (plan->async_delivery) {
-        status = fitsbin_prefetch_ranges_submit(
-            plan->fitsbin,
-            ranges,
-            range_count,
-            byte_budget,
-            &ticket);
-        if (status > 0 && ticket) {
-            int saved_errno;
-
-            errno = 0;
-            status = fitsbin_payload_io_ticket_wait(
-                plan->fitsbin, ticket);
-            saved_errno = errno;
-            fitsbin_payload_io_ticket_destroy(ticket);
-            if (status > 0) {
-                return 1;
-            }
-            if (!status && saved_errno == ECANCELED) {
-                errno = ECANCELED;
-                return 0;
-            }
-        }
-        return status;
+    if (!solver_payload_completion_service_available()) {
+        plan->delivery_unavailable = TRUE;
+        return 0;
     }
-    status = fitsbin_advise_mapped_ranges(
+    status = fitsbin_prefetch_ranges_submit(
         plan->fitsbin,
         ranges,
         range_count,
-        byte_budget);
-    return status > 0 ? 1 : status;
+        byte_budget,
+        &ticket);
+    if (status > 0 && ticket) {
+        int saved_errno;
+
+        errno = 0;
+        status = fitsbin_payload_io_ticket_wait(
+            plan->fitsbin, ticket);
+        saved_errno = errno;
+        fitsbin_payload_io_ticket_destroy(ticket);
+        if (status > 0) {
+            return 1;
+        }
+        if (!status && saved_errno == ECANCELED) {
+            errno = ECANCELED;
+            return 0;
+        }
+    }
+    return status;
 }
 
 typedef struct solver_payload_page_delivery {
@@ -4948,6 +4968,9 @@ static int solver_payload_page_plan_submit(
         return -1;
     }
     memset(delivery, 0, sizeof(*delivery));
+    if (plan->delivery_unavailable) {
+        return 0;
+    }
     if (!plan->range_count) {
         delivery->ready = TRUE;
         return 1;
@@ -4960,6 +4983,10 @@ static int solver_payload_page_plan_submit(
     if (fitsbin_payload_is_fully_resident(plan->fitsbin)) {
         delivery->ready = TRUE;
         return 1;
+    }
+    if (!solver_payload_completion_service_available()) {
+        plan->delivery_unavailable = TRUE;
+        return 0;
     }
     range_count = solver_payload_page_plan_chunk(
         plan, 0U, ranges, &byte_budget);
@@ -5036,6 +5063,9 @@ static int solver_payload_page_plan_deliver(
     }
     if (plan->failed) {
         return -1;
+    }
+    if (plan->delivery_unavailable) {
+        return 0;
     }
     if (!plan->range_count) {
         return 0;
@@ -5169,6 +5199,12 @@ static int solver_payload_page_plan_add_starkd_sweep(
     }
     if (fitsbin_payload_is_fully_resident(
             (const fitsbin_t*)tree->io)) {
+        return 0;
+    }
+    if (leaf_plan->delivery_unavailable ||
+        !solver_payload_completion_service_available()) {
+        sweep_plan->fitsbin = tree->io;
+        sweep_plan->delivery_unavailable = TRUE;
         return 0;
     }
 
@@ -5321,12 +5357,23 @@ static size_t solver_payload_prepare_candidate_rows(
 
     if (!result || !solver || !solver->index ||
         !solver->index->quads || !solver->index->starkd ||
+        !solver->index->quads->fb ||
+        !solver->index->starkd->tree ||
+        !solver->index->starkd->tree->io ||
+        !solver->index->starkd->tree->io_is_fitsbin ||
         first >= end || end > (size_t)result->nres ||
         dimquads <= 0 || dimquads > DQMAX) {
         return 0U;
     }
     quads = solver->index->quads;
     starkd = solver->index->starkd;
+    quad_ready = fitsbin_payload_is_fully_resident(quads->fb);
+    star_ready = fitsbin_payload_is_fully_resident(
+        (fitsbin_t*)starkd->tree->io);
+    if ((!quad_ready || !star_ready) &&
+        !solver_payload_completion_service_available()) {
+        return 0U;
+    }
     count = MIN(
         end - first,
         (size_t)SOLVER_PAYLOAD_CANDIDATE_BATCH);
@@ -5339,7 +5386,6 @@ static size_t solver_payload_prepare_candidate_rows(
         quadids[i] = (unsigned int)quadid;
     }
 
-    quad_ready = fitsbin_payload_is_fully_resident(quads->fb);
     if (!quad_ready) {
         status = quadfile_prefetch_stars_submit(
             quads, quadids, (int)count, &ticket);
@@ -5369,8 +5415,6 @@ static size_t solver_payload_prepare_candidate_rows(
         }
     }
 
-    star_ready = fitsbin_payload_is_fully_resident(
-        (fitsbin_t*)starkd->tree->io);
     if (!star_ready) {
         status = startree_prefetch_stars_submit(
             starkd, starids, (int)star_count, &ticket);
@@ -5460,6 +5504,13 @@ static int solver_payload_candidate_window_begin(
     window->end = end;
     window->count = end - first;
     window->dimquads = dimquads;
+    if ((!fitsbin_payload_is_fully_resident(window->quads->fb) ||
+         !fitsbin_payload_is_fully_resident(
+             (fitsbin_t*)window->starkd->tree->io)) &&
+        !solver_payload_completion_service_available()) {
+        window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
+        return 0;
+    }
     for (i = 0U; i < window->count; i++) {
         int quadid = result->inds[first + i];
 
@@ -5508,6 +5559,12 @@ static int solver_payload_candidate_window_submit_stars(
             return 0;
         }
         window->state = SOLVER_PAYLOAD_CANDIDATE_QUAD_READY;
+    }
+    if (!fitsbin_payload_is_fully_resident(
+            (fitsbin_t*)window->starkd->tree->io) &&
+        !solver_payload_completion_service_available()) {
+        window->state = SOLVER_PAYLOAD_CANDIDATE_FAILED;
+        return 0;
     }
     for (i = 0U; i < window->count; i++) {
         int star_index;
@@ -5745,9 +5802,9 @@ static int solver_ab_try_verification_wave(
     memset(tasks, 0, sizeof(tasks));
     memset(inputs, 0, sizeof(inputs));
     memset(&run_stats, 0, sizeof(run_stats));
-    solver_payload_page_plan_init_async(
+    solver_payload_page_plan_init(
         &page_plan, solver);
-    solver_payload_page_plan_init_async(
+    solver_payload_page_plan_init(
         &sweep_plan, solver);
 
     if (solver_ab_packet_reserve_candidates(
@@ -5901,6 +5958,9 @@ static int solver_ab_try_verification_wave(
             break;
         }
     }
+    if (page_plan.delivery_unavailable) {
+        goto cleanup;
+    }
     if (solver_payload_page_plan_coalesce(&page_plan)) {
         goto cleanup;
     }
@@ -5919,6 +5979,9 @@ static int solver_ab_try_verification_wave(
             &page_plan,
             solver->index->starkd,
             &sweep_plan)) {
+        goto cleanup;
+    }
+    if (sweep_plan.delivery_unavailable) {
         goto cleanup;
     }
     delivery_status =
@@ -6537,7 +6600,15 @@ static int solver_ab_io_batch_prepare(
         return 0;
     }
     tree = solver->index->codekd->tree;
-    solver_payload_page_plan_init_async(&plan, solver);
+    if (!tree->io || !tree->io_is_fitsbin ||
+        (!fitsbin_payload_is_fully_resident(
+             (const fitsbin_t*)tree->io) &&
+         !solver_payload_completion_service_available())) {
+        batch->plan_probed = TRUE;
+        batch->state = SOLVER_AB_IO_BATCH_READY;
+        return 0;
+    }
+    solver_payload_page_plan_init(&plan, solver);
     end = first + target_count;
 
     for (descriptor_index = first;
@@ -6674,6 +6745,26 @@ static int solver_ab_descriptor_reduce_range(
     return 0;
 }
 
+static int solver_ab_descriptor_finish_output(
+    solver_t* solver,
+    const solver_ab_descriptor_output_t* output) {
+    if (!solver || !output) {
+        return -1;
+    }
+    if (output->has_final_rel_field_noise2) {
+        solver->rel_field_noise2 =
+            output->final_rel_field_noise2;
+    }
+    if (solver_ab_checked_counter_delta(
+            solver,
+            output->trailing_numtries,
+            output->trailing_cxdx,
+            output->trailing_meanx)) {
+        return -1;
+    }
+    return 0;
+}
+
 static int solver_ab_descriptor_reduce_output(
     solver_t* solver,
     const solver_ab_descriptor_output_t* output,
@@ -6691,6 +6782,22 @@ static int solver_ab_descriptor_reduce_output(
     unsigned long long expected_sequence = 0ULL;
     anbool planning_enabled = TRUE;
     int status = 0;
+
+    if (!solver_payload_completion_service_available()) {
+        status = solver_ab_descriptor_reduce_range(
+            solver,
+            output,
+            0U,
+            output->descriptor_count,
+            dimquads,
+            query_result,
+            reduced);
+        if (status) {
+            return status;
+        }
+        return solver_ab_descriptor_finish_output(
+            solver, output);
+    }
 
     memset(batches, 0, sizeof(batches));
     if (next < output->descriptor_count) {
@@ -6792,18 +6899,8 @@ static int solver_ab_descriptor_reduce_output(
     if (status) {
         return status;
     }
-    if (output->has_final_rel_field_noise2) {
-        solver->rel_field_noise2 =
-            output->final_rel_field_noise2;
-    }
-    if (solver_ab_checked_counter_delta(
-            solver,
-            output->trailing_numtries,
-            output->trailing_cxdx,
-            output->trailing_meanx)) {
-        return -1;
-    }
-    return 0;
+    return solver_ab_descriptor_finish_output(
+        solver, output);
 }
 
 /*
@@ -10481,6 +10578,27 @@ static void resolve_matches(kdtree_qres_t* krez, const double *field_xy,
             solver->quit_now = TRUE;
             return;
         }
+    }
+
+    /*
+     * Do not enter the completion-window state machine when its only
+     * nonresident provider is absent. The native range is the authoritative
+     * fallback and preserves the original candidate order and access path.
+     */
+    if (!solver_payload_completion_service_available() &&
+        !solver_payload_candidate_data_fully_resident(solver)) {
+        resolve_matches_native_range(
+            krez,
+            field_xy,
+            fieldstars,
+            dimquads,
+            quads_tried,
+            solver,
+            current_parity,
+            0,
+            krez->nres,
+            (size_t)krez->nres);
+        return;
     }
 
     memset(windows, 0, sizeof(windows));

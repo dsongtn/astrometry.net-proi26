@@ -16,12 +16,12 @@
  *   context may still own the pool.
  *
  * INDEX_SHARD_SOLVE_TERMINAL_FAILURE:
- *   Execution failed after master-visible state may have been mutated.
- *   Serial fallback is forbidden.
+ *   A global-integrity failure occurred, or execution failed after
+ *   master-visible state may have been mutated. Serial fallback is forbidden.
  *
  * INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE:
- *   Execution failed before any worker result was transferred into
- *   master-visible state. Serial fallback is permitted.
+ *   One or more task-local executions failed before any worker result was
+ *   transferred into master-visible state. Serial fallback is permitted.
  *
  * INDEX_SHARD_SOLVE_HANDLED:
  *   The parallel pass completed normally, either solved or unsolved.
@@ -200,13 +200,6 @@ index_shard_helper_run(
     index_shard_helper_task_t *tasks,
     size_t task_count,
     index_shard_helper_run_stats_t *stats);
-
-/*
- * Publish a speculative worker-local solution. It narrows the claim ceiling
- * without cancelling earlier canonical indexes; only the reducer may commit
- * the winner and stop the pool.
- */
-void index_shard_worker_publish_solution_candidate(void);
 
 index_shard_solve_status_t
 index_shard_solve(onefield_t *bp,

@@ -2643,8 +2643,8 @@ void onefield_run(onefield_t* bp) {
         break;
 
       case INDEX_SHARD_SOLVE_TERMINAL_FAILURE:
-        logerr("[index-shard] pthread solve failed after master commit; "
-               "serial fallback suppressed\n");
+        logerr("[index-shard] pthread solve hit a global-integrity or "
+               "post-commit failure; serial fallback suppressed\n");
         bp->solver_failed = TRUE;
         goto cleanup;
 
@@ -3235,7 +3235,6 @@ static anbool record_match_callback(MatchObj* mo, void* userdata) {
                 }
             }
         }
-        index_shard_worker_publish_solution_candidate();
         return TRUE;
     }
     return FALSE;
@@ -3552,9 +3551,9 @@ static void solved_field(onefield_t* bp, int fieldnum) {
 
 /*
  * Publish external solved markers only after the complete solve pass has
- * quiesced and final solution output succeeded. In-memory solved state may be
- * committed earlier to stop workers, but a later in-flight hard failure must
- * not leave a marker that makes a retry skip the input.
+ * quiesced and final solution output succeeded. First-valid selection stops
+ * workers before the reducer commits in-memory solved state, and neither event
+ * may leave a marker that makes a failed output retry skip the input.
  */
 static int publish_solved_fields(onefield_t* bp) {
     int i;

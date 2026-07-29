@@ -53,6 +53,18 @@
 /*
  * SECTION INDEX-SHARD: types
  */
+/*
+ * Failure scope is determined by the originating operation, never by whether
+ * a winner happened to publish first. Task-local failures are isolated to one
+ * index execution and require an exact retry only when the pass finds no
+ * winner. Global-integrity failures invalidate the pass at any time.
+ */
+typedef enum index_shard_failure_class {
+  INDEX_SHARD_FAILURE_NONE = 0,
+  INDEX_SHARD_FAILURE_TASK_LOCAL,
+  INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY
+} index_shard_failure_class_t;
+
 // ANCHOR INDEX-SHARD: result-state
 /*
  * Result produced by exactly one shard task.
@@ -63,7 +75,7 @@
  * Important:
  *   - solutions is worker-local until merge
  *   - merged prevents double-free / double-merge
- *   - solved means this shard produced an accepted candidate or local solve flag
+ *   - solved means this shard contains an accepted verified MatchObj
  */
 typedef struct index_shard_result {
   bl *solutions; // worker-local MatchObj list for this index
@@ -71,8 +83,9 @@ typedef struct index_shard_result {
   /* Immutable after task publication; aggregated only after pass quiescence. */
   solver_profile_t solver_profile;
 
-  int failed; // hard task failure, not normal "did not solve"
+  int failed; // classified failure, not normal "did not solve"
   int rc;
+  index_shard_failure_class_t failure_class;
 
   anbool solved; // accepted solution detected for this shard
 
@@ -124,6 +137,7 @@ typedef struct index_shard_result {
   anbool cancelled;
 
   size_t index_order; // original candidate index order in onefield pass
+  size_t completion_sequence;
   int merged;         // reducer already consumed/transferred this result
 } index_shard_result_t;
 
@@ -137,9 +151,10 @@ typedef struct index_shard_result {
  *   - result arrays are owned by index_shard_solve()
  *
  * Locking:
- *   - queue_mutex protects claim state, owner count, and solved frontier
- *   - result_mutex protects completed slots + active worker count
- *   - state_mutex protects stop/fatal/committed-solve pass state
+ *   - queue_mutex protects claim state and owner count
+ *   - result_mutex protects completed slots, completion sequence, and active
+ *     worker count
+ *   - state_mutex protects stop/fatal/selected/committed-solve pass state
  *   - limit_mutex protects process-wide CPU-limit publication
  *
  * Do not store per-worker heavy data here.  Per-worker context belongs in
@@ -166,7 +181,8 @@ typedef struct index_shard_thread_state {
 
   index_shard_result_t *results;
   unsigned char *completed; // result slot is visible to reducer
-  size_t next_reduce;       // ordered prefix reducer cursor
+  size_t results_reduced;
+  size_t next_completion_sequence;
 
   pthread_mutex_t queue_mutex;
   pthread_cond_t queue_cv;
@@ -183,6 +199,7 @@ typedef struct index_shard_thread_state {
 
   int stop_requested;   // cooperative stop, no new claims
   int fatal_error;      // hard worker/module failure
+  int winner_selected;  // first immutable verified result won the pass
   int solved_published; // reducer committed a valid solved result
   int master_committed;
   double first_stop_wall_since_pass;
@@ -193,12 +210,13 @@ typedef struct index_shard_thread_state {
    */
   int worker_stop_requested;
 
+  /* First-valid selection identity, immutable after publication. */
+  size_t selected_index_order;
+  size_t selected_completion_sequence;
+
   /* Reducer-owned identity of the first and only master solution commit. */
   int have_committed_result;
   size_t committed_index_order;
-
-  int have_solved_order;
-  size_t solved_index_order;
 
   int limit_reported; // avoid repeated CPU-limit log spam
 
@@ -222,6 +240,9 @@ typedef struct index_shard_thread_state {
   unsigned long long helper_task_failures;
   unsigned long long helper_owner_wait_calls;
   double helper_owner_wait_seconds;
+  unsigned long long task_local_failures;
+  unsigned long long global_integrity_failures;
+  unsigned long long late_loser_failures;
 } index_shard_thread_state_t;
 
 typedef enum index_shard_outer_state {
@@ -1147,8 +1168,13 @@ static int index_shard_get_worker_count(const onefield_t *bp,
 typedef struct index_shard_pass_state_snapshot {
   int stop_requested;
   int fatal_error;
+  int winner_selected;
   int solved_published;
   int master_committed;
+  size_t selected_index_order;
+  size_t selected_completion_sequence;
+  unsigned long long task_local_failures;
+  unsigned long long global_integrity_failures;
   double first_stop_wall_since_pass;
 } index_shard_pass_state_snapshot_t;
 
@@ -1241,8 +1267,16 @@ static void index_shard_pass_state_snapshot(index_shard_thread_state_t *shared,
 
   snapshot->stop_requested = shared->stop_requested;
   snapshot->fatal_error = shared->fatal_error;
+  snapshot->winner_selected = shared->winner_selected;
   snapshot->solved_published = shared->solved_published;
   snapshot->master_committed = shared->master_committed;
+  snapshot->selected_index_order = shared->selected_index_order;
+  snapshot->selected_completion_sequence =
+      shared->selected_completion_sequence;
+  snapshot->task_local_failures =
+      shared->task_local_failures;
+  snapshot->global_integrity_failures =
+      shared->global_integrity_failures;
   snapshot->first_stop_wall_since_pass =
       shared->first_stop_wall_since_pass;
 
@@ -1252,7 +1286,7 @@ static void index_shard_pass_state_snapshot(index_shard_thread_state_t *shared,
 /*
  * Snapshot completed-pass metrics.
  *
- * This function is called only after index_shard_pool_reduce_online() has
+ * This function is called only after index_shard_pool_reduce_first_valid() has
  * returned and all participating workers have left the pass.
  */
 static double index_shard_timeval_delta_seconds(
@@ -1300,7 +1334,7 @@ static void index_shard_pass_metrics_snapshot(
 
   memset(snapshot, 0, sizeof(*snapshot));
 
-  snapshot->reduced = shared->next_reduce;
+  snapshot->reduced = shared->results_reduced;
   snapshot->wall_seconds =
       monotonic_seconds() - shared->pass_wall_start;
   snapshot->cpu_seconds =
@@ -1412,7 +1446,7 @@ static size_t index_shard_percentile_index(size_t count,
 /*
  * Build a completed-pass profile from immutable worker result slots.
  *
- * This runs only after index_shard_pool_reduce_online() has waited for every
+ * This runs only after index_shard_pool_reduce_first_valid() has waited for every
  * participating worker to leave the pass. No task modifies result storage at
  * this point.
  *
@@ -1790,31 +1824,6 @@ static void index_shard_request_stop(index_shard_thread_state_t *shared) {
   index_shard_wake_queue_waiters(shared);
 }
 
-static void index_shard_publish_solved(
-    index_shard_thread_state_t *shared,
-    size_t index_order);
-
-/*
- * Publish a speculative solved frontier without cancelling earlier indexes.
- *
- * Affinity claims may be out of order. A solved index narrows the claim
- * ceiling, but every earlier unclaimed index remains eligible. The ordered
- * reducer is still the only path that can publish the canonical winner and
- * stop the complete pool.
- */
-void index_shard_worker_publish_solution_candidate(void) {
-  index_shard_worker_context_t *ctx = index_shard_get_tls();
-
-  if (!ctx || !ctx->pool ||
-      !ctx->current_outer_active) {
-    return;
-  }
-
-  index_shard_publish_solved(
-      &ctx->pool->shared,
-      ctx->current_index_order);
-}
-
 // ANCHOR INDEX-SHARD: request-fatal-stop
 /*
  * Publish a hard worker/module failure and stop the current pass.
@@ -1843,8 +1852,8 @@ static void index_shard_request_fatal_stop(index_shard_thread_state_t *shared) {
 /*
  * Publish that the reducer committed a valid solved result.
  *
- * Quick commit is intentional project policy. Once a solved result becomes
- * master-visible, no new shard tasks should be claimed.
+ * First-valid selection already stopped new work. This publication records
+ * that the reducer transferred the selected result into master state.
  */
 static void index_shard_publish_committed_solve(
     index_shard_thread_state_t *shared) {
@@ -1908,7 +1917,7 @@ static int index_shard_master_limit_or_cancel_requested(index_shard_thread_state
 /*
  * Read-only stop predicate used by workers before expensive work.
  *
- * Solver completion is mirrored through solved_published.  Workers therefore
+ * First-valid selection is mirrored through stop_requested. Workers therefore
  * do not read master bp->single_field_solved concurrently with the reducer.
  */
 static int index_shard_master_stop_requested(index_shard_thread_state_t *shared) {
@@ -2030,6 +2039,33 @@ void index_shard_poll_from_callback(onefield_t *bp) {
  * best_logodds starts at -HUGE_VAL so diagnostics can distinguish "no match"
  * from a real low-confidence match.
  */
+static const char *index_shard_failure_class_name(
+    index_shard_failure_class_t failure_class) {
+  switch (failure_class) {
+  case INDEX_SHARD_FAILURE_TASK_LOCAL:
+    return "task-local";
+  case INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY:
+    return "global-integrity";
+  case INDEX_SHARD_FAILURE_NONE:
+  default:
+    return "none";
+  }
+}
+
+static void index_shard_result_fail(
+    index_shard_result_t *result,
+    index_shard_failure_class_t failure_class,
+    int rc) {
+  assert(result);
+  assert(failure_class != INDEX_SHARD_FAILURE_NONE);
+
+  result->failed = TRUE;
+  result->rc = rc ? rc : -1;
+  if (failure_class > result->failure_class) {
+    result->failure_class = failure_class;
+  }
+}
+
 static void index_shard_result_init(index_shard_result_t *result, size_t index_order) {
   memset(result, 0, sizeof(index_shard_result_t));
 
@@ -2125,9 +2161,9 @@ static void index_shard_result_finish_task(
 /*
  * Inspect worker-local solutions without merging them.
  *
- * This marks solved/best_logodds before the ordered reducer reaches this
- * slot.  The worker may stop later claims, but only the reducer can commit a
- * solution and cancel earlier-index work.
+ * This marks solved/best_logodds before immutable result publication elects
+ * a winner. Only the reducer may transfer the selected solution into master
+ * state.
  */
 static void index_shard_capture_solution_analysis(index_shard_thread_state_t *shared,
                                                   index_shard_result_t *result) {
@@ -2188,8 +2224,10 @@ static int index_shard_reduce_one_result(index_shard_thread_state_t *shared,
   }
 
   if (!shared->hooks || !shared->hooks->merge_solutions) {
-    result->failed = TRUE;
-    result->rc = -1;
+    index_shard_result_fail(
+        result,
+        INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+        -1);
     index_shard_reducer_work_account(shared, reducer_wall_start);
     return -1;
   }
@@ -2209,13 +2247,16 @@ static int index_shard_reduce_one_result(index_shard_thread_state_t *shared,
   if (shared->hooks->merge_solutions(shared->bp,
                                      result->solutions,
                                      &solved)) {
-    result->failed = TRUE;
-    result->rc = -1;
+    index_shard_result_fail(
+        result,
+        INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+        -1);
     index_shard_reducer_work_account(shared, reducer_wall_start);
     return -1;
   }
 
   result->merged = TRUE;
+  shared->results_reduced++;
 
   if (solved || result->solved) {
     result->solved = TRUE;
@@ -2356,7 +2397,6 @@ static int index_shard_helper_add_work(
 /* queue_mutex must be held. */
 static anbool index_shard_helper_outer_claimable_locked(
     const index_shard_thread_state_t *shared) {
-  size_t limit;
   size_t candidate;
 
   if (!shared || !shared->outer_states ||
@@ -2364,15 +2404,13 @@ static anbool index_shard_helper_outer_claimable_locked(
       shared->outer_running >= shared->producer_width) {
     return FALSE;
   }
-  limit = shared->have_solved_order ?
-      shared->solved_index_order : shared->nindexes;
   candidate = shared->canonical_scan_cursor;
-  while (candidate < limit &&
+  while (candidate < shared->nindexes &&
          shared->outer_states[candidate] !=
              INDEX_SHARD_OUTER_UNCLAIMED) {
     candidate++;
   }
-  return candidate < limit;
+  return candidate < shared->nindexes;
 }
 
 /* queue_mutex must be held. */
@@ -2548,11 +2586,6 @@ static int index_shard_helper_select_locked(
         worker->pool->contexts[owner].published_helper_group;
 
     if (!candidate || !candidate->ready_count) {
-      continue;
-    }
-    if (shared->have_solved_order &&
-        candidate->owner_index_order >=
-            shared->solved_index_order) {
       continue;
     }
     if (candidate->generation != worker->generation_seen ||
@@ -2800,10 +2833,7 @@ static int index_shard_helper_cancel_for_pool_locked(
         group, INDEX_SHARD_HELPER_TASK_ERROR);
     return TRUE;
   }
-  if (stopped ||
-      (shared->have_solved_order &&
-       group->owner_index_order >=
-           shared->solved_index_order)) {
+  if (stopped) {
     index_shard_helper_cancel_ready_locked(
         shared,
         group, INDEX_SHARD_HELPER_TASK_STOPPED);
@@ -2825,10 +2855,7 @@ static int index_shard_helper_owner_claim_locked(
   fatal = shared->fatal_error;
   stopped = shared->stop_requested ||
       shared->solved_published;
-  if (!fatal && !stopped &&
-      (!shared->have_solved_order ||
-       group->owner_index_order <
-           shared->solved_index_order)) {
+  if (!fatal && !stopped) {
     rc = index_shard_helper_claim_locked(
         group, task_index);
     pthread_mutex_unlock(&shared->state_mutex);
@@ -2865,9 +2892,7 @@ size_t index_shard_helper_available_workers(void) {
   if (ctx->generation_seen == ctx->pool->generation &&
       !ctx->published_helper_group &&
       !ctx->helper_preparation_active &&
-      !shared->helper_preparations_active &&
-      (!shared->have_solved_order ||
-       ctx->current_index_order < shared->solved_index_order)) {
+      !shared->helper_preparations_active) {
     available = index_shard_helper_idle_workers_locked(
         shared);
   }
@@ -2891,9 +2916,7 @@ size_t index_shard_helper_prepare_reserve(void) {
   if (ctx->generation_seen == ctx->pool->generation &&
       !ctx->published_helper_group &&
       !ctx->helper_preparation_active &&
-      !shared->helper_preparations_active &&
-      (!shared->have_solved_order ||
-       ctx->current_index_order < shared->solved_index_order)) {
+      !shared->helper_preparations_active) {
     available = index_shard_helper_idle_workers_locked(shared);
     if (available) {
       shared->helper_preparations_active++;
@@ -3022,10 +3045,7 @@ index_shard_helper_run(
   if (ctx->generation_seen != ctx->pool->generation ||
       ctx->published_helper_group ||
       (!preparation_permit &&
-       shared->helper_preparations_active) ||
-      (shared->have_solved_order &&
-       group.owner_index_order >=
-           shared->solved_index_order)) {
+       shared->helper_preparations_active)) {
     if (index_shard_helper_prepare_clear_locked(
             ctx, shared)) {
       pthread_mutex_unlock(&shared->queue_mutex);
@@ -3295,14 +3315,6 @@ index_shard_helper_run(
   return result;
 }
 
-static size_t index_shard_claim_limit_locked(
-    const index_shard_thread_state_t *shared) {
-  if (shared->have_solved_order) {
-    return shared->solved_index_order;
-  }
-  return shared->nindexes;
-}
-
 static void index_shard_worker_cleanup_pass(
     index_shard_worker_context_t *ctx,
     index_shard_thread_state_t *shared);
@@ -3361,8 +3373,8 @@ static int index_shard_claim_outer_locked(
  *
  * New canonical outer work has priority whenever a producer slot is free.
  * Helper packages become eligible only when no outer task is immediately
- * claimable. The reducer remains the only authority for ordered result
- * publication.
+ * claimable. The reducer remains the only authority for master result
+ * mutation.
  */
 static index_shard_work_selection_t
 index_shard_select_work(
@@ -3383,7 +3395,6 @@ index_shard_select_work(
   pthread_mutex_lock(&shared->queue_mutex);
   while (1) {
     index_shard_pass_state_snapshot_t state;
-    size_t claim_limit;
     size_t candidate;
     int helper_selection;
 
@@ -3394,10 +3405,9 @@ index_shard_select_work(
       return INDEX_SHARD_WORK_DONE;
     }
 
-    claim_limit = index_shard_claim_limit_locked(shared);
     index_shard_advance_canonical_cursor_locked(shared);
     candidate = shared->canonical_scan_cursor;
-    if (candidate < claim_limit &&
+    if (candidate < shared->nindexes &&
         shared->outer_running < shared->producer_width) {
       if (index_shard_claim_outer_locked(
               worker,
@@ -3456,9 +3466,32 @@ index_shard_select_work(
   }
 }
 
-static int index_shard_mark_result_completed(index_shard_thread_state_t *shared,
-                                             size_t index_order) {
+/*
+ * Publish one immutable outer result and arbitrate pass termination.
+ *
+ * result_mutex orders completed result publication. state_mutex is acquired
+ * second so a verified result, an ordinary task failure, cancellation, and a
+ * fatal stop cannot pass one another without a defined winner. The first
+ * eligible completed result stops the pass immediately; only the reducer may
+ * later transfer its private MatchObj payload into master state.
+ */
+static int index_shard_mark_result_completed(
+    index_shard_thread_state_t *shared,
+    size_t index_order) {
+  index_shard_result_t *result;
+  int fatal_now = FALSE;
+  int late_loser_failure = FALSE;
   int rc = 0;
+  int selected_now = FALSE;
+  int stop_now = FALSE;
+  int task_local_now = FALSE;
+
+  if (!shared || !shared->results || !shared->completed ||
+      index_order >= shared->nindexes) {
+    return -1;
+  }
+
+  result = &shared->results[index_order];
 
   /*
    * NOTE INDEX-SHARD: claimed-task-invariant
@@ -3473,10 +3506,115 @@ static int index_shard_mark_result_completed(index_shard_thread_state_t *shared,
            index_order);
     rc = -1;
   } else {
+    /*
+     * Freeze a complete cause-based terminal classification before publishing
+     * the immutable result slot. Unclassified or internally inconsistent
+     * failure state is itself a pass-integrity failure.
+     */
+    if ((result->failed || result->rc) &&
+        result->failure_class == INDEX_SHARD_FAILURE_NONE) {
+      index_shard_result_fail(
+          result,
+          INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+          result->rc);
+    } else if (result->failure_class != INDEX_SHARD_FAILURE_NONE &&
+               (!result->failed || !result->rc)) {
+      index_shard_result_fail(
+          result,
+          INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+          result->rc);
+    }
+
+    result->completion_sequence =
+        ++shared->next_completion_sequence;
     shared->completed[index_order] = TRUE;
+
+    pthread_mutex_lock(&shared->state_mutex);
+
+    if (result->solved &&
+        !result->failed &&
+        result->rc == 0 &&
+        result->failure_class == INDEX_SHARD_FAILURE_NONE &&
+        !result->cancelled &&
+        !result->hit_total_cpulimit &&
+        !shared->stop_requested &&
+        !shared->fatal_error &&
+        !shared->winner_selected &&
+        !shared->solved_published) {
+      shared->winner_selected = TRUE;
+      shared->selected_index_order = index_order;
+      shared->selected_completion_sequence =
+          result->completion_sequence;
+      shared->first_stop_wall_since_pass =
+          monotonic_seconds() - shared->pass_wall_start;
+      shared->stop_requested = TRUE;
+      selected_now = TRUE;
+      stop_now = TRUE;
+    } else if (result->failure_class ==
+               INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY) {
+      shared->global_integrity_failures++;
+      if (!shared->stop_requested) {
+        shared->first_stop_wall_since_pass =
+            monotonic_seconds() - shared->pass_wall_start;
+      }
+      shared->fatal_error = TRUE;
+      shared->stop_requested = TRUE;
+      fatal_now = TRUE;
+      stop_now = TRUE;
+    } else if (result->failure_class ==
+               INDEX_SHARD_FAILURE_TASK_LOCAL) {
+      shared->task_local_failures++;
+      task_local_now = TRUE;
+      if (shared->winner_selected &&
+          shared->selected_index_order != index_order) {
+        shared->late_loser_failures++;
+        late_loser_failure = TRUE;
+      }
+    }
+
+    pthread_mutex_unlock(&shared->state_mutex);
   }
+
   pthread_cond_broadcast(&shared->result_cv);
   pthread_mutex_unlock(&shared->result_mutex);
+
+  if (stop_now) {
+    __atomic_store_n(
+        &shared->worker_stop_requested,
+        TRUE,
+        __ATOMIC_RELEASE);
+    fitsbin_payload_io_notify_wait_helpers();
+    index_shard_wake_queue_waiters(shared);
+  }
+
+  if (selected_now) {
+    logverb("[index-shard] winner-selected index_order=%zu worker=%i "
+            "completion_sequence=%zu field=%i best_logodds=%.17g "
+            "pass_wall=%.6f\n",
+            index_order,
+            result->worker_id,
+            result->completion_sequence,
+            result->best_fieldnum,
+            result->best_logodds,
+            shared->first_stop_wall_since_pass);
+  } else if (fatal_now) {
+    logerr("[index-shard] global integrity failure terminated pass "
+           "index_order=%zu completion_sequence=%zu class=%s\n",
+           index_order,
+           result->completion_sequence,
+           index_shard_failure_class_name(result->failure_class));
+  } else if (late_loser_failure) {
+    logverb("[index-shard] preserving selected winner after task-local "
+            "loser index_order=%zu completion_sequence=%zu\n",
+            index_order,
+            result->completion_sequence);
+  } else if (task_local_now) {
+    logverb("[index-shard] isolated task-local failure "
+            "index_order=%zu completion_sequence=%zu\n",
+            index_order,
+            result->completion_sequence);
+  }
+
   return rc;
 }
 
@@ -3488,7 +3626,7 @@ static void index_shard_finish_outer_claim(
 
   /*
    * Publish the terminal owner state before completed[index_order] makes the
-   * immutable result visible to the canonical reducer.
+   * immutable result visible to first-valid election and the reducer.
    */
   pthread_mutex_lock(&shared->queue_mutex);
   if (!shared->outer_states ||
@@ -3521,28 +3659,6 @@ static void index_shard_finish_outer_claim(
   }
 }
 
-// ANCHOR INDEX-SHARD: publish-solved
-/*
- * Publish solved frontier.
- *
- * This prevents workers from claiming at or above the earliest known solved
- * order. Affinity can leave earlier holes, so those indexes remain claimable.
- * The actual solution merge and global stop still belong to the canonical
- * ordered reducer.
- */
-static void index_shard_publish_solved(
-    index_shard_thread_state_t *shared,
-    size_t index_order) {
-  pthread_mutex_lock(&shared->queue_mutex);
-  if (index_order < shared->nindexes &&
-      (!shared->have_solved_order ||
-       index_order < shared->solved_index_order)) {
-    shared->have_solved_order = TRUE;
-    shared->solved_index_order = index_order;
-    pthread_cond_broadcast(&shared->queue_cv);
-  }
-  pthread_mutex_unlock(&shared->queue_mutex);
-}
 /*
  * SECTION INDEX-SHARD: worker-context
  *
@@ -3648,21 +3764,27 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
   result->mmap_advice = mmap_advice;
 
   if (!result->solutions) {
-    result->failed = TRUE;
-    result->rc = -1;
+    index_shard_result_fail(
+        result,
+        INDEX_SHARD_FAILURE_TASK_LOCAL,
+        -1);
     return -1;
   }
 
   if (!ctx->local_context_ready) {
-    result->failed = TRUE;
-    result->rc = -1;
+    index_shard_result_fail(
+        result,
+        INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+        -1);
     return -1;
   }
 
   if (!shared->hooks || !shared->hooks->reset_local_context_for_task ||
       !shared->hooks->solve_one_index) {
-    result->failed = TRUE;
-    result->rc = -1;
+    index_shard_result_fail(
+        result,
+        INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+        -1);
     return -1;
   }
 
@@ -3714,8 +3836,10 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
         monotonic_seconds() - phase_wall_start;
 
     ERROR("Failed to load index order %zu", index_order);
-    result->failed = TRUE;
-    result->rc = -1;
+    index_shard_result_fail(
+        result,
+        INDEX_SHARD_FAILURE_TASK_LOCAL,
+        -1);
 
     index_shard_result_finish_task(result,
                                    shared,
@@ -3768,8 +3892,10 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
             index_order,
             index,
             &inverse_lease)) {
-      result->failed = TRUE;
-      result->rc = -1;
+      index_shard_result_fail(
+          result,
+          INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+          -1);
     }
     index = NULL;
     result->release_seconds =
@@ -3791,7 +3917,7 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
   wall_start = monotonic_seconds();
   cpu_start = get_cpu_usage();
 
-  // Worker-lifetime TLS lets onefield callbacks publish this exact order.
+  // Worker-lifetime TLS lets onefield callbacks poll this pass for stop.
   ctx->current_index_order = index_order;
   ctx->current_outer_active = TRUE;
   fitsbin_payload_io_clear_thread_wait_helper();
@@ -3812,22 +3938,21 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
   result->rc = rc;
 
   if (rc) {
-    result->failed = TRUE;
+    index_shard_result_fail(
+        result,
+        INDEX_SHARD_FAILURE_TASK_LOCAL,
+        rc);
   }
 
   if (result->cancelled) {
     index_shard_request_stop(shared);
   }
 
-  // analyze before reducer so worker can trigger fast stop
+  // Analyze before immutable result publication and winner election.
   phase_wall_start = monotonic_seconds();
 
   if (!result->failed) {
     index_shard_capture_solution_analysis(shared, result);
-
-    if (ctx->local_bp.single_field_solved) {
-      result->solved = TRUE;
-    }
   }
 
   result->analyze_seconds =
@@ -3851,8 +3976,10 @@ static int index_shard_run_one_with_worker_context(index_shard_worker_context_t 
           index_order,
           index,
           &inverse_lease)) {
-    result->failed = TRUE;
-    result->rc = -1;
+    index_shard_result_fail(
+        result,
+        INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+        -1);
     rc = -1;
   }
   index = NULL;
@@ -4020,11 +4147,12 @@ static void *index_shard_worker_main(void *userdata) {
               monotonic_seconds() - context_wall_start;
 
           index_shard_result_init(result, index_order);
-          result->failed = TRUE;
-          result->rc = -1;
+          index_shard_result_fail(
+              result,
+              INDEX_SHARD_FAILURE_GLOBAL_INTEGRITY,
+              -1);
 
           index_shard_finish_outer_claim(shared, index_order);
-          index_shard_request_fatal_stop(shared);
           break;
         }
 
@@ -4038,12 +4166,14 @@ static void *index_shard_worker_main(void *userdata) {
                                                   result,
                                                   mmap_advice)) {
         index_shard_finish_outer_claim(shared, index_order);
-        index_shard_request_fatal_stop(shared);
+        if (result->failure_class == INDEX_SHARD_FAILURE_TASK_LOCAL) {
+          continue;
+        }
         break;
       }
 
       if (result->solved) {
-        logverb("[index-shard] solved-candidate worker=%i index_order=%zu "
+        logverb("[index-shard] verified-result-ready worker=%i index_order=%zu "
                 "best_logodds=%.3f field=%i wall=%.6f cpu=%.6f\n",
                 ctx->worker_id,
                 index_order,
@@ -4051,8 +4181,6 @@ static void *index_shard_worker_main(void *userdata) {
                 result->best_fieldnum,
                 result->wall_seconds,
                 (double)result->cpu_seconds);
-
-        index_shard_publish_solved(shared, index_order);
       }
 
       if (index_shard_trace_enabled()) {
@@ -4067,8 +4195,8 @@ static void *index_shard_worker_main(void *userdata) {
                monotonic_seconds() - shared->pass_wall_start);
       }
 
-      index_shard_check_global_limits(shared);
       index_shard_finish_outer_claim(shared, index_order);
+      index_shard_check_global_limits(shared);
     }
 
     {
@@ -4102,14 +4230,14 @@ static void *index_shard_worker_main(void *userdata) {
  * MatchObj data into master bp->solutions and updates final master solved state.
  */
 
-// ANCHOR INDEX-SHARD: reduce-online
+// ANCHOR INDEX-SHARD: reduce-first-valid
 /*
- * Online reducer for one submitted pass.
+ * First-valid reducer for one submitted pass.
  *
- * Reduce only the completed canonical prefix.  A solved result becomes
- * master-visible only after every earlier configured index has completed and
- * been reduced, preserving the original serial index priority independently
- * of worker completion order.
+ * Result publication selects the first immutable verified completion and
+ * starts cooperative cancellation. After all workers quiesce, reduce exactly
+ * that selected result. Configured index order is used only for the clean
+ * unsolved drain that preserves original diagnostic accumulation.
  */
 #define INDEX_SHARD_LIMIT_POLL_NANOSECONDS 100000000L
 
@@ -4124,108 +4252,18 @@ static void index_shard_limit_poll_deadline(
   }
 }
 
-static int index_shard_pool_reduce_online(index_shard_pool_t *pool) {
+static int index_shard_pool_reduce_first_valid(index_shard_pool_t *pool) {
   index_shard_thread_state_t *shared = &pool->shared;
+  index_shard_pass_state_snapshot_t state;
   size_t i;
   int rc = 0;
 
-  while (shared->next_reduce < shared->nindexes) {
-    index_shard_pass_state_snapshot_t state;
-    int can_reduce = FALSE;
-    int workers_done = FALSE;
-    int fatal = FALSE;
-    int wait_failed = FALSE;
-
-    pthread_mutex_lock(&shared->result_mutex);
-
-    while (!shared->completed[shared->next_reduce] &&
-           shared->active_workers > 0) {
-      index_shard_pass_state_snapshot(shared, &state);
-
-      if (state.fatal_error) {
-        break;
-      }
-
-      {
-        struct timespec deadline;
-        int wait_result;
-
-        index_shard_limit_poll_deadline(&deadline);
-        wait_result = pthread_cond_timedwait(
-            &shared->result_cv,
-            &shared->result_mutex,
-            &deadline);
-        if (wait_result == ETIMEDOUT) {
-          pthread_mutex_unlock(&shared->result_mutex);
-          (void)index_shard_check_global_limits(shared);
-          pthread_mutex_lock(&shared->result_mutex);
-        } else if (wait_result) {
-          wait_failed = TRUE;
-          break;
-        }
-      }
-    }
-
-    can_reduce = shared->completed[shared->next_reduce];
-    workers_done = (shared->active_workers == 0);
-
-    index_shard_pass_state_snapshot(shared, &state);
-    fatal = state.fatal_error;
-
-    pthread_mutex_unlock(&shared->result_mutex);
-
-    if (wait_failed) {
-      rc = -1;
-      index_shard_request_fatal_stop(shared);
-      break;
-    }
-
-    if (fatal) {
-      rc = -1;
-      index_shard_request_stop(shared);
-      break;
-    }
-
-    if (can_reduce) {
-      index_shard_result_t *result =
-          &shared->results[shared->next_reduce];
-
-      if (index_shard_trace_enabled()) {
-        logmsg("[index-shard] reduce index_order=%zu solved=%i failed=%i\n",
-               shared->next_reduce,
-               result->solved,
-               result->failed);
-      }
-
-      if (result->failed) {
-        rc = -1;
-        index_shard_request_fatal_stop(shared);
-        break;
-      }
-
-      if (index_shard_reduce_one_result(shared, result)) {
-        rc = -1;
-        index_shard_request_fatal_stop(shared);
-        break;
-      }
-
-      shared->next_reduce++;
-
-      if (index_shard_master_stop_requested(shared)) {
-        index_shard_request_stop(shared);
-        break;
-      }
-
-      continue;
-    }
-
-    if (workers_done) {
-      break;
-    }
-  }
-
+  /*
+   * Winner selection already published stop. Keep all result storage and
+   * shared field state alive until every owner and borrowed helper has left
+   * this generation.
+   */
   pthread_mutex_lock(&shared->result_mutex);
-
   while (shared->active_workers > 0) {
     struct timespec deadline;
     int wait_result;
@@ -4247,67 +4285,125 @@ static int index_shard_pool_reduce_online(index_shard_pool_t *pool) {
     }
   }
 
+  index_shard_pass_state_snapshot(shared, &state);
   pthread_mutex_unlock(&shared->result_mutex);
 
+  if (state.fatal_error) {
+    return -1;
+  }
+  if (rc) {
+    return rc;
+  }
+
+  if (state.winner_selected) {
+    index_shard_result_t *winner;
+
+    if (state.selected_index_order >= shared->nindexes ||
+        !shared->completed[state.selected_index_order]) {
+      logerr("[index-shard] selected winner result is unavailable "
+             "index_order=%zu\n",
+             state.selected_index_order);
+      index_shard_request_fatal_stop(shared);
+      return -1;
+    }
+
+    winner = &shared->results[state.selected_index_order];
+    if (!winner->solved ||
+        winner->failed ||
+        winner->rc ||
+        winner->failure_class != INDEX_SHARD_FAILURE_NONE ||
+        winner->cancelled ||
+        winner->hit_total_cpulimit ||
+        winner->merged ||
+        !winner->completion_sequence ||
+        winner->completion_sequence !=
+            state.selected_completion_sequence) {
+      logerr("[index-shard] selected winner result is inconsistent "
+             "index_order=%zu completion_sequence=%zu\n",
+             state.selected_index_order,
+             state.selected_completion_sequence);
+      index_shard_request_fatal_stop(shared);
+      return -1;
+    }
+
+    if (index_shard_trace_enabled()) {
+      logmsg("[index-shard] reduce-winner index_order=%zu worker=%i "
+             "completion_sequence=%zu solved=%i failed=%i\n",
+             winner->index_order,
+             winner->worker_id,
+             winner->completion_sequence,
+             winner->solved,
+             winner->failed);
+    }
+
+    if (index_shard_reduce_one_result(shared, winner) ||
+        !shared->have_committed_result ||
+        shared->committed_index_order !=
+            state.selected_index_order) {
+      logerr("[index-shard] failed to commit selected winner "
+             "index_order=%zu\n",
+             state.selected_index_order);
+      index_shard_request_fatal_stop(shared);
+      return -1;
+    }
+    return 0;
+  }
+
+  /* Cancellation or a limit won before any immutable verified result. */
+  if (state.stop_requested) {
+    return 0;
+  }
+
+  if (state.task_local_failures) {
+    logerr("[index-shard] pass exhausted with task-local failures "
+           "count=%llu; requesting exact serial retry\n",
+           state.task_local_failures);
+    return -1;
+  }
+
   /*
-   * A worker failure can race with an earlier valid-solution commit.  Never
-   * convert that hard failure into a successful pass: after quiescence every
-   * result slot is immutable, so perform one authoritative failure scan.
+   * A clean unsolved pass preserves configured-order accumulation of
+   * below-threshold diagnostics. No result in this path may be solved.
    */
   for (i = 0; i < shared->nindexes; i++) {
-    if (shared->completed[i] &&
-        (shared->results[i].failed || shared->results[i].rc)) {
-      rc = -1;
+    index_shard_result_t *result = &shared->results[i];
+
+    if (!shared->completed[i] ||
+        result->failed ||
+        result->rc ||
+        result->failure_class != INDEX_SHARD_FAILURE_NONE ||
+        result->solved) {
+      logerr("[index-shard] invalid clean-unsolved result "
+             "index_order=%zu completed=%i solved=%i failed=%i rc=%i\n",
+             i,
+             shared->completed[i] ? 1 : 0,
+             result->solved,
+             result->failed,
+             result->rc);
       index_shard_request_fatal_stop(shared);
-      break;
+      return -1;
+    }
+
+    if (index_shard_reduce_one_result(shared, result)) {
+      index_shard_request_fatal_stop(shared);
+      return -1;
+    }
+
+    if (shared->solved_published) {
+      logerr("[index-shard] clean-unsolved reduction committed a solution "
+             "index_order=%zu\n", i);
+      index_shard_request_fatal_stop(shared);
+      return -1;
     }
   }
 
-  {
-    index_shard_pass_state_snapshot_t state;
-
-    index_shard_pass_state_snapshot(shared, &state);
-    if (state.fatal_error) {
-      rc = -1;
-    }
-  }
-
-  while (rc == 0 &&
-         shared->next_reduce < shared->nindexes &&
-         shared->completed[shared->next_reduce]) {
-    index_shard_pass_state_snapshot_t state;
-    index_shard_result_t *result =
-        &shared->results[shared->next_reduce];
-
-    index_shard_pass_state_snapshot(shared, &state);
-
-    if (state.solved_published) {
-      break;
-    }
-
-    if (!result->failed && !result->merged) {
-      if (index_shard_reduce_one_result(shared, result)) {
-        rc = -1;
-        break;
-      }
-    }
-
-    shared->next_reduce++;
-
-    index_shard_pass_state_snapshot(shared, &state);
-
-    if (state.solved_published) {
-      break;
-    }
-  }
-
-  return rc;
+  return 0;
 }
 
 /*
  * Report the reducer-owned winner after every worker has quiesced and the
- * late hard-failure scan has passed. Worker callbacks deliberately suppress
- * their ordinary solved line, so this is the sole parallel success report.
+ * selected result has committed. Worker callbacks deliberately suppress their
+ * ordinary solved line, so this is the sole parallel success report.
  */
 static int index_shard_report_committed_solution(
     onefield_t *bp,
@@ -4323,8 +4419,10 @@ static int index_shard_report_committed_solution(
   }
 
   if (!shared ||
+      !shared->winner_selected ||
       !shared->have_committed_result ||
-      shared->committed_index_order >= nindexes) {
+      shared->committed_index_order >= nindexes ||
+      shared->committed_index_order != shared->selected_index_order) {
     logerr("[index-shard] committed-solution identity is unavailable\n");
     return -1;
   }
@@ -4934,16 +5032,21 @@ static int index_shard_pool_submit(
   shared->helper_task_failures = 0U;
   shared->helper_owner_wait_calls = 0U;
   shared->helper_owner_wait_seconds = 0.0;
+  shared->task_local_failures = 0U;
+  shared->global_integrity_failures = 0U;
+  shared->late_loser_failures = 0U;
 
   shared->results = results;
   shared->completed = completed;
-  shared->next_reduce = 0U;
+  shared->results_reduced = 0U;
+  shared->next_completion_sequence = 0U;
 
   shared->worker_count = worker_count;
   shared->active_workers = worker_count;
 
   shared->stop_requested = FALSE;
   shared->fatal_error = FALSE;
+  shared->winner_selected = FALSE;
   shared->solved_published = FALSE;
   shared->master_committed = FALSE;
   shared->first_stop_wall_since_pass = -1.0;
@@ -4951,10 +5054,10 @@ static int index_shard_pool_submit(
       &shared->worker_stop_requested,
       FALSE,
       __ATOMIC_RELEASE);
+  shared->selected_index_order = nindexes;
+  shared->selected_completion_sequence = 0U;
   shared->have_committed_result = FALSE;
   shared->committed_index_order = 0U;
-  shared->have_solved_order = FALSE;
-  shared->solved_index_order = nindexes;
   shared->limit_reported = FALSE;
 
   shared->reducer_work_calls = 0U;
@@ -4991,7 +5094,7 @@ static int index_shard_pool_submit(
   logverb("[index-shard] pthread-pool submit compute_width=%i "
           "producer_width=%zu candidates=%zu engine_pass=%zu "
           "depth_index=%zu scale_index=%zu startobj=%i endobj=%i "
-          "scheduler=canonical-ready inner_scheduler=prepared-groups "
+          "scheduler=first-valid-completion inner_scheduler=prepared-groups "
           "mmap_pass=%u mmap_advice=%s mmap_scope=all-chunks "
           "mmap_policy=parallel-random-serial-normal "
           "page_delivery=native-mmap-demand "
@@ -5020,9 +5123,10 @@ static int index_shard_pool_submit(
 /*
  * Execute one complete index-shard pass.
  *
- * Terminal status is classified according to whether master-visible solver
- * state has already been mutated. Only an unavailable path or a failure
- * proven to occur before master commit may return control to the serial path.
+ * Terminal status is classified by failure scope and the master mutation
+ * boundary. Only an unavailable path or an isolated task-local failure proven
+ * to occur before master commit may return control to the serial path. A
+ * global-integrity failure is terminal regardless of winner timing.
  */
 static index_shard_solve_status_t
 index_shard_solve_impl(onefield_t *bp,
@@ -5119,7 +5223,7 @@ index_shard_solve_impl(onefield_t *bp,
     return INDEX_SHARD_SOLVE_PRECOMMIT_FAILURE;
   }
 
-  rc = index_shard_pool_reduce_online(pool);
+  rc = index_shard_pool_reduce_first_valid(pool);
 
   index_shard_pass_state_snapshot(&pool->shared, &state);
   clean_exhaustion_required =
@@ -5243,14 +5347,14 @@ index_shard_solve_impl(onefield_t *bp,
     }
   }
 
-  if (worker_cancelled) {
+  if (worker_cancelled && !state.winner_selected) {
     pthread_mutex_lock(&pool->shared.limit_mutex);
     bp->cancelled = TRUE;
     pthread_mutex_unlock(&pool->shared.limit_mutex);
   }
 
   /*
-   * active_workers reached zero before reduce_online() returned, so every
+   * active_workers reached zero before the first-valid reducer returned, so every
    * participating context timing is immutable here. These are work sums; the
    * maxima expose the critical per-worker prepare/cleanup contribution.
    */
@@ -5280,7 +5384,11 @@ index_shard_solve_impl(onefield_t *bp,
     reduction_ex_verify_seconds = 0.0;
   }
 
-  if (rc && status != INDEX_SHARD_SOLVE_TERMINAL_FAILURE) {
+  if (state.fatal_error || state.global_integrity_failures) {
+    rc = -1;
+    status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
+  } else if (rc &&
+             status != INDEX_SHARD_SOLVE_TERMINAL_FAILURE) {
     if (state.master_committed) {
       status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
     } else {
@@ -5323,7 +5431,7 @@ index_shard_solve_impl(onefield_t *bp,
 
 
   /*
-   * index_shard_pool_reduce_online() has returned and every participating
+   * index_shard_pool_reduce_first_valid() returned and every participating
    * worker has left this generation. The pass outcome is now immutable.
    */
   pass_completed =
@@ -5494,7 +5602,10 @@ index_shard_solve_impl(onefield_t *bp,
   logverb("[index-shard] pass-detail candidates=%zu reduced=%zu "
           "hit_total_cpu_limit=%i hit_total_wall_limit=%i "
           "cancelled=%i rc=%i status=%i "
-          "master_committed=%i\n",
+          "master_committed=%i winner_selected=%i "
+          "selected_order=%zu selected_sequence=%zu "
+          "task_local_failures=%llu global_integrity_failures=%llu "
+          "late_loser_failures=%llu\n",
           nindexes,
           pass_metrics.reduced,
           bp->hit_total_cpulimit,
@@ -5502,7 +5613,13 @@ index_shard_solve_impl(onefield_t *bp,
           bp->cancelled,
           rc,
           (int)status,
-          state.master_committed);
+          state.master_committed,
+          state.winner_selected,
+          state.selected_index_order,
+          state.selected_completion_sequence,
+          state.task_local_failures,
+          state.global_integrity_failures,
+          pool->shared.late_loser_failures);
 
   logverb("[index-shard] mmap-policy "
          "policy=%s effective=%s scope=all-chunks pass=%u "
