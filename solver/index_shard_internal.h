@@ -277,6 +277,188 @@ index_shard_helper_run_ordered(
     void *owner_context,
     index_shard_helper_run_stats_t *stats);
 
+/*
+ * Persistent staged helper work.
+ *
+ * Unlike the synchronous helper task above, one logical staged task may
+ * release its compute claim while a payload ticket is pending. The outer
+ * owner still waits for the complete group, retains every borrowed input and
+ * mapping until quiescence, and alone retires results in task order.
+ *
+ * All operation callbacks run without the shard queue mutex. prepare(),
+ * submit(), execute(), and owner() may mutate only their task-private output.
+ * poll() must not wait: a terminal return must also collect and destroy the
+ * task's payload ticket. cancel() requests cancellation without waiting and
+ * returns any nonnegative success value or a negative error.
+ * No callback may mutate solver_t, reducer state, or final publication state.
+ */
+typedef enum index_shard_staged_prepare_status {
+  INDEX_SHARD_STAGED_PREPARE_ERROR = -2,
+  INDEX_SHARD_STAGED_PREPARE_STOPPED = -1,
+  INDEX_SHARD_STAGED_PREPARE_MORE = 0,
+  INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY = 1,
+  INDEX_SHARD_STAGED_PREPARE_COMPUTE_READY = 2,
+  INDEX_SHARD_STAGED_PREPARE_OWNER_READY = 3,
+  INDEX_SHARD_STAGED_PREPARE_RESULTS_READY = 4
+} index_shard_staged_prepare_status_t;
+
+typedef enum index_shard_staged_submit_status {
+  INDEX_SHARD_STAGED_SUBMIT_ERROR = -2,
+  INDEX_SHARD_STAGED_SUBMIT_STOPPED = -1,
+  INDEX_SHARD_STAGED_SUBMIT_RETRY = 0,
+  INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED = 1,
+  INDEX_SHARD_STAGED_SUBMIT_COMPUTE_READY = 2,
+  INDEX_SHARD_STAGED_SUBMIT_OWNER_READY = 3
+} index_shard_staged_submit_status_t;
+
+typedef enum index_shard_staged_io_status {
+  INDEX_SHARD_STAGED_IO_ERROR = -2,
+  INDEX_SHARD_STAGED_IO_CANCELLED = -1,
+  INDEX_SHARD_STAGED_IO_PENDING = 0,
+  INDEX_SHARD_STAGED_IO_READY = 1,
+  INDEX_SHARD_STAGED_IO_FAILED = 2
+} index_shard_staged_io_status_t;
+
+typedef enum index_shard_staged_execute_status {
+  INDEX_SHARD_STAGED_EXECUTE_ERROR = -1,
+  INDEX_SHARD_STAGED_EXECUTE_OK = 0,
+  INDEX_SHARD_STAGED_EXECUTE_STOPPED = 1,
+  INDEX_SHARD_STAGED_EXECUTE_MORE = 2
+} index_shard_staged_execute_status_t;
+
+typedef index_shard_staged_prepare_status_t
+(*index_shard_staged_prepare_fn)(
+    const void *input,
+    size_t input_bytes,
+    void *output,
+    size_t output_bytes);
+
+typedef index_shard_staged_submit_status_t
+(*index_shard_staged_submit_fn)(
+    const void *input,
+    size_t input_bytes,
+    void *output,
+    size_t output_bytes,
+    unsigned long long *completion_id_out);
+
+/*
+ * A successful IO_SUBMITTED return must publish one nonzero immutable
+ * completion ID through completion_id_out. Every other return leaves it zero.
+ */
+typedef index_shard_staged_io_status_t
+(*index_shard_staged_poll_fn)(
+    const void *input,
+    size_t input_bytes,
+    void *output,
+    size_t output_bytes);
+
+typedef int
+(*index_shard_staged_cancel_fn)(
+    const void *input,
+    size_t input_bytes,
+    void *output,
+    size_t output_bytes);
+
+typedef index_shard_staged_execute_status_t
+(*index_shard_staged_execute_fn)(
+    const void *input,
+    size_t input_bytes,
+    void *output,
+    size_t output_bytes);
+
+typedef struct index_shard_staged_ops {
+  const char *name;
+  index_shard_staged_prepare_fn prepare;
+  index_shard_staged_submit_fn submit;
+  index_shard_staged_poll_fn poll;
+  index_shard_staged_cancel_fn cancel;
+  index_shard_staged_execute_fn execute;
+  index_shard_staged_execute_fn owner;
+} index_shard_staged_ops_t;
+
+typedef struct index_shard_staged_task {
+  const void *input;
+  size_t input_bytes;
+  void *output;
+  size_t output_bytes;
+  unsigned long long work_units;
+
+  /* Scheduler-owned while index_shard_staged_run_ordered() is active. */
+  unsigned char scheduler_state;
+  unsigned char cancel_sent;
+  unsigned char completion_pending;
+  int callback_status;
+  unsigned long long scheduler_epoch;
+  unsigned long long completion_id;
+  double scheduler_submit_seconds;
+  double scheduler_ready_seconds;
+  double scheduler_result_seconds;
+} index_shard_staged_task_t;
+
+typedef enum index_shard_staged_retire_status {
+  INDEX_SHARD_STAGED_RETIRE_ERROR = -1,
+  INDEX_SHARD_STAGED_RETIRE_OK = 0,
+  INDEX_SHARD_STAGED_RETIRE_STOPPED = 1,
+  /*
+   * The canonical owner retired one bounded prefix. Requeue this same task
+   * without advancing the ordered retirement cursor.
+   */
+  INDEX_SHARD_STAGED_RETIRE_MORE = 2
+} index_shard_staged_retire_status_t;
+
+typedef index_shard_staged_retire_status_t
+(*index_shard_staged_retire_fn)(
+    const index_shard_staged_task_t *task,
+    size_t task_index,
+    void *owner_context);
+
+typedef struct index_shard_staged_run_stats {
+  size_t owner_claims;
+  size_t foreign_claims;
+  size_t owner_compute_executes;
+  size_t foreign_compute_executes;
+  size_t max_concurrent_claims;
+  size_t max_compute_running;
+  size_t io_submitted;
+  size_t io_completed;
+  size_t max_io_submitted;
+  size_t max_compute_ready;
+  size_t max_reorder_ready;
+  size_t prepare_claims;
+  size_t submit_claims;
+  size_t poll_claims;
+  size_t execute_claims;
+  size_t owner_claims_executed;
+  double submit_to_ready_seconds;
+  double ready_dwell_seconds;
+  double execute_seconds;
+  double result_to_retire_seconds;
+  double retire_seconds;
+  unsigned long long owner_work_units;
+  unsigned long long foreign_work_units;
+} index_shard_staged_run_stats_t;
+
+/*
+ * Return the maximum useful logical packet width for the current pool.
+ * W1 and a pool without a completion notifier return zero.
+ */
+size_t index_shard_staged_capacity(void);
+
+/*
+ * Publish one bounded owner-scoped group. The group object is heap-backed and
+ * remains published while its outwardly synchronous owner call schedules
+ * preparation, submission, completion, execution, and ordered retirement.
+ * The caller retains tasks, inputs, outputs, and owner_context until return.
+ */
+index_shard_helper_run_status_t
+index_shard_staged_run_ordered(
+    const index_shard_staged_ops_t *ops,
+    index_shard_staged_task_t *tasks,
+    size_t task_count,
+    index_shard_staged_retire_fn retire,
+    void *owner_context,
+    index_shard_staged_run_stats_t *stats);
+
 index_shard_solve_status_t
 index_shard_solve(onefield_t *bp,
                   solver_t *base_sp,

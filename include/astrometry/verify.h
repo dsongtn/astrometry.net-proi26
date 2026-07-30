@@ -108,6 +108,70 @@ void verify_hit(const startree_t* skdt,
                 anbool fake_match);
 
 /*
+ * Heap-owned result of the native StarKD traversal used by verification. The
+ * logical result preserves the exact native reference-star order. Optional
+ * sweep capture only attaches an owned copy; it does not change that result.
+ * The source startree and its mappings must outlive the query. The query owns
+ * no mapped payload pointer. A successful zero-result query still returns a
+ * non-NULL context with count zero.
+ */
+typedef struct verify_index_query verify_index_query_t;
+
+int verify_query_hit(const startree_t* skdt,
+                     const double center[3],
+                     double radius2,
+                     verify_index_query_t** query);
+
+size_t verify_index_query_count(const verify_index_query_t* query);
+size_t verify_index_query_bytes(const verify_index_query_t* query);
+
+/*
+ * Return the exact mapped sweep element used by the indexed native result.
+ * The returned mapping remains owned by skdt. Callers may reorder or
+ * deduplicate physical ranges, but must not reorder the logical query result.
+ */
+int verify_index_query_sweep_range(const startree_t* skdt,
+                                   const verify_index_query_t* query,
+                                   size_t index,
+                                   const void** data,
+                                   size_t* size);
+
+/*
+ * Copy sweep values in native query-result order. This is intended to run
+ * after the ranges above have completed delivery. The copy is optional:
+ * continuation uses the authoritative mapped sweep when it is absent.
+ */
+int verify_index_query_capture_sweep(const startree_t* skdt,
+                                     verify_index_query_t* query);
+
+/*
+ * One caller-owned direct-read buffer for an exact range of the compute
+ * mapping. mapping_data is an address token in that mapping and is never
+ * dereferenced by the capture routine. bytes contains the corresponding
+ * contents. A buffer array must be ordered by mapping_data and must not
+ * overlap.
+ */
+typedef struct verify_mapped_page_buffer {
+    const void* mapping_data;
+    size_t size;
+    const unsigned char* bytes;
+} verify_mapped_page_buffer_t;
+
+/*
+ * Copy sweep values from fully read mapping-relative buffers in native query
+ * result order. The buffers remain caller-owned and are not retained. Every
+ * requested sweep byte must be covered; failure leaves query unchanged so
+ * the authoritative mapped fallback remains available.
+ */
+int verify_index_query_capture_sweep_buffers(
+    const startree_t* skdt,
+    verify_index_query_t* query,
+    const verify_mapped_page_buffer_t* buffers,
+    size_t buffer_count);
+
+void verify_destroy_index_query(verify_index_query_t* query);
+
+/*
  * Prepared verification separates index-backed input collection from the
  * index-free scoring kernel and the ordered MatchObj update.
  *
@@ -155,6 +219,30 @@ int verify_prepare_hit(const startree_t* skdt,
                        anbool distance_from_quad_bonus,
                        anbool fake_match,
                        verify_prepared_hit_t** prepared);
+
+/*
+ * Continue verification from one exact native StarKD query result.
+ *
+ * On success, this function consumes *query, sets it to NULL, and transfers
+ * its arrays into *prepared. On validation or allocation failure it leaves
+ * *query unchanged and caller-owned, sets *prepared to NULL, and returns -1.
+ */
+int verify_prepare_hit_from_query(const startree_t* skdt,
+                                  verify_index_query_t** query,
+                                  int index_cutnside,
+                                  const MatchObj* mo,
+                                  const sip_t* sip,
+                                  const verify_field_t* vf,
+                                  double verify_pix2,
+                                  double distractors,
+                                  double fieldW,
+                                  double fieldH,
+                                  double logratio_tobail,
+                                  double logratio_toaccept,
+                                  double logratio_tostoplooking,
+                                  anbool distance_from_quad_bonus,
+                                  anbool fake_match,
+                                  verify_prepared_hit_t** prepared);
 
 int verify_score_prepared_hit(const verify_prepared_hit_t* prepared,
                               verify_prepared_score_t* score);

@@ -440,7 +440,8 @@ int quadfile_prefetch_stars_submit(
     const unsigned int* quadids,
     int nquads,
     fitsbin_payload_io_ticket_t** ticket) {
-    fitsbin_prefetch_range_t ranges[32];
+    fitsbin_prefetch_range_t
+        ranges[FITSBIN_PREAD_ASYNC_RANGE_LIMIT];
     size_t row_size;
     size_t byte_budget;
     size_t per_range_budget;

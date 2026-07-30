@@ -91,6 +91,12 @@ typedef struct payload_ticket_wait_state {
     int result;
 } payload_ticket_wait_state_t;
 
+typedef struct payload_planned_state {
+    fitsbin_prefetch_range_t range;
+    int result;
+    int calls;
+} payload_planned_state_t;
+
 static payload_wrapper_state_t payload_wrapper = {
     PTHREAD_MUTEX_INITIALIZER,
     PTHREAD_COND_INITIALIZER,
@@ -250,6 +256,38 @@ static int payload_ticket_wait_helper(void* opaque) {
     pthread_cond_broadcast(&helper->condition);
     pthread_mutex_unlock(&helper->mutex);
     return 0;
+}
+
+static int payload_planned_ranges(
+    void* opaque,
+    fitsbin_payload_io_cancel_check_fn cancelled,
+    void* cancel_opaque,
+    fitsbin_prefetch_range_t* ranges,
+    size_t range_capacity,
+    size_t* range_count) {
+    payload_planned_state_t* state = opaque;
+
+    if (!state || !cancelled || !ranges || !range_count ||
+        !range_capacity) {
+        errno = EINVAL;
+        return -1;
+    }
+    state->calls++;
+    *range_count = 0U;
+    if (cancelled(cancel_opaque)) {
+        errno = ECANCELED;
+        return -1;
+    }
+    if (state->result < 0) {
+        errno = EIO;
+        return -1;
+    }
+    if (!state->result) {
+        return 0;
+    }
+    ranges[0] = state->range;
+    *range_count = 1U;
+    return 1;
 }
 
 static int payload_wait_helper_wait_for_calls(
@@ -1022,6 +1060,90 @@ void test_fitsbin_payload_async_mapped_population(CuTest* ct) {
     payload_fixture_close(&fixture);
 }
 
+void test_fitsbin_payload_deferred_mapped_plan(CuTest* ct) {
+    payload_fixture_t fixture;
+    fitsbin_payload_io_ticket_t* ticket = NULL;
+    fitsbin_payload_io_stats_t stats;
+    payload_planned_state_t plan;
+    int submitted;
+    int waited = -1;
+
+    CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
+    CuAssertIntEquals(
+        ct,
+        0,
+        fitsbin_configure_index_mmap(fixture.fitsbin));
+    memset(&plan, 0, sizeof(plan));
+    plan.range.data = fixture.chunk->data;
+    plan.range.size = sizeof(fixture.bytes);
+    plan.result = 1;
+    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
+    fitsbin_payload_io_configure_workers(2);
+    CuAssertIntEquals(
+        ct, 0, fitsbin_payload_io_service_start(1));
+
+    submitted = fitsbin_prefetch_ranges_planned_submit(
+        fixture.fitsbin,
+        payload_planned_ranges,
+        &plan,
+        1024U * 1024U,
+        &ticket);
+    if (ticket) {
+        waited = fitsbin_payload_io_ticket_wait(
+            fixture.fitsbin, ticket);
+        fitsbin_payload_io_ticket_destroy(ticket);
+        ticket = NULL;
+    }
+
+#if defined(MADV_POPULATE_READ)
+    CuAssertIntEquals(ct, 1, submitted);
+    CuAssert(ct, "deferred mapped plan failed", waited > 0);
+    CuAssertIntEquals(ct, 1, plan.calls);
+
+    plan.result = 0;
+    submitted = fitsbin_prefetch_ranges_planned_submit(
+        fixture.fitsbin,
+        payload_planned_ranges,
+        &plan,
+        1024U * 1024U,
+        &ticket);
+    waited = -1;
+    if (ticket) {
+        waited = fitsbin_payload_io_ticket_wait(
+            fixture.fitsbin, ticket);
+        fitsbin_payload_io_ticket_destroy(ticket);
+        ticket = NULL;
+    }
+    CuAssertIntEquals(ct, 1, submitted);
+    CuAssertIntEquals(ct, 1, waited);
+    CuAssertIntEquals(ct, 2, plan.calls);
+#else
+    CuAssertIntEquals(ct, 0, submitted);
+    CuAssertIntEquals(ct, -1, waited);
+    CuAssertIntEquals(ct, 0, plan.calls);
+#endif
+
+    fitsbin_payload_io_service_stop();
+    fitsbin_payload_io_configure_workers(1);
+    fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
+#if defined(MADV_POPULATE_READ)
+    CuAssertIntEquals(ct, 1, (int)stats.warm_calls);
+    CuAssert(ct, "deferred mapped plan reported no pages",
+             stats.warm_bytes > 0U);
+#else
+    CuAssertIntEquals(ct, 0, (int)stats.warm_calls);
+#endif
+    CuAssertIntEquals(ct, 0, (int)stats.failures);
+    CuAssert(
+        ct,
+        "deferred mapped plan changed payload bytes",
+        !memcmp((const unsigned char*)fixture.chunk->data,
+                fixture.bytes,
+                sizeof(fixture.bytes)));
+
+    payload_fixture_close(&fixture);
+}
+
 void test_fitsbin_payload_exact_range_order(CuTest* ct) {
     payload_fixture_t fixture;
     fitsbin_pread_range_t ranges[2];
@@ -1231,6 +1353,83 @@ void test_fitsbin_payload_async_direct_destination(CuTest* ct) {
     CuAssertIntEquals(ct, 20, (int)stats.read_logical_bytes);
     CuAssertIntEquals(ct, 0, (int)stats.warm_calls);
     CuAssertIntEquals(ct, 0, (int)stats.failures);
+
+    payload_fixture_close(&fixture);
+}
+
+void test_fitsbin_payload_async_mapping_boundary(CuTest* ct) {
+    payload_fixture_t fixture;
+    fitsbin_pread_range_t range;
+    fitsbin_payload_io_ticket_t* ticket = NULL;
+    unsigned char destination[64];
+    unsigned char expected[64];
+    size_t request_size;
+    size_t data_map_offset;
+    off_t expected_offset;
+    off_t observed_offset;
+    int submitted;
+    int waited = 0;
+    int calls;
+
+    CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
+    CuAssert(ct, "fixture has no file-backed mapping",
+             fixture.chunk->map && fixture.chunk->mapsize);
+    request_size = MIN(
+        sizeof(destination), fixture.chunk->mapsize);
+    CuAssert(ct, "fixture mapping is empty", request_size > 0U);
+    data_map_offset =
+        (size_t)((const unsigned char*)fixture.chunk->data -
+                 (const unsigned char*)fixture.chunk->map);
+    CuAssert(
+        ct,
+        "fixture mapping offset exceeds file payload offset",
+        fixture.chunk->data_file_offset >=
+            (off_t)data_map_offset);
+    expected_offset =
+        fixture.chunk->data_file_offset -
+            (off_t)data_map_offset;
+    memcpy(expected, fixture.chunk->map, request_size);
+    memset(destination, 0, sizeof(destination));
+    range.data = fixture.chunk->map;
+    range.size = request_size;
+    range.logical_size = request_size;
+    range.destination = destination;
+
+    fitsbin_payload_io_configure_workers(1);
+    CuAssertIntEquals(
+        ct, 0, fitsbin_payload_io_service_start(1));
+    payload_wrapper_reset(PAYLOAD_WRAPPER_RECORD);
+    submitted = fitsbin_pread_mapped_ranges_submit(
+        fixture.fitsbin,
+        &range,
+        1U,
+        request_size,
+        FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
+        &ticket);
+    if (ticket) {
+        waited = fitsbin_payload_io_ticket_wait(
+            fixture.fitsbin, ticket);
+        fitsbin_payload_io_ticket_destroy(ticket);
+        ticket = NULL;
+    }
+    pthread_mutex_lock(&payload_wrapper.mutex);
+    calls = payload_wrapper.calls;
+    observed_offset = payload_wrapper.offsets[0];
+    pthread_mutex_unlock(&payload_wrapper.mutex);
+    payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
+    fitsbin_payload_io_service_stop();
+
+    CuAssertIntEquals(ct, 1, submitted);
+    CuAssertIntEquals(ct, 1, waited);
+    CuAssertIntEquals(ct, 1, calls);
+    CuAssert(
+        ct,
+        "mapping-boundary read used the wrong file offset",
+        observed_offset == expected_offset);
+    CuAssert(
+        ct,
+        "mapping-boundary direct read returned wrong bytes",
+        !memcmp(destination, expected, request_size));
 
     payload_fixture_close(&fixture);
 }

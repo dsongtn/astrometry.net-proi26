@@ -837,6 +837,120 @@ int startree_prefetch_stars_submit(
         ticket);
 }
 
+int startree_prefetch_stars_ready_submit(
+    const startree_t* s,
+    const unsigned int* starids,
+    int nstars,
+    fitsbin_payload_io_ticket_t** ticket) {
+    fitsbin_prefetch_range_t
+        ranges[FITSBIN_MMAP_PREFETCH_RANGE_LIMIT];
+    fitsbin_t* fb;
+    size_t row_size;
+    size_t byte_budget;
+    size_t per_range_budget;
+    long detected_page_size;
+    int ndata;
+    int i;
+
+    if (!ticket) {
+        errno = EINVAL;
+        return -1;
+    }
+    *ticket = NULL;
+    if (!s || !s->tree || !starids || nstars <= 0 ||
+        !s->tree->io || !s->tree->io_is_fitsbin ||
+        !s->tree->data.any) {
+        return 0;
+    }
+    ndata = Ndata(s);
+    if (ndata <= 0) {
+        return 0;
+    }
+    if ((size_t)nstars > sizeof(ranges) / sizeof(ranges[0])) {
+        errno = E2BIG;
+        return -1;
+    }
+    if (s->tree->perm && !s->inverse_perm) {
+        errno = EAGAIN;
+        return 0;
+    }
+    detected_page_size = sysconf(_SC_PAGESIZE);
+    if (detected_page_size <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    row_size = kdtree_sizeof_data(s->tree) / (size_t)ndata;
+    if (!row_size || (size_t)detected_page_size >
+        (SIZE_MAX - row_size) / 2U) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    per_range_budget = row_size +
+        2U * (size_t)detected_page_size;
+    if ((size_t)nstars > SIZE_MAX / per_range_budget) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    byte_budget = (size_t)nstars * per_range_budget;
+    fb = s->tree->io;
+
+    for (i = 0; i < nstars; i++) {
+        unsigned int starid = starids[i];
+        int data_index;
+
+        if (starid >= (unsigned int)ndata) {
+            errno = EINVAL;
+            return -1;
+        }
+        data_index = s->inverse_perm
+            ? s->inverse_perm[starid]
+            : (int)starid;
+        if (data_index < 0 || data_index >= ndata) {
+            errno = EINVAL;
+            return -1;
+        }
+        ranges[i].data = kdtree_get_data(s->tree, data_index);
+        ranges[i].size = row_size;
+    }
+    return fitsbin_prefetch_ranges_submit(
+        fb,
+        ranges,
+        (size_t)nstars,
+        byte_budget,
+        ticket);
+}
+
+int startree_get_ready(
+    const startree_t* s,
+    int starid,
+    double* posn) {
+    int data_index;
+    int ndata;
+
+    if (!s || !s->tree || !posn) {
+        errno = EINVAL;
+        return -1;
+    }
+    ndata = Ndata(s);
+    if (starid < 0 || starid >= ndata) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (s->tree->perm && !s->inverse_perm) {
+        errno = EAGAIN;
+        return -1;
+    }
+    data_index = s->inverse_perm
+        ? s->inverse_perm[starid]
+        : starid;
+    if (data_index < 0 || data_index >= ndata) {
+        errno = EINVAL;
+        return -1;
+    }
+    kdtree_copy_data_double(s->tree, data_index, 1, posn);
+    return 0;
+}
+
 #define STARTREE_MAPPED_ADVICE_RANGE_LIMIT 256U
 
 int startree_advise_rows(startree_t* s,

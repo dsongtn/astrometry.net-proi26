@@ -4220,7 +4220,7 @@ static anbool MANGLE(kdtree_prefetch_size_mul)
     return TRUE;
 }
 
-static void MANGLE(kdtree_prefetch_emit_hint)
+static int MANGLE(kdtree_prefetch_emit_hint)
      (const kdtree_t *kd,
       const void *address,
       size_t length,
@@ -4228,6 +4228,7 @@ static void MANGLE(kdtree_prefetch_emit_hint)
       unsigned int priority,
       const kdtree_prefetch_sink_t *sink) {
     kdtree_prefetch_hint_t hint;
+    int status;
 
     if (!kd ||
         !kd->io ||
@@ -4235,7 +4236,7 @@ static void MANGLE(kdtree_prefetch_emit_hint)
         !length ||
         !sink ||
         !sink->emit) {
-        return;
+        return KDTREE_PREFETCH_EMIT_ERROR;
     }
 
     memset(&hint, 0, sizeof(hint));
@@ -4246,14 +4247,17 @@ static void MANGLE(kdtree_prefetch_emit_hint)
     hint.kind = kind;
     hint.priority = priority;
 
-    /*
-     * Prefetch is strictly advisory. Rejection or failure must never change
-     * solver correctness or range-search semantics.
-     */
-    (void)sink->emit(sink->userdata, &hint);
+    status = sink->emit(sink->userdata, &hint);
+    if (status < 0) {
+        return KDTREE_PREFETCH_EMIT_ERROR;
+    }
+    if (status > 0) {
+        return KDTREE_PREFETCH_EMIT_REFUSED;
+    }
+    return KDTREE_PREFETCH_EMIT_CONTINUE;
 }
 
-static void MANGLE(kdtree_prefetch_emit_leaf_metadata)
+static int MANGLE(kdtree_prefetch_emit_leaf_metadata)
      (const kdtree_t *kd,
       int nodeid,
       const kdtree_prefetch_sink_t *sink) {
@@ -4264,7 +4268,7 @@ static void MANGLE(kdtree_prefetch_emit_leaf_metadata)
 
     if (!kd || !kd->lr || kd->has_linear_lr ||
         !MANGLE(kdtree_product_valid_leaf_node)(kd, nodeid)) {
-        return;
+        return KDTREE_PREFETCH_EMIT_CONTINUE;
     }
 
     leafid = nodeid - kd->ninterior;
@@ -4274,10 +4278,10 @@ static void MANGLE(kdtree_prefetch_emit_leaf_metadata)
         lr_count <= 0 || lr_count > kd->nbottom - first_lr ||
         !MANGLE(kdtree_prefetch_size_mul)
             ((size_t)lr_count, sizeof(*kd->lr), &lr_bytes)) {
-        return;
+        return KDTREE_PREFETCH_EMIT_CONTINUE;
     }
 
-    MANGLE(kdtree_prefetch_emit_hint)
+    return MANGLE(kdtree_prefetch_emit_hint)
         (kd,
          kd->lr + first_lr,
          lr_bytes,
@@ -4299,7 +4303,7 @@ static int MANGLE(kdtree_prefetch_emit_payload)
 
     if (!MANGLE(kdtree_product_valid_data_range)(kd, L, R) ||
         D <= 0) {
-        return -1;
+        return KDTREE_PREFETCH_EMIT_ERROR;
     }
 
     count = (size_t)(R - L + 1);
@@ -4308,51 +4312,62 @@ static int MANGLE(kdtree_prefetch_emit_payload)
                 (count, (size_t)D, &coordinates) ||
             !MANGLE(kdtree_prefetch_size_mul)
                 (coordinates, sizeof(dtype), &data_bytes)) {
-            return -1;
+            return KDTREE_PREFETCH_EMIT_ERROR;
         }
-        MANGLE(kdtree_prefetch_emit_hint)
+        int emit_status = MANGLE(kdtree_prefetch_emit_hint)
             (kd,
              KD_DATA(kd, D, L),
              data_bytes,
              KDTREE_PREFETCH_ARRAY_DATA,
              KDTREE_PREFETCH_PRIORITY_LEAF,
              sink);
+        if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+            return emit_status;
+        }
     }
 
     if (kd->perm) {
         if (!MANGLE(kdtree_prefetch_size_mul)
                 (count, sizeof(*kd->perm), &perm_bytes)) {
-            return -1;
+            return KDTREE_PREFETCH_EMIT_ERROR;
         }
-        MANGLE(kdtree_prefetch_emit_hint)
+        int emit_status = MANGLE(kdtree_prefetch_emit_hint)
             (kd,
              kd->perm + L,
              perm_bytes,
              KDTREE_PREFETCH_ARRAY_PERM,
              KDTREE_PREFETCH_PRIORITY_LEAF,
              sink);
+        if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+            return emit_status;
+        }
     }
-    return 0;
+    return KDTREE_PREFETCH_EMIT_CONTINUE;
 }
 
-static void MANGLE(kdtree_prefetch_emit_split_metadata)
+static int MANGLE(kdtree_prefetch_emit_split_metadata)
      (const kdtree_t *kd,
       int nodeid,
       const kdtree_prefetch_sink_t *sink) {
+    int emit_status;
+
     if (!kd || !kd->split.any || nodeid < 0 ||
         nodeid >= kd->ninterior) {
-        return;
+        return KDTREE_PREFETCH_EMIT_CONTINUE;
     }
 
-    MANGLE(kdtree_prefetch_emit_hint)
+    emit_status = MANGLE(kdtree_prefetch_emit_hint)
         (kd,
          KD_SPLIT(kd, nodeid),
          sizeof(ttype),
          KDTREE_PREFETCH_ARRAY_SPLIT,
          KDTREE_PREFETCH_PRIORITY_METADATA,
          sink);
+    if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+        return emit_status;
+    }
     if (kd->splitdim) {
-        MANGLE(kdtree_prefetch_emit_hint)
+        emit_status = MANGLE(kdtree_prefetch_emit_hint)
             (kd,
              kd->splitdim + nodeid,
              sizeof(*kd->splitdim),
@@ -4360,9 +4375,10 @@ static void MANGLE(kdtree_prefetch_emit_split_metadata)
              KDTREE_PREFETCH_PRIORITY_METADATA,
              sink);
     }
+    return emit_status;
 }
 
-static void MANGLE(kdtree_prefetch_emit_bbox_metadata)
+static int MANGLE(kdtree_prefetch_emit_bbox_metadata)
      (const kdtree_t *kd,
       int D,
       int nodeid,
@@ -4376,10 +4392,10 @@ static void MANGLE(kdtree_prefetch_emit_bbox_metadata)
             ((size_t)D, 2U, &coordinates) ||
         !MANGLE(kdtree_prefetch_size_mul)
             (coordinates, sizeof(ttype), &bbox_bytes)) {
-        return;
+        return KDTREE_PREFETCH_EMIT_CONTINUE;
     }
 
-    MANGLE(kdtree_prefetch_emit_hint)
+    return MANGLE(kdtree_prefetch_emit_hint)
         (kd,
          LOW_HR(kd, D, nodeid),
          bbox_bytes,
@@ -4424,12 +4440,13 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
     bigttype bigtl2 = 0;
     const etype *query = vquery;
 
-    if (!kd || !query || !sink) {
-        return -1;
+    if (!kd || !query || !sink ||
+        !sink->emit || !sink->enabled) {
+        return KDTREE_PREFETCH_PREPARE_ERROR;
     }
-    if (!kd->io || !sink->emit || !sink->enabled ||
+    if (!kd->io ||
         !sink->enabled(sink->userdata, kd->io)) {
-        return 0;
+        return KDTREE_PREFETCH_PREPARE_NOT_APPLICABLE;
     }
 
 #if defined(KD_DIM)
@@ -4439,7 +4456,7 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
     D = kd->ndim;
 #endif
     if (D <= 0 || D > KDTREE_MAX_DIM) {
-        return -1;
+        return KDTREE_PREFETCH_PREPARE_ERROR;
     }
 
     do_wholenode_check = !(options & KD_OPTIONS_SMALL_RADIUS);
@@ -4453,7 +4470,7 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
 
     if (!kd->split.any) {
         if (!kd->bb.any) {
-            return 0;
+            return KDTREE_PREFETCH_PREPARE_NOT_APPLICABLE;
         }
         use_bboxes = TRUE;
     } else if (kd->bb.any &&
@@ -4500,19 +4517,28 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
         int L;
         int R;
         ttype split = 0;
+        int emit_status;
 
         if (!MANGLE(kdtree_product_valid_node)(kd, nodeid)) {
-            return -1;
+            return KDTREE_PREFETCH_PREPARE_ERROR;
         }
 
         if (KD_IS_LEAF(kd, nodeid)) {
-            MANGLE(kdtree_prefetch_emit_leaf_metadata)
+            emit_status = MANGLE(kdtree_prefetch_emit_leaf_metadata)
                 (kd, nodeid, sink);
+            if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+                return emit_status < 0
+                    ? KDTREE_PREFETCH_PREPARE_ERROR
+                    : KDTREE_PREFETCH_PREPARE_REFUSED;
+            }
             L = kdtree_left(kd, nodeid);
             R = kdtree_right(kd, nodeid);
-            if (MANGLE(kdtree_prefetch_emit_payload)
-                    (kd, D, L, R, sink)) {
-                return -1;
+            emit_status = MANGLE(kdtree_prefetch_emit_payload)
+                (kd, D, L, R, sink);
+            if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+                return emit_status < 0
+                    ? KDTREE_PREFETCH_PREPARE_ERROR
+                    : KDTREE_PREFETCH_PREPARE_REFUSED;
             }
             continue;
         }
@@ -4526,11 +4552,16 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
             ttype *thi = NULL;
             anbool wholenode = FALSE;
 
-            MANGLE(kdtree_prefetch_emit_bbox_metadata)
+            emit_status = MANGLE(kdtree_prefetch_emit_bbox_metadata)
                 (kd, D, nodeid, sink);
+            if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+                return emit_status < 0
+                    ? KDTREE_PREFETCH_PREPARE_ERROR
+                    : KDTREE_PREFETCH_PREPARE_REFUSED;
+            }
             if (!bboxes(kd, nodeid, &tlo, &thi, D) ||
                 !tlo || !thi) {
-                return -1;
+                return KDTREE_PREFETCH_PREPARE_ERROR;
             }
 
             if (do_precheck && nodeid) {
@@ -4611,9 +4642,12 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
             if (wholenode) {
                 L = kdtree_left(kd, nodeid);
                 R = kdtree_right(kd, nodeid);
-                if (MANGLE(kdtree_prefetch_emit_payload)
-                        (kd, D, L, R, sink)) {
-                    return -1;
+                emit_status = MANGLE(kdtree_prefetch_emit_payload)
+                    (kd, D, L, R, sink);
+                if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+                    return emit_status < 0
+                        ? KDTREE_PREFETCH_PREPARE_ERROR
+                        : KDTREE_PREFETCH_PREPARE_REFUSED;
                 }
                 continue;
             }
@@ -4624,16 +4658,21 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
                 MANGLE(kdtree_product_push_node)
                     (kd, nodestack, &stackpos,
                      KD_CHILD_RIGHT(nodeid))) {
-                return -1;
+                return KDTREE_PREFETCH_PREPARE_ERROR;
             }
             continue;
         }
 
         if (!use_splits) {
-            return -1;
+            return KDTREE_PREFETCH_PREPARE_ERROR;
         }
-        MANGLE(kdtree_prefetch_emit_split_metadata)
+        emit_status = MANGLE(kdtree_prefetch_emit_split_metadata)
             (kd, nodeid, sink);
+        if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+            return emit_status < 0
+                ? KDTREE_PREFETCH_PREPARE_ERROR
+                : KDTREE_PREFETCH_PREPARE_REFUSED;
+        }
         split = *KD_SPLIT(kd, nodeid);
         if (!kd->splitdim && TTYPE_INTEGER) {
             bigint tmpsplit = split;
@@ -4642,7 +4681,7 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
             split = tmpsplit & kd->splitmask;
         }
         if (dim < 0 || dim >= D) {
-            return -1;
+            return KDTREE_PREFETCH_PREPARE_ERROR;
         }
 
         if (TTYPE_INTEGER && use_tsplit) {
@@ -4650,25 +4689,25 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
                 if (MANGLE(kdtree_product_push_node)
                         (kd, nodestack, &stackpos,
                          KD_CHILD_LEFT(nodeid))) {
-                    return -1;
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
                 }
                 if (split - tquery[dim] <= tlinf &&
                     MANGLE(kdtree_product_push_node)
                         (kd, nodestack, &stackpos,
                          KD_CHILD_RIGHT(nodeid))) {
-                    return -1;
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
                 }
             } else {
                 if (MANGLE(kdtree_product_push_node)
                         (kd, nodestack, &stackpos,
                          KD_CHILD_RIGHT(nodeid))) {
-                    return -1;
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
                 }
                 if (tquery[dim] - split <= tlinf &&
                     MANGLE(kdtree_product_push_node)
                         (kd, nodestack, &stackpos,
                          KD_CHILD_LEFT(nodeid))) {
-                    return -1;
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
                 }
             }
         } else {
@@ -4678,31 +4717,31 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
                 if (MANGLE(kdtree_product_push_node)
                         (kd, nodestack, &stackpos,
                          KD_CHILD_LEFT(nodeid))) {
-                    return -1;
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
                 }
                 if (rsplit - query[dim] <= maxdist &&
                     MANGLE(kdtree_product_push_node)
                         (kd, nodestack, &stackpos,
                          KD_CHILD_RIGHT(nodeid))) {
-                    return -1;
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
                 }
             } else {
                 if (MANGLE(kdtree_product_push_node)
                         (kd, nodestack, &stackpos,
                          KD_CHILD_RIGHT(nodeid))) {
-                    return -1;
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
                 }
                 if (query[dim] - rsplit <= maxdist &&
                     MANGLE(kdtree_product_push_node)
                         (kd, nodestack, &stackpos,
                          KD_CHILD_LEFT(nodeid))) {
-                    return -1;
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
                 }
             }
         }
     }
 
-    return 0;
+    return KDTREE_PREFETCH_PREPARE_COMPLETE;
 }
 static void MANGLE(kdtree_product_task_run)(void *userdata) {
   kdtree_product_task_t *task = userdata;

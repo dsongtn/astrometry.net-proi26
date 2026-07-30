@@ -287,6 +287,23 @@ typedef struct fitsbin_prefetch_range {
 typedef struct fitsbin_payload_io_ticket
     fitsbin_payload_io_ticket_t;
 
+typedef anbool (*fitsbin_payload_io_cancel_check_fn)(void* opaque);
+
+/*
+ * Construct one complete mapped-range plan on an I/O lane in provider-owned
+ * storage. The callback is bounded and nonblocking: it must not enter or wait
+ * on the payload provider. Return one for a complete nonempty plan, zero for
+ * a complete logical operation requiring no mapped population, and minus one
+ * for failure. Cancellation is authoritative only through cancelled().
+ */
+typedef int (*fitsbin_payload_io_plan_fn)(
+    void* opaque,
+    fitsbin_payload_io_cancel_check_fn cancelled,
+    void* cancel_opaque,
+    fitsbin_prefetch_range_t* ranges,
+    size_t range_capacity,
+    size_t* range_count);
+
 /*
  * Loader dequeue order is demand, current-index preparation, then
  * speculation. Non-demand admission leaves one job and one quarter of the
@@ -332,6 +349,29 @@ void fitsbin_payload_io_service_stop(void);
 
 /* Return the live loader width, or zero while the service is unavailable. */
 int fitsbin_payload_io_service_width(void);
+
+/* Return nonzero when mapped-page population is compiled into the loader. */
+int fitsbin_payload_io_mapped_population_supported(void);
+
+/*
+ * One process-wide scheduler wakeup for terminal payload tickets. The
+ * immutable completion ID is unique for the lifetime of the process and lets
+ * a scheduler wake only the task that owns the completed ticket. The notifier
+ * runs after the payload mutex is released, must remain bounded, and must not
+ * perform payload I/O or wait for the payload service. It may briefly
+ * synchronize with scheduler state. Clearing waits for active notifier calls
+ * and must not be called by the notifier itself.
+ */
+typedef void (*fitsbin_payload_io_completion_notify_fn)(
+    void* opaque,
+    unsigned long long completion_id);
+
+int fitsbin_payload_io_set_completion_notifier(
+    fitsbin_payload_io_completion_notify_fn notify,
+    void* opaque);
+int fitsbin_payload_io_clear_completion_notifier(
+    fitsbin_payload_io_completion_notify_fn notify,
+    void* opaque);
 
 /*
  * Cheap advisory predicate for optional work that may compete with payload
@@ -381,6 +421,8 @@ typedef struct fitsbin_pread_range {
 #define FITSBIN_PREAD_RANGE_LIMIT 16U
 /* Direct async tickets own up to this many prepared range records. */
 #define FITSBIN_PREAD_ASYNC_RANGE_LIMIT 256U
+/* Mapped population accepts this many logical ranges before page deduplication. */
+#define FITSBIN_MMAP_PREFETCH_RANGE_LIMIT 640U
 
 /*
  * Resolve the file-page covering interval for one exact mapped request.
@@ -418,12 +460,16 @@ int fitsbin_pread_mapped_ranges(
  * Return 1 when queued, zero when bounded service capacity is unavailable,
  * and -1 for invalid input or failed preparation. After a return of 1, every
  * destination must remain allocated and inaccessible to the caller until
- * ticket_wait() or ticket_cancel_and_wait() returns. Only a positive wait
- * result permits publication; failure or cancellation invalidates the whole
- * batch even when some destination bytes were written. Disjoint destinations
- * may be read in file-offset order; overlapping destinations retain caller
- * order. The source fitsbin must remain live through the wait so operation
- * counters can be applied.
+ * ticket_wait(), ticket_cancel_and_wait(), or a terminal ticket_poll(). Only
+ * a positive collected result permits publication; failure or cancellation
+ * invalidates the whole batch even when some destination bytes were written.
+ * Disjoint destinations may be read in file-offset order; overlapping
+ * destinations retain caller order. The source fitsbin must remain live
+ * through collection so operation counters can be applied.
+ *
+ * On a zero return, errno is ENODEV when the service is unavailable, EAGAIN
+ * when current queue occupancy prevents admission, and E2BIG when the
+ * unchanged ticket can never fit the service byte ceiling.
  */
 int fitsbin_pread_mapped_ranges_submit(
     fitsbin_t* fb,
@@ -463,14 +509,16 @@ int fitsbin_prefetch_ranges(
 /*
  * Submit one complete current-index mapped-page population to the bounded
  * loader. The source must first be initialized by
- * fitsbin_configure_index_mmap(). The loader retains validated page-aligned
- * spans and their fitsbin owner until the ticket reaches a terminal state.
+ * fitsbin_configure_index_mmap(). The ticket copies validated page-aligned
+ * spans but borrows the fitsbin owner and its mappings.
  *
  * Return 1 when queued, zero when the optional service or bounded capacity is
  * unavailable, and -1 for an invalid or failed preparation. The caller must
- * keep every source mapping live and wait (or cancel and wait) before closing
- * the source fitsbin. A fully resident source returns zero without creating a
- * ticket.
+ * keep every source mapping live through blocking or polled collection before
+ * closing the source fitsbin. A fully resident source returns zero without
+ * creating a ticket. On a zero return caused by the service, errno
+ * distinguishes ENODEV, transient admission refusal EAGAIN, and permanent
+ * size refusal E2BIG.
  */
 int fitsbin_prefetch_ranges_submit(
     fitsbin_t* fb,
@@ -480,17 +528,74 @@ int fitsbin_prefetch_ranges_submit(
     fitsbin_payload_io_ticket_t** ticket);
 
 /*
+ * Submit a bounded mapped-population ticket whose exact ranges are planned on
+ * the I/O lane. byte_budget is reserved at admission; actual mapped bytes are
+ * recorded after the callback completes. plan_opaque and every object it can
+ * reach must remain alive and exclusively owned by the ticket until terminal
+ * collection. An empty successful plan collects as a positive logical result
+ * and does not increment mapped-warm counters. Refusal and failure leave the
+ * native mapped path authoritative.
+ */
+int fitsbin_prefetch_ranges_planned_submit(
+    fitsbin_t* fb,
+    fitsbin_payload_io_plan_fn plan,
+    void* plan_opaque,
+    size_t byte_budget,
+    fitsbin_payload_io_ticket_t** ticket);
+
+/*
  * Wait for one ticket and apply operation-specific I/O counters to the
  * still-live fitsbin. A failed or cancelled operation leaves the original
  * synchronous solver path valid. A direct ticket returns its range count only
- * after every destination is complete. destroy() is valid only after one of
- * the wait functions.
+ * after every destination is complete. destroy() is valid only after blocking
+ * or polled collection. The exact source passed at submission must remain
+ * live and must be passed again when collecting the ticket.
  */
 int fitsbin_payload_io_ticket_wait(
     fitsbin_t* fb,
     fitsbin_payload_io_ticket_t* ticket);
 int fitsbin_payload_io_ticket_cancel_and_wait(
     fitsbin_t* fb,
+    fitsbin_payload_io_ticket_t* ticket);
+
+/*
+ * Poll one ticket without waiting. Return one when terminal and place the
+ * ordinary wait result in result_out, zero while pending, and minus one for
+ * invalid or already-collected input. A terminal poll applies counters and
+ * must be followed by exactly one checked destroy. A terminal failure is
+ * reported as a successful poll with result_out set to -1 and errno set to
+ * the I/O failure.
+ */
+int fitsbin_payload_io_ticket_poll(
+    fitsbin_t* fb,
+    fitsbin_payload_io_ticket_t* ticket,
+    int* result_out);
+
+/*
+ * Request cancellation without waiting or applying counters. Return one for
+ * a new request, zero when already requested or terminal, and minus one for
+ * invalid input. Queued tickets become terminal immediately; running tickets
+ * complete cancellation at their next bounded polling point.
+ */
+int fitsbin_payload_io_ticket_cancel_async(
+    fitsbin_payload_io_ticket_t* ticket);
+
+/*
+ * Return the immutable nonzero completion ID assigned at successful
+ * submission, or zero for invalid or unpublished input. The caller must
+ * still own the live ticket.
+ */
+unsigned long long fitsbin_payload_io_ticket_completion_id(
+    const fitsbin_payload_io_ticket_t* ticket);
+
+/*
+ * Destroy a terminal, collected ticket. A failure returns minus one with
+ * errno set to EBUSY for pending or actively waited tickets, or EAGAIN when
+ * terminal counters have not been collected. Ticket operations, collection,
+ * and destruction require exclusive caller serialization. The legacy void
+ * wrapper preserves its original silent no-op behavior.
+ */
+int fitsbin_payload_io_ticket_destroy_checked(
     fitsbin_payload_io_ticket_t* ticket);
 void fitsbin_payload_io_ticket_destroy(
     fitsbin_payload_io_ticket_t* ticket);

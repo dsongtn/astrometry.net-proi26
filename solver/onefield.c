@@ -2356,6 +2356,7 @@ static int onefield_index_shard_solve_preprocessed_field(onefield_t *local_bp) {
   MatchObj template;
   qfits_header *fieldhdr;
   double field_wall_start;
+  anbool interrupted_by_parallel_stop = FALSE;
   int fieldnum = local_bp->fieldnum;
 
   if (!sp->fieldxy_orig || !sp->fieldxy || !sp->vf) {
@@ -2397,6 +2398,18 @@ static int onefield_index_shard_solve_preprocessed_field(onefield_t *local_bp) {
     local_bp->solver_failed = TRUE;
   }
 
+  /*
+   * A losing owner can observe the pass stop while unwinding from solver_run.
+   * Its partial traversal is not a completed scientific "did not solve"
+   * result. Preserve the ordinary per-index report for completed work and
+   * local user/limit cancellation, but omit this one misleading observation.
+   */
+  interrupted_by_parallel_stop =
+      index_shard_worker_stop_requested() &&
+      !local_bp->cancelled &&
+      !local_bp->hit_total_timelimit &&
+      !local_bp->hit_total_cpulimit;
+
   sp->mo_template = NULL;
   sp->record_match_callback = NULL;
   sp->timer_callback = NULL;
@@ -2422,33 +2435,34 @@ static int onefield_index_shard_solve_preprocessed_field(onefield_t *local_bp) {
           sp->nummatches);
 
   if (sp->maxquads && sp->numtries >= sp->maxquads) {
-    logverb("  exceeded the number of quads to try: %i >= %i.\n",
+    logmsg("  exceeded the number of quads to try: %i >= %i.\n",
            sp->numtries,
            sp->maxquads);
   }
   if (sp->maxmatches && sp->nummatches >= sp->maxmatches) {
-    logverb("  exceeded the number of quads to match: %i >= %i.\n",
+    logmsg("  exceeded the number of quads to match: %i >= %i.\n",
            sp->nummatches,
            sp->maxmatches);
   }
   if (local_bp->cancelled) {
-    logverb("  cancelled at user request.\n");
+    logmsg("  cancelled at user request.\n");
   }
 
   if (sp->best_match_solves) {
     local_bp->single_field_solved = TRUE;
-  } else if (sp->index && sp->index->indexname) {
+  } else if (!interrupted_by_parallel_stop &&
+             sp->index && sp->index->indexname) {
     char *copy = strdup_safe(sp->index->indexname);
     char *base = basename(copy);
 
     if (sp->endobj) {
-      logverb("Field %i did not solve (index %s, field objects %i-%i).\n",
+      logerr("Field %i did not solve (index %s, field objects %i-%i).\n",
              fieldnum,
              base,
              sp->startobj + 1,
              sp->endobj);
     } else {
-      logverb("Field %i did not solve (index %s).\n",
+      logerr("Field %i did not solve (index %s).\n",
              fieldnum,
              base);
     }
@@ -2460,8 +2474,8 @@ static int onefield_index_shard_solve_preprocessed_field(onefield_t *local_bp) {
     } else {
       logverb("Best odds encountered: %g\n", exp(sp->best_logodds));
     }
-  } else {
-    logverb("Field %i did not solve.\n", fieldnum);
+  } else if (!interrupted_by_parallel_stop) {
+    logerr("Field %i did not solve.\n", fieldnum);
   }
 
   return 0;
@@ -3507,13 +3521,8 @@ static anbool record_match_callback(MatchObj* mo, void* userdata) {
 
     bp->nsolves_sofar++;
     if (bp->nsolves_sofar < bp->nsolves) {
-        if (index_shard_worker_context_active()) {
-            logverb("[index-shard] worker found solution %i of %i required.\n",
-                    bp->nsolves_sofar, bp->nsolves);
-        } else {
-            logmsg("Found a quad that solves the image; that makes %i of %i required.\n",
-                   bp->nsolves_sofar, bp->nsolves);
-        }
+        logmsg("Found a quad that solves the image; that makes %i of %i required.\n",
+               bp->nsolves_sofar, bp->nsolves);
     } else {
         if (!index_shard_worker_context_active()) {
             if (bp->solver.index) {

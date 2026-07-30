@@ -53,6 +53,7 @@ typedef struct {
                                       size_t bytes,
                                       anbool allocated);
     void* inverse_callback_opaque;
+
 } startree_t;
 
 startree_t* startree_open(const char* fn);
@@ -228,6 +229,23 @@ int startree_prefetch_stars_submit(
     const unsigned int* starids,
     int nstars,
     fitsbin_payload_io_ticket_t** ticket);
+
+/*
+ * Submit exact StarKD rows only when canonical IDs already have an immutable
+ * data-index mapping. Unlike startree_prefetch_stars_submit(), this helper
+ * never constructs or publishes the lazy inverse permutation.
+ */
+int startree_prefetch_stars_ready_submit(
+    const startree_t* s,
+    const unsigned int* starids,
+    int nstars,
+    fitsbin_payload_io_ticket_t** ticket);
+
+/* Copy one row without constructing the lazy inverse permutation. */
+int startree_get_ready(
+    const startree_t* s,
+    int starid,
+    double* posn);
 
 /*
  * Advise mapped coordinate rows for selected canonical star IDs. If a tree

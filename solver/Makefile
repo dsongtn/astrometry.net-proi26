@@ -418,6 +418,8 @@ test-solver: test-solver.o solver_test.o $(SLIB)
 test-solver-2: test-solver-2.o solver_test_2.o $(SLIB)
 test-engine-passes: test-engine-passes.o $(SLIB)
 test-index-shard-config: test-index-shard-config.o index_shard_config.o
+test-index-shard-staged: test-index-shard-staged.o \
+		index_shard_staged_test.o $(SLIB)
 test-ab-block-integration: test-ab-block-integration.o $(SLIB)
 test-ab-stream-integration: test-ab-block-integration.o \
 		$(AB_STREAM_TEST_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
@@ -472,11 +474,13 @@ NODEP_OBJS += solver_test.o solver_test_2.o \
 	index_shard_ab_no_geometry.o \
 	solver_ab_allocfail_test.o solver_ab_allocfail_asan.o \
 	solver_ab_allocfail_tsan.o \
-	test_ab_integration_asan.o test_ab_integration_tsan.o
+	test_ab_integration_asan.o test_ab_integration_tsan.o \
+	index_shard_staged_test.o
 ALL_OBJ += test-solver.o test-solver-2.o test-engine-passes.o \
-	test-index-shard-config.o test-ab-block-integration.o
+	test-index-shard-config.o test-index-shard-staged.o \
+	test-ab-block-integration.o
 ALL_EXECS += test-index-shard-config test-ab-block-integration \
-	test-engine-passes \
+	test-index-shard-staged test-engine-passes \
 	test-ab-stream-integration test-ab-stream-asan test-ab-stream-tsan \
 	test-ab-allocfail-integration test-ab-allocfail-asan \
 	test-ab-allocfail-tsan \
@@ -496,6 +500,9 @@ test-solver-2.o: test-solver-2.c
 	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -o $@ -c $<
 test-engine-passes.o: test-engine-passes.c engine_internal.h
 	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -o $@ -c $<
+index_shard_staged_test.o: index_shard.c $(CORE_STATE_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-DTESTING_INDEX_SHARD_STAGED=1 -o $@ -c $<
 
 solver_test.o: solver.c
 	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -DTESTING=1 -DTESTING_TRYALLCODES=1 -o $@ -c $<
@@ -524,6 +531,7 @@ ALL_TEST_LIBS := $(SLIB)
 #test_multiindex2: test_multiindex2.o $(SLIB)
 
 tests: $(ALL_TEST_FILES) test-index-shard-config \
+	test-index-shard-staged \
 	test-engine-passes test-ab-block-integration
 .PHONY: tests
 

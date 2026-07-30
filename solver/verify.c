@@ -39,9 +39,13 @@ extern index_shard_helper_run_status_t index_shard_helper_run(
     index_shard_helper_task_t* tasks,
     size_t task_count,
     index_shard_helper_run_stats_t* stats) __attribute__((weak));
+extern anbool index_shard_worker_stop_requested(void)
+    __attribute__((weak));
 #define VERIFY_PROJECTION_HELPERS_LINKED 1
+#define VERIFY_STOP_CHECK_LINKED 1
 #else
 #define VERIFY_PROJECTION_HELPERS_LINKED 0
+#define VERIFY_STOP_CHECK_LINKED 0
 #endif
 
 #if DEBUGVERIFY
@@ -95,6 +99,16 @@ typedef enum verify_prepared_state {
     VERIFY_PREPARED_EMPTY_LISTS = 4
 } verify_prepared_state_t;
 
+struct verify_index_query {
+    const startree_t* source;
+    double center[3];
+    double radius2;
+    double* refxyz;
+    int* refstarid;
+    uint8_t* sweep;
+    int nrall;
+};
+
 struct verify_prepared_hit {
     verify_t verify;
     sip_t wcs;
@@ -108,6 +122,281 @@ struct verify_prepared_hit {
     verify_prepared_state_t state;
     anbool fake_match;
 };
+
+int verify_query_hit(const startree_t* skdt,
+                     const double center[3],
+                     double radius2,
+                     verify_index_query_t** query) {
+    verify_index_query_t* result;
+
+    if (!query) {
+        return -1;
+    }
+    *query = NULL;
+    if (!skdt || !center || !skdt->tree || !skdt->sweep) {
+        return -1;
+    }
+    result = calloc(1, sizeof(*result));
+    if (!result) {
+        return -1;
+    }
+    result->source = skdt;
+    memcpy(result->center, center, sizeof(result->center));
+    result->radius2 = radius2;
+    startree_search_for(skdt, center, radius2,
+                        &result->refxyz, NULL,
+                        &result->refstarid, &result->nrall);
+    if (result->nrall < 0 ||
+        (result->nrall &&
+         (!result->refxyz || !result->refstarid)) ||
+        (!result->nrall &&
+         (result->refxyz || result->refstarid))) {
+        verify_destroy_index_query(result);
+        return -1;
+    }
+    *query = result;
+    return 0;
+}
+
+size_t verify_index_query_count(const verify_index_query_t* query) {
+    if (!query || query->nrall <= 0) {
+        return 0U;
+    }
+    return (size_t)query->nrall;
+}
+
+size_t verify_index_query_bytes(const verify_index_query_t* query) {
+    size_t count;
+    size_t total;
+
+    if (!query || query->nrall < 0) {
+        return 0U;
+    }
+    count = (size_t)query->nrall;
+    total = sizeof(*query);
+    if (count > (SIZE_MAX - total) / (3U * sizeof(double))) {
+        return SIZE_MAX;
+    }
+    total += count * 3U * sizeof(double);
+    if (count > (SIZE_MAX - total) / sizeof(int)) {
+        return SIZE_MAX;
+    }
+    total += count * sizeof(int);
+    if (count > (SIZE_MAX - total) / sizeof(*query->sweep)) {
+        return SIZE_MAX;
+    }
+    total += count * sizeof(*query->sweep);
+    return total;
+}
+
+int verify_index_query_sweep_range(const startree_t* skdt,
+                                   const verify_index_query_t* query,
+                                   size_t index,
+                                   const void** data,
+                                   size_t* size) {
+    int starid;
+
+    if (!data || !size) {
+        return -1;
+    }
+    *data = NULL;
+    *size = 0U;
+    if (!skdt || !query || query->source != skdt ||
+        !skdt->tree || !skdt->sweep ||
+        query->nrall < 0 ||
+        index >= (size_t)query->nrall ||
+        !query->refstarid) {
+        return -1;
+    }
+    starid = query->refstarid[index];
+    if (starid < 0 || starid >= startree_N(skdt)) {
+        return -1;
+    }
+    *data = skdt->sweep + starid;
+    *size = sizeof(*skdt->sweep);
+    return 0;
+}
+
+int verify_index_query_capture_sweep(const startree_t* skdt,
+                                     verify_index_query_t* query) {
+    uint8_t* sweep;
+    size_t count;
+    int nstars;
+    int i;
+
+    if (!skdt || !query || query->source != skdt ||
+        !skdt->tree || !skdt->sweep ||
+        query->nrall < 0 ||
+        (query->nrall && !query->refstarid)) {
+        return -1;
+    }
+    if (query->sweep || !query->nrall) {
+        return 0;
+    }
+    count = (size_t)query->nrall;
+    nstars = startree_N(skdt);
+    for (i = 0; i < query->nrall; i++) {
+        if (query->refstarid[i] < 0 ||
+            query->refstarid[i] >= nstars) {
+            return -1;
+        }
+    }
+    sweep = malloc(count * sizeof(*sweep));
+    if (!sweep) {
+        return -1;
+    }
+    for (i = 0; i < query->nrall; i++) {
+#if VERIFY_STOP_CHECK_LINKED
+        if (!(i & 255) &&
+            index_shard_worker_stop_requested &&
+            index_shard_worker_stop_requested()) {
+            free(sweep);
+            return -1;
+        }
+#endif
+        sweep[i] = skdt->sweep[query->refstarid[i]];
+    }
+    query->sweep = sweep;
+    return 0;
+}
+
+static int verify_mapped_page_buffers_validate(
+    const verify_mapped_page_buffer_t* buffers,
+    size_t buffer_count) {
+    uintptr_t previous_end = 0U;
+    size_t i;
+
+    if (!buffers || !buffer_count) {
+        return -1;
+    }
+    for (i = 0U; i < buffer_count; i++) {
+        uintptr_t begin;
+        uintptr_t end;
+
+        if (!buffers[i].mapping_data || !buffers[i].bytes ||
+            !buffers[i].size) {
+            return -1;
+        }
+        begin = (uintptr_t)buffers[i].mapping_data;
+        if (buffers[i].size > UINTPTR_MAX - begin) {
+            return -1;
+        }
+        end = begin + buffers[i].size;
+        if (i && begin < previous_end) {
+            return -1;
+        }
+        previous_end = end;
+    }
+    return 0;
+}
+
+static int verify_mapped_page_buffer_find(
+    const verify_mapped_page_buffer_t* buffers,
+    size_t buffer_count,
+    uintptr_t target,
+    size_t target_size,
+    const unsigned char** bytes) {
+    size_t low = 0U;
+    size_t high = buffer_count;
+
+    if (!bytes || !target_size) {
+        return -1;
+    }
+    *bytes = NULL;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2U;
+        uintptr_t begin = (uintptr_t)buffers[middle].mapping_data;
+        uintptr_t end = begin + buffers[middle].size;
+
+        if (target < begin) {
+            high = middle;
+            continue;
+        }
+        if (target >= end) {
+            low = middle + 1U;
+            continue;
+        }
+        if (target_size > end - target) {
+            return -1;
+        }
+        *bytes = buffers[middle].bytes + (size_t)(target - begin);
+        return 0;
+    }
+    return -1;
+}
+
+int verify_index_query_capture_sweep_buffers(
+    const startree_t* skdt,
+    verify_index_query_t* query,
+    const verify_mapped_page_buffer_t* buffers,
+    size_t buffer_count) {
+    uint8_t* sweep;
+    size_t count;
+    int nstars;
+    int i;
+
+    if (!skdt || !query || query->source != skdt ||
+        !skdt->tree || !skdt->sweep ||
+        query->nrall < 0 ||
+        (query->nrall && !query->refstarid)) {
+        return -1;
+    }
+    if (query->sweep || !query->nrall) {
+        return 0;
+    }
+    if (verify_mapped_page_buffers_validate(
+            buffers, buffer_count)) {
+        return -1;
+    }
+    count = (size_t)query->nrall;
+    if (count > SIZE_MAX / sizeof(*sweep)) {
+        return -1;
+    }
+    sweep = malloc(count * sizeof(*sweep));
+    if (!sweep) {
+        return -1;
+    }
+    nstars = startree_N(skdt);
+    for (i = 0; i < query->nrall; i++) {
+        const unsigned char* bytes;
+        uintptr_t target;
+        int starid = query->refstarid[i];
+
+#if VERIFY_STOP_CHECK_LINKED
+        if (!(i & 255) &&
+            index_shard_worker_stop_requested &&
+            index_shard_worker_stop_requested()) {
+            free(sweep);
+            return -1;
+        }
+#endif
+        if (starid < 0 || starid >= nstars) {
+            free(sweep);
+            return -1;
+        }
+        target = (uintptr_t)(skdt->sweep + starid);
+        if (verify_mapped_page_buffer_find(
+                buffers, buffer_count,
+                target, sizeof(*sweep), &bytes)) {
+            free(sweep);
+            return -1;
+        }
+        memcpy(&sweep[i], bytes, sizeof(*sweep));
+    }
+    query->sweep = sweep;
+    return 0;
+}
+
+void verify_destroy_index_query(verify_index_query_t* query) {
+    if (!query) {
+        return;
+    }
+    free(query->refxyz);
+    free(query->refstarid);
+    free(query->sweep);
+    memset(query, 0, sizeof(*query));
+    free(query);
+}
 
 /*
  * Verification projects a different reference-star set for every candidate.
@@ -2208,30 +2497,53 @@ static void verify_hit_original(const startree_t* skdt, int index_cutnside,
     goto cleanup;
 }
 
-int verify_prepare_hit(const startree_t* skdt, int index_cutnside,
-                       const MatchObj* mo, const sip_t* sip,
-                       const verify_field_t* vf,
-                       double pix2, double distractors,
-                       double fieldW, double fieldH,
-                       double logbail, double logaccept,
-                       double logstoplooking,
-                       anbool do_gamma, anbool fake_match,
-                       verify_prepared_hit_t** prepared) {
+int verify_prepare_hit_from_query(const startree_t* skdt,
+                                  verify_index_query_t** query,
+                                  int index_cutnside,
+                                  const MatchObj* mo, const sip_t* sip,
+                                  const verify_field_t* vf,
+                                  double pix2, double distractors,
+                                  double fieldW, double fieldH,
+                                  double logbail, double logaccept,
+                                  double logstoplooking,
+                                  anbool do_gamma, anbool fake_match,
+                                  verify_prepared_hit_t** prepared) {
+    verify_index_query_t* query_context;
     verify_prepared_hit_t* context;
     verify_t* v;
     double fieldr2;
     int* sweep = NULL;
+    int nstars;
     int i;
     int j;
     int ibad;
     int igood;
 
-    if (!prepared || !skdt || !mo || !vf ||
+    if (!prepared) {
+        return -1;
+    }
+    *prepared = NULL;
+    if (!query || !*query || !skdt || !mo || !vf ||
         (!mo->wcs_valid && !sip) ||
         !isfinite(logaccept) || !isfinite(logbail)) {
         return -1;
     }
-    *prepared = NULL;
+    query_context = *query;
+    fieldr2 = square(mo->radius);
+    if (!skdt->tree ||
+        query_context->source != skdt ||
+        memcmp(query_context->center, mo->center,
+               sizeof(query_context->center)) ||
+        memcmp(&query_context->radius2, &fieldr2, sizeof(fieldr2)) ||
+        query_context->nrall < 0 ||
+        (query_context->nrall &&
+         (!query_context->refxyz || !query_context->refstarid)) ||
+        (!query_context->nrall &&
+         (query_context->refxyz || query_context->refstarid)) ||
+        (query_context->nrall && !query_context->sweep &&
+         !skdt->sweep)) {
+        return -1;
+    }
     context = calloc(1, sizeof(*context));
     if (!context) {
         return -1;
@@ -2250,16 +2562,12 @@ int verify_prepare_hit(const startree_t* skdt, int index_cutnside,
         sip_wrap_tan(&mo->wcstan, &context->wcs);
     }
     v->wcs = &context->wcs;
-    fieldr2 = square(mo->radius);
-
-    assert(skdt->sweep);
-    startree_search_for(skdt, mo->center, fieldr2,
-                        &context->refxyz, NULL,
-                        &v->refstarid, &v->NRall);
+    context->refxyz = query_context->refxyz;
+    v->refstarid = query_context->refstarid;
+    v->NRall = query_context->nrall;
     if (!context->refxyz) {
         context->state = VERIFY_PREPARED_NO_REFERENCE;
-        *prepared = context;
-        return 0;
+        goto done;
     }
 
     if ((size_t)v->NRall > SIZE_MAX / (2U * sizeof(double)) ||
@@ -2291,8 +2599,18 @@ int verify_prepare_hit(const startree_t* skdt, int index_cutnside,
     if (!sweep) {
         goto fail;
     }
+    nstars = startree_N(skdt);
     for (i = 0; i < v->NRall; i++) {
-        sweep[i] = skdt->sweep[v->refstarid[i]];
+        int starid = v->refstarid[i];
+
+        if (starid < 0 || starid >= nstars) {
+            goto fail;
+        }
+        if (query_context->sweep) {
+            sweep[i] = query_context->sweep[i];
+        } else {
+            sweep[i] = skdt->sweep[starid];
+        }
     }
     permuted_sort(sweep, sizeof(int), compare_ints_asc,
                   v->refperm, v->NR);
@@ -2358,13 +2676,51 @@ done:
     v->badguys = NULL;
     free(v->tbadguys);
     v->tbadguys = NULL;
+    query_context->refxyz = NULL;
+    query_context->refstarid = NULL;
+    verify_destroy_index_query(query_context);
+    *query = NULL;
     *prepared = context;
     return 0;
 
 fail:
     free(sweep);
+    context->refxyz = NULL;
+    v->refstarid = NULL;
     verify_destroy_prepared_hit(context);
     return -1;
+}
+
+int verify_prepare_hit(const startree_t* skdt, int index_cutnside,
+                       const MatchObj* mo, const sip_t* sip,
+                       const verify_field_t* vf,
+                       double pix2, double distractors,
+                       double fieldW, double fieldH,
+                       double logbail, double logaccept,
+                       double logstoplooking,
+                       anbool do_gamma, anbool fake_match,
+                       verify_prepared_hit_t** prepared) {
+    verify_index_query_t* query = NULL;
+    double fieldr2;
+    int status;
+
+    if (!prepared || !skdt || !mo || !vf ||
+        (!mo->wcs_valid && !sip) ||
+        !isfinite(logaccept) || !isfinite(logbail)) {
+        return -1;
+    }
+    *prepared = NULL;
+    fieldr2 = square(mo->radius);
+    if (verify_query_hit(skdt, mo->center, fieldr2, &query)) {
+        return -1;
+    }
+    status = verify_prepare_hit_from_query(
+        skdt, &query, index_cutnside, mo, sip, vf,
+        pix2, distractors, fieldW, fieldH,
+        logbail, logaccept, logstoplooking,
+        do_gamma, fake_match, prepared);
+    verify_destroy_index_query(query);
+    return status;
 }
 
 int verify_score_prepared_hit(const verify_prepared_hit_t* prepared,

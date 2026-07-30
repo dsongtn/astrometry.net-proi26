@@ -17,6 +17,8 @@
 
 /* Emitted only by solver_test_2.o for bounded verification storage. */
 int solver_test_verification_packet_bounds(void);
+int solver_test_candidate_nonresident_zero_submit_falls_back(void);
+int solver_test_candidate_rolling_windows(void);
 
 static int compare_n(const void* v1, const void* v2, int N) {
     const int* u1 = v1;
@@ -254,6 +256,8 @@ int main(int argc, char** args) {
     free(flatwanted);
 
     assert(!solver_test_verification_packet_bounds());
+    assert(!solver_test_candidate_nonresident_zero_submit_falls_back());
+    assert(!solver_test_candidate_rolling_windows());
 
     return 0;
 }
