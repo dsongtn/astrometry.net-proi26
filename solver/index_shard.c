@@ -3524,6 +3524,7 @@ static int index_shard_helper_complete_claim(
     index_shard_helper_task_status_t execute_status) {
   index_shard_helper_group_t *group;
   index_shard_helper_task_t *task;
+  anbool canonical_ready = FALSE;
   int rc = 0;
 
   if (!shared || !claim || !claim->group) {
@@ -3572,6 +3573,10 @@ static int index_shard_helper_complete_claim(
   } else {
     task->execute_status = execute_status;
     task->scheduler_state = INDEX_SHARD_HELPER_TASK_DONE;
+    canonical_ready =
+        group->retire &&
+        claim->task_index == group->next_retire &&
+        execute_status == INDEX_SHARD_HELPER_TASK_OK;
   }
 
   if (execute_status == INDEX_SHARD_HELPER_TASK_ERROR) {
@@ -3592,7 +3597,8 @@ static int index_shard_helper_complete_claim(
   }
   if (group->completed_count == group->task_count ||
       !group->running_count || group->internal_error ||
-      group->task_failed || group->stop_seen) {
+      group->task_failed || group->stop_seen ||
+      canonical_ready) {
     pthread_cond_broadcast(&shared->queue_cv);
   }
   pthread_mutex_unlock(&shared->queue_mutex);
@@ -3729,6 +3735,7 @@ static int index_shard_staged_complete_claim(
   index_shard_staged_task_t *task;
   index_shard_staged_task_state_t expected;
   double now;
+  anbool task_failed_before;
   int rc = 0;
 
   if (!shared || !claim || !claim->group) {
@@ -3747,6 +3754,7 @@ static int index_shard_staged_complete_claim(
     return -1;
   }
   task = &group->tasks[claim->task_index];
+  task_failed_before = group->task_failed;
   now = monotonic_seconds();
   switch (claim->kind) {
   case INDEX_SHARD_STAGED_CLAIM_PREPARE:
@@ -4006,6 +4014,17 @@ static int index_shard_staged_complete_claim(
       index_shard_staged_set_failed_locked(shared, group, task);
       break;
     }
+  }
+  if (!task_failed_before && group->task_failed) {
+    logerr("[index-shard] staged callback failed ops=%s task=%zu "
+           "claim=%i status=%i state=%i\n",
+           group->ops && group->ops->name
+               ? group->ops->name
+               : "<unnamed>",
+           claim->task_index,
+           (int)claim->kind,
+           callback_status,
+           task->scheduler_state);
   }
   pthread_cond_broadcast(&shared->queue_cv);
   pthread_mutex_unlock(&shared->queue_mutex);
@@ -4719,6 +4738,23 @@ index_shard_helper_run_internal(
       continue;
     }
 
+    /*
+     * As with staged groups, a foreign task can finish after the owner
+     * retirement scan but before this lock is acquired. Consume the
+     * canonical completed task before deciding that the group is quiescent
+     * or waiting for another notification.
+     */
+    if (group.retire &&
+        !group.task_failed && !group.stop_seen &&
+        group.next_retire < group.task_count &&
+        group.tasks[group.next_retire].scheduler_state ==
+            INDEX_SHARD_HELPER_TASK_DONE &&
+        group.tasks[group.next_retire].execute_status ==
+            INDEX_SHARD_HELPER_TASK_OK) {
+      pthread_mutex_unlock(&shared->queue_mutex);
+      continue;
+    }
+
     if (!group.ready_count && !group.running_count) {
       break;
     }
@@ -4934,6 +4970,29 @@ size_t index_shard_staged_capacity(void) {
   return capacity;
 }
 
+size_t index_shard_staged_compute_width(void) {
+  index_shard_worker_context_t *ctx = index_shard_get_tls();
+  index_shard_thread_state_t *shared;
+  size_t width = 0U;
+
+  if (!ctx || !ctx->pool || !ctx->current_outer_active ||
+      ctx->pool->worker_count < 2 ||
+      !ctx->pool->payload_completion_registered ||
+      index_shard_worker_stop_requested()) {
+    return 0U;
+  }
+  shared = &ctx->pool->shared;
+  pthread_mutex_lock(&shared->queue_mutex);
+  if (ctx->generation_seen == ctx->pool->generation &&
+      !ctx->published_helper_group &&
+      !ctx->published_staged_group &&
+      !ctx->helper_preparation_active) {
+    width = (size_t)ctx->pool->worker_count;
+  }
+  pthread_mutex_unlock(&shared->queue_mutex);
+  return width;
+}
+
 index_shard_helper_run_status_t
 index_shard_staged_run_ordered(
     const index_shard_staged_ops_t *ops,
@@ -5055,6 +5114,20 @@ index_shard_staged_run_ordered(
       fatal_requested = TRUE;
       pthread_mutex_unlock(&shared->queue_mutex);
       index_shard_request_fatal_stop(shared);
+      continue;
+    }
+
+    /*
+     * Retirement is owner-only and runs without the queue lock. A foreign
+     * completion can publish the next canonical result after the retirement
+     * scan but before this lock is acquired. Recheck that predicate here so
+     * the owner never sleeps after the corresponding broadcast has passed.
+     */
+    if (!group->cancelling &&
+        group->next_retire < group->task_count &&
+        group->tasks[group->next_retire].scheduler_state ==
+            INDEX_SHARD_STAGED_TASK_RESULTS_READY) {
+      pthread_mutex_unlock(&shared->queue_mutex);
       continue;
     }
 
@@ -6744,6 +6817,7 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   int tls_status;
   int worker_count;
   int payload_io_lanes;
+  int payload_io_width;
 
    // pool already active for this engine job
   if (!index_shard_pthread_enabled(bp)) {
@@ -6927,7 +7001,6 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
    * Completion lanes populate only packet-planned mapped pages. They are not
    * compute workers and do not own solver, index, or result state.
    */
-  fitsbin_payload_io_configure_workers(worker_count);
   payload_io_lanes = MIN(2, MAX(1, worker_count / 2));
   if (!fitsbin_payload_io_service_width()) {
     if (fitsbin_payload_io_service_start(payload_io_lanes)) {
@@ -6952,15 +7025,25 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   }
 
   index_shard_global_pool = pool;
+  payload_io_width = fitsbin_payload_io_service_width();
   if (pool->payload_completion_registered) {
-    /* Inner work is now dynamic; no compute lane is permanently reserved. */
-    pool->helper_width = 0U;
+    /*
+     * Mapped-page delivery width and outer compute width are independent.
+     * Every compute worker may own an outer index. A worker with no
+     * immediately claimable outer work may still execute READY staged work
+     * from any published owner.
+     */
     pool->producer_width = (size_t)worker_count;
+    pool->helper_width = 0U;
   } else {
     pool->helper_width = worker_count > 1 ? 1U : 0U;
     pool->producer_width =
         (size_t)worker_count - pool->helper_width;
   }
+  fitsbin_payload_io_configure_workers(
+      pool->payload_completion_registered
+          ? (int)pool->producer_width
+          : worker_count);
 
   logverb("[index-shard] workers=%i mode=pthread "
           "compute_width=%i producer_width=%zu helper_width=%zu "
@@ -6969,7 +7052,7 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
           worker_count,
           pool->producer_width,
           pool->helper_width,
-          fitsbin_payload_io_service_width(),
+          payload_io_width,
           pool->inverse_cache_budget);
 
   pthread_mutex_unlock(&index_shard_global_pool_mutex);
@@ -7349,7 +7432,10 @@ static int index_shard_pool_submit(
           payload_io_width > 0 ? "kernel-page-cache" : "native-mmap",
           payload_io_width,
           pool->payload_completion_registered
-              ? "full-producer"
+              ? (shared->producer_width ==
+                         (size_t)worker_count
+                     ? "full-producer"
+                     : "bounded-delivery-window")
               : "reserved-helper");
 
   return 0;
@@ -7923,7 +8009,9 @@ index_shard_solve_impl(onefield_t *bp,
           "rows=%llu/%llu/%llu/%llu "
           "verify_pages=%llu/%llu prefixes=%llu "
           "tickets=%llu/%llu fallback=%llu ready_rows=%llu "
-          "ranges=%llu bytes=%llu/%llu candidate_math=%llu/%llu\n",
+          "ranges=%llu bytes=%llu/%llu candidate_math=%llu/%llu "
+          "verify_score=%llu/%llu/%llu/%llu/%llu/%llu "
+          "work=%llu work_wall_sum=%.6f\n",
           pool->generation,
           solver_profile.page_plan_descriptors_total,
           solver_profile.page_plan_descriptors_complete,
@@ -7966,7 +8054,15 @@ index_shard_solve_impl(onefield_t *bp,
           solver_profile.verification_page_logical_bytes,
           solver_profile.verification_page_aligned_bytes,
           solver_profile.candidate_math_prepared,
-          solver_profile.candidate_math_reused);
+          solver_profile.candidate_math_reused,
+          solver_profile.verification_score_batches_prepared,
+          solver_profile.verification_score_contexts_prepared,
+          solver_profile.verification_score_batches_executed,
+          solver_profile.verification_score_contexts_completed,
+          solver_profile.verification_score_fallback_batches,
+          solver_profile.verification_score_stopped_batches,
+          solver_profile.verification_score_work_units_completed,
+          solver_profile.verification_score_wall_seconds);
 
   logverb("[index-shard] pass-detail candidates=%zu reduced=%zu "
           "hit_total_cpu_limit=%i hit_total_wall_limit=%i "

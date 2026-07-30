@@ -57,6 +57,7 @@ typedef struct solver_profile {
     double codekd_wall_seconds;
     double resolve_wall_seconds;
     double verify_wall_seconds;
+    double verification_score_wall_seconds;
 
     unsigned long long codekd_calls;
     unsigned long long codekd_hits;
@@ -122,6 +123,13 @@ typedef struct solver_profile {
     unsigned long long verification_page_aligned_bytes;
     unsigned long long candidate_math_prepared;
     unsigned long long candidate_math_reused;
+    unsigned long long verification_score_batches_prepared;
+    unsigned long long verification_score_contexts_prepared;
+    unsigned long long verification_score_batches_executed;
+    unsigned long long verification_score_contexts_completed;
+    unsigned long long verification_score_work_units_completed;
+    unsigned long long verification_score_fallback_batches;
+    unsigned long long verification_score_stopped_batches;
     unsigned long long staged_owner_claims;
     unsigned long long staged_foreign_claims;
     unsigned long long staged_io_submitted;

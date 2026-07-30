@@ -253,6 +253,9 @@ int verify_finish_prepared_hit(verify_prepared_hit_t* prepared,
 
 size_t verify_prepared_hit_bytes(const verify_prepared_hit_t* prepared);
 
+size_t verify_prepared_score_bytes(
+    const verify_prepared_hit_t* prepared);
+
 size_t verify_prepared_hit_peak_bytes(
     const verify_prepared_hit_t* prepared);
 

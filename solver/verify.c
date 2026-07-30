@@ -470,15 +470,65 @@ static void verify_nn_free_grid(verify_nn_t* nn) {
     nn->nslots = 0;
 }
 
+static anbool verify_nn_grid_workspace_size(int npoints,
+                                            size_t* p_nslots,
+                                            size_t* p_coordoffset,
+                                            size_t* p_nbytes) {
+    size_t coordoffset;
+    size_t intcount;
+    size_t nbytes;
+    size_t nslots;
+    size_t points;
+    size_t target;
+
+    if (npoints < 0 || !p_nslots || !p_coordoffset || !p_nbytes) {
+        return FALSE;
+    }
+    points = (size_t)npoints;
+    if (points > SIZE_MAX / 2U) {
+        return FALSE;
+    }
+    target = points * 2U;
+    nslots = VERIFY_NN_MIN_SLOTS;
+    while (nslots < target) {
+        if (nslots > SIZE_MAX / 2U) {
+            return FALSE;
+        }
+        nslots *= 2U;
+    }
+
+    if (nslots > SIZE_MAX - points) {
+        return FALSE;
+    }
+    intcount = nslots + points;
+    if (intcount > SIZE_MAX / sizeof(int)) {
+        return FALSE;
+    }
+    coordoffset = intcount * sizeof(int);
+    if (coordoffset > SIZE_MAX - (sizeof(int64_t) - 1U)) {
+        return FALSE;
+    }
+    coordoffset = (coordoffset + sizeof(int64_t) - 1U) &
+                  ~(sizeof(int64_t) - 1U);
+    if (nslots > (SIZE_MAX - coordoffset) /
+                     (2U * sizeof(int64_t))) {
+        return FALSE;
+    }
+    nbytes = coordoffset + 2U * nslots * sizeof(int64_t);
+
+    *p_nslots = nslots;
+    *p_coordoffset = coordoffset;
+    *p_nbytes = nbytes;
+    return TRUE;
+}
+
 static anbool verify_nn_build_grid(verify_nn_t* nn,
                                   const double* sigma2,
                                   const int* testperm,
                                   int ntest) {
     double maxd2 = 0.0;
     size_t coordoffset;
-    size_t intcount;
     size_t nbytes;
-    size_t target;
     size_t mask;
     size_t nslots;
     int maxoccupancy = 0;
@@ -500,35 +550,10 @@ static anbool verify_nn_build_grid(verify_nn_t* nn,
         return FALSE;
     }
 
-    if ((size_t)nn->npoints > SIZE_MAX / 2U) {
+    if (!verify_nn_grid_workspace_size(
+            nn->npoints, &nslots, &coordoffset, &nbytes)) {
         return FALSE;
     }
-    target = (size_t)nn->npoints * 2U;
-    nslots = VERIFY_NN_MIN_SLOTS;
-    while (nslots < target) {
-        if (nslots > SIZE_MAX / 2U) {
-            return FALSE;
-        }
-        nslots *= 2U;
-    }
-
-    if (nslots > SIZE_MAX - (size_t)nn->npoints) {
-        return FALSE;
-    }
-    intcount = nslots + (size_t)nn->npoints;
-    if (intcount > SIZE_MAX / sizeof(int)) {
-        return FALSE;
-    }
-    coordoffset = intcount * sizeof(int);
-    if (coordoffset > SIZE_MAX - (sizeof(int64_t) - 1U)) {
-        return FALSE;
-    }
-    coordoffset = (coordoffset + sizeof(int64_t) - 1U) &
-                  ~(sizeof(int64_t) - 1U);
-    if (nslots > (SIZE_MAX - coordoffset) / (2U * sizeof(int64_t))) {
-        return FALSE;
-    }
-    nbytes = coordoffset + 2U * nslots * sizeof(int64_t);
 
     nn->workspace = calloc(1, nbytes);
     if (!nn->workspace) {
@@ -581,12 +606,12 @@ static anbool verify_nn_build_grid(verify_nn_t* nn,
     return TRUE;
 }
 
-static void verify_nn_init(verify_nn_t* nn,
-                           double* points,
-                           int npoints,
-                           const double* sigma2,
-                           const int* testperm,
-                           int ntest) {
+static anbool verify_nn_init(verify_nn_t* nn,
+                             double* points,
+                             int npoints,
+                             const double* sigma2,
+                             const int* testperm,
+                             int ntest) {
     memset(nn, 0, sizeof(*nn));
     nn->mode = VERIFY_NN_LINEAR;
     nn->points = points;
@@ -594,23 +619,28 @@ static void verify_nn_init(verify_nn_t* nn,
     if (npoints > 0 && ntest > 0 &&
         (size_t)npoints <=
         (size_t)VERIFY_NN_LINEAR_WORK_LIMIT / (size_t)ntest) {
-        return;
+        return TRUE;
     }
     if (npoints <= VERIFY_NN_SMALL_KD_LIMIT) {
         nn->tree = kdtree_build(NULL, nn->points, nn->npoints, 2, 10,
                                 KDTT_DOUBLE, KD_BUILD_SPLIT);
-        nn->mode = VERIFY_NN_KDTREE;
-        return;
-    }
-    {
-        if (verify_nn_build_grid(nn, sigma2, testperm, ntest)) {
-            nn->mode = VERIFY_NN_GRID;
-        } else {
-            nn->tree = kdtree_build(NULL, nn->points, nn->npoints, 2, 10,
-                                    KDTT_DOUBLE, KD_BUILD_SPLIT);
-            nn->mode = VERIFY_NN_KDTREE;
+        if (!nn->tree) {
+            return FALSE;
         }
+        nn->mode = VERIFY_NN_KDTREE;
+        return TRUE;
     }
+    if (verify_nn_build_grid(nn, sigma2, testperm, ntest)) {
+        nn->mode = VERIFY_NN_GRID;
+        return TRUE;
+    }
+    nn->tree = kdtree_build(NULL, nn->points, nn->npoints, 2, 10,
+                            KDTT_DOUBLE, KD_BUILD_SPLIT);
+    if (!nn->tree) {
+        return FALSE;
+    }
+    nn->mode = VERIFY_NN_KDTREE;
+    return TRUE;
 }
 
 static size_t verify_nn_find_slot(const verify_nn_t* nn,
@@ -716,31 +746,50 @@ static anbool verify_nn_flat_query(const verify_nn_t* nn,
     return TRUE;
 }
 
-static void verify_nn_promote(verify_nn_t* nn) {
+static anbool verify_nn_promote(verify_nn_t* nn) {
     if (nn->mode == VERIFY_NN_KDTREE) {
-        return;
+        return nn->tree != NULL;
     }
     verify_nn_free_grid(nn);
     nn->tree = kdtree_build(NULL, nn->points, nn->npoints, 2, 10,
                             KDTT_DOUBLE, KD_BUILD_SPLIT);
+    if (!nn->tree) {
+        return FALSE;
+    }
     nn->mode = VERIFY_NN_KDTREE;
+    return TRUE;
 }
 
 static int verify_nn_query(verify_nn_t* nn,
                            const double* query,
                            double maxd2,
-                           double* bestd2) {
+                           double* bestd2,
+                           anbool* failed) {
     int best;
 
+    if (failed) {
+        *failed = FALSE;
+    }
     if (nn->mode != VERIFY_NN_KDTREE) {
         anbool tied;
         if (verify_nn_flat_query(nn, query, maxd2,
                                  &best, bestd2, &tied) && !tied) {
             return best;
         }
-        verify_nn_promote(nn);
+        if (!verify_nn_promote(nn)) {
+            if (failed) {
+                *failed = TRUE;
+            }
+            return -1;
+        }
     }
 
+    if (!nn->tree) {
+        if (failed) {
+            *failed = TRUE;
+        }
+        return -1;
+    }
     best = kdtree_nearest_neighbour_within(nn->tree, query, maxd2, bestd2);
     if (best == -1) {
         return -1;
@@ -754,13 +803,25 @@ static void verify_nn_cleanup(verify_nn_t* nn) {
     nn->tree = NULL;
 }
 
-static anbool* verify_deduplicate_field_stars(verify_t* v, const verify_field_t* vf, double nsigmas);
+static anbool* verify_deduplicate_field_stars(
+    verify_t* v, const verify_field_t* vf, double nsigmas);
+
+static int verify_uniformize_field_checked(
+    const double* xy,
+    int* perm,
+    int N,
+    double fieldW,
+    double fieldH,
+    int nw,
+    int nh,
+    int** p_bincounts,
+    int** p_binids);
 
 verify_field_t* verify_field_preprocess(const starxy_t* fieldxy) {
     verify_field_t* vf;
     int Nleaf = 5;
 
-    vf = malloc(sizeof(verify_field_t));
+    vf = calloc(1, sizeof(verify_field_t));
     if (!vf) {
         fprintf(stderr, "Failed to allocate space for a verify_field_t().\n");
         return NULL;
@@ -774,11 +835,17 @@ verify_field_t* verify_field_preprocess(const starxy_t* fieldxy) {
     vf->xy = starxy_copy_xy(fieldxy);
     if (!vf->fieldcopy || !vf->xy) {
         fprintf(stderr, "Failed to copy the field.\n");
+        verify_field_free(vf);
         return NULL;
     }
     // Build a tree out of the field objects (in pixel space)
     vf->ftree = kdtree_build(NULL, vf->fieldcopy, starxy_n(vf->field),
                              2, Nleaf, KDTT_DOUBLE, KD_BUILD_SPLIT);
+    if (!vf->ftree) {
+        fprintf(stderr, "Failed to build the verification field tree.\n");
+        verify_field_free(vf);
+        return NULL;
+    }
 
     vf->do_uniformize = TRUE;
     vf->do_dedup = TRUE;
@@ -788,8 +855,9 @@ verify_field_t* verify_field_preprocess(const starxy_t* fieldxy) {
 }
 
 void verify_field_free(verify_field_t* vf) {
-    if (!vf)
+    if (!vf) {
         return;
+    }
     kdtree_free(vf->ftree);
     free(vf->xy);
     free(vf->fieldcopy);
@@ -808,7 +876,14 @@ static double* compute_sigma2s(const verify_field_t* vf,
     int i;
     double R2;
 
-    sigma2s = malloc(NF * sizeof(double));
+    if (NF < 0 ||
+        (size_t)NF > SIZE_MAX / sizeof(double)) {
+        return NULL;
+    }
+    sigma2s = malloc((size_t)NF * sizeof(double));
+    if (NF && !sigma2s) {
+        return NULL;
+    }
     if (!do_gamma) {
         for (i=0; i<NF; i++)
             sigma2s[i] = verify_pix2;
@@ -886,18 +961,32 @@ static void print_test_perm(verify_t* v) {
     }
 }
 
-static void verify_get_test_stars(verify_t* v, const verify_field_t* vf, MatchObj* mo,
-                                  double pix2, anbool do_gamma, anbool fake_match) {
+static int verify_get_test_stars(
+    verify_t* v,
+    const verify_field_t* vf,
+    MatchObj* mo,
+    double pix2,
+    anbool do_gamma,
+    anbool fake_match) {
     anbool* keepers = NULL;
     int i;
     int ibad=0, igood=0;
 
     v->NTall = starxy_n(vf->field);
+    if (v->NTall < 0 ||
+        (size_t)v->NTall > SIZE_MAX / sizeof(int)) {
+        return -1;
+    }
     v->testxy = vf->xy;
     v->NT = v->NTall;
     v->testsigma = verify_compute_sigma2s(vf, mo, pix2, do_gamma);
     v->testperm = permutation_init(NULL, v->NTall);
-    v->tbadguys = malloc(v->NTall * sizeof(int));
+    v->tbadguys = malloc((size_t)v->NTall * sizeof(int));
+    if ((v->NTall && !v->testsigma) ||
+        (v->NTall && !v->testperm) ||
+        (v->NTall && !v->tbadguys)) {
+        return -1;
+    }
 
     if (DEBUGVERIFY) {
         debug2("start:\n");
@@ -912,6 +1001,9 @@ static void verify_get_test_stars(verify_t* v, const verify_field_t* vf, MatchOb
         // -- can perhaps discretize dedup to nearest power-of-sqrt(2) pixel radius and cache it.
         // -- we can compute sigma much later
         keepers = verify_deduplicate_field_stars(v, vf, 1.0);
+        if (v->NTall && !keepers) {
+            return -1;
+        }
 
         // Remove test quad stars.  Do this after deduplication so we
         // don't end up with (duplicate) test stars near the quad stars.
@@ -967,7 +1059,10 @@ static void verify_get_test_stars(verify_t* v, const verify_field_t* vf, MatchOb
 
     v->NT = igood;
     // remember the bad guys
-    memcpy(v->testperm + igood, v->tbadguys, ibad * sizeof(int));
+    if (ibad) {
+        memcpy(v->testperm + igood, v->tbadguys,
+               (size_t)ibad * sizeof(int));
+    }
     free(keepers);
 
     if (DEBUGVERIFY) {
@@ -976,6 +1071,7 @@ static void verify_get_test_stars(verify_t* v, const verify_field_t* vf, MatchOb
         debug2("\n");
     }
 
+    return 0;
 }
 
 double verify_get_ror2(double Q2, double area,
@@ -983,17 +1079,17 @@ double verify_get_ror2(double Q2, double area,
     return Q2 * MAX(1, (area*(1 - distractors) / (4. * M_PI * NR * pix2) - 1));
 }
 
-static void verify_apply_ror(verify_t* v,
-                             int index_cutnside,
-                             MatchObj* mo,
-                             const verify_field_t* vf,
-                             double pix2,
-                             double distractors,
-                             double fieldW,
-                             double fieldH,
-                             anbool do_gamma, anbool fake_match,
-                             double* p_effA,
-                             int* p_uninw, int* p_uninh) {
+static int verify_apply_ror(verify_t* v,
+                            int index_cutnside,
+                            MatchObj* mo,
+                            const verify_field_t* vf,
+                            double pix2,
+                            double distractors,
+                            double fieldW,
+                            double fieldH,
+                            anbool do_gamma, anbool fake_match,
+                            double* p_effA,
+                            int* p_uninw, int* p_uninh) {
     int i;
     int uni_nw = 0, uni_nh = 0;
     double effA = fieldW * fieldH;
@@ -1007,7 +1103,10 @@ static void verify_apply_ror(verify_t* v,
     if (fake_match)
         do_gamma = FALSE;
 
-    verify_get_test_stars(v, vf, mo, pix2, do_gamma, fake_match);
+    if (verify_get_test_stars(
+            v, vf, mo, pix2, do_gamma, fake_match)) {
+        goto fail;
+    }
     debug2("Number of test stars: %i\n", v->NT);
     debug2("Number of reference stars: %i\n", v->NR);
 
@@ -1023,8 +1122,16 @@ static void verify_apply_ror(verify_t* v,
 
         // uniformize!
         if (uni_nw > 1 || uni_nh > 1) {
-            verify_uniformize_field(vf->xy, v->testperm, v->NT, fieldW, fieldH, uni_nw, uni_nh, NULL, &binids);
+            if (verify_uniformize_field_checked(
+                    vf->xy, v->testperm, v->NT,
+                    fieldW, fieldH, uni_nw, uni_nh,
+                    NULL, &binids)) {
+                goto fail;
+            }
             bincenters = verify_uniformize_bin_centers(fieldW, fieldH, uni_nw, uni_nh);
+            if (!bincenters) {
+                goto fail;
+            }
 
             if (DEBUGVERIFY) {
                 debug2("after uniformizing:\n");
@@ -1045,6 +1152,9 @@ static void verify_apply_ror(verify_t* v,
         if (binids) {
             assert(uni_nw);
             goodbins = malloc((size_t)uni_nw * (size_t)uni_nh * sizeof(anbool));
+            if (!goodbins) {
+                goto fail;
+            }
             Ngoodbins = 0;
             for (i=0; i<(uni_nw * uni_nh); i++) {
                 double binr2 = distsq(bincenters + 2*i, qc, 2);
@@ -1083,6 +1193,9 @@ static void verify_apply_ror(verify_t* v,
             if (!uni_nw)
                 verify_get_uniformize_scale(index_cutnside, mo->scale, fieldW, fieldH, &uni_nw, &uni_nh);
             bincenters = verify_uniformize_bin_centers(fieldW, fieldH, uni_nw, uni_nh);
+            if (!bincenters) {
+                goto fail;
+            }
             Ngoodbins = 0;
             for (i=0; i<(uni_nw * uni_nh); i++) {
                 double binr2 = distsq(bincenters + 2*i, qc, 2);
@@ -1092,7 +1205,10 @@ static void verify_apply_ror(verify_t* v,
         }
 
         v->NT = igood;
-        memcpy(v->testperm + igood, v->tbadguys, ibad * sizeof(int));
+        if (ibad) {
+            memcpy(v->testperm + igood, v->tbadguys,
+                   (size_t)ibad * sizeof(int));
+        }
         debug2("After removing %i/%i irrelevant bins: %i test stars.\n", (uni_nw*uni_nh)-Ngoodbins, uni_nw*uni_nh, v->NT);
 
         if (DEBUGVERIFY) {
@@ -1132,7 +1248,10 @@ static void verify_apply_ror(verify_t* v,
             }
         }
         // remember the bad guys
-        memcpy(v->refperm + igood, v->badguys, ibad * sizeof(int));
+        if (ibad) {
+            memcpy(v->refperm + igood, v->badguys,
+                   (size_t)ibad * sizeof(int));
+        }
         v->NR = igood;
         debug2("After removing irrelevant ref stars: %i ref stars.\n", v->NR);
 
@@ -1150,6 +1269,12 @@ static void verify_apply_ror(verify_t* v,
         *p_uninw = uni_nw;
     if (p_uninh)
         *p_uninh = uni_nh;
+    return 0;
+
+fail:
+    free(bincenters);
+    free(binids);
+    return -1;
 }
 
 static double real_verify_star_lists(verify_t* v,
@@ -1160,7 +1285,8 @@ static double real_verify_star_lists(verify_t* v,
                                      int* p_besti,
                                      double** p_logodds, int** p_theta,
                                      double* p_worstlogodds,
-                                     int* p_ibailed, int* p_istopped) {
+                                     int* p_ibailed, int* p_istopped,
+                                     anbool* p_completed) {
     int i, j;
     double worstlogodds;
     double bestworstlogodds;
@@ -1170,7 +1296,7 @@ static double real_verify_star_lists(verify_t* v,
     double logbg;
     double logd;
     //double matchnsigma = 5.0;
-    unsigned char* arrays;
+    unsigned char* arrays = NULL;
     double* refcopy;
     verify_nn_t nn;
     int* rmatches;
@@ -1181,20 +1307,73 @@ static double real_verify_star_lists(verify_t* v,
     int* theta = NULL;
     int mu;
     int* rperm;
+    size_t arrays_bytes;
+    size_t double_count;
+    size_t nr;
+    size_t nt;
+    anbool allocated_badguys = FALSE;
 
+    memset(&nn, 0, sizeof(nn));
+    if (p_completed) {
+        *p_completed = FALSE;
+    }
+    if (p_besti) {
+        *p_besti = -1;
+    }
+    if (p_logodds) {
+        *p_logodds = NULL;
+    }
+    if (p_theta) {
+        *p_theta = NULL;
+    }
+    if (p_worstlogodds) {
+        *p_worstlogodds = -LARGE_VAL;
+    }
+    if (p_ibailed) {
+        *p_ibailed = -1;
+    }
+    if (p_istopped) {
+        *p_istopped = -1;
+    }
     if (!v->NR || !v->NT) {
         logerr("real_verify_star_lists: NR=%i, NT=%i\n", v->NR, v->NT);
         return -LARGE_VAL;
     }
+    if (v->NR < 0 || v->NT < 0) {
+        return -LARGE_VAL;
+    }
+    nr = (size_t)v->NR;
+    nt = (size_t)v->NT;
 
     /*
      * Keep the fixed-size per-candidate arrays in one allocation.  The
      * fallback KD builder may scramble refcopy, so it remains a packed copy.
      */
-    arrays = malloc(((size_t)3 * (size_t)v->NR +
-                     (size_t)v->NT + 1U) * sizeof(double) +
-                    (size_t)v->NR * sizeof(int) +
-                    ((size_t)v->NT + 1U) * sizeof(unsigned char));
+    if (nr > (SIZE_MAX - 1U) / 3U) {
+        goto fail;
+    }
+    double_count = 3U * nr + 1U;
+    if (nt > SIZE_MAX - double_count) {
+        goto fail;
+    }
+    double_count += nt;
+    if (double_count > SIZE_MAX / sizeof(double)) {
+        goto fail;
+    }
+    arrays_bytes = double_count * sizeof(double);
+    if (nr > (SIZE_MAX - arrays_bytes) / sizeof(int)) {
+        goto fail;
+    }
+    arrays_bytes += nr * sizeof(int);
+    if (nt == SIZE_MAX ||
+        nt + 1U > SIZE_MAX - arrays_bytes) {
+        goto fail;
+    }
+    arrays_bytes += (nt + 1U) * sizeof(unsigned char);
+    arrays = malloc(arrays_bytes);
+    if (!arrays) {
+        goto fail;
+    }
     refcopy = (double*)arrays;
     rprobs = refcopy + 2 * v->NR;
     logdcache = rprobs + v->NR;
@@ -1204,8 +1383,16 @@ static double real_verify_star_lists(verify_t* v,
 
     // we must pack/unpermute the refxys; remember this packing order in "rperm".
     // we borrow storage for "rperm"...
-    if (!v->badguys)
-        v->badguys = malloc(v->NR * sizeof(int));
+    if (!v->badguys) {
+        if (nr > SIZE_MAX / sizeof(int)) {
+            goto fail;
+        }
+        v->badguys = malloc(nr * sizeof(int));
+        if (!v->badguys) {
+            goto fail;
+        }
+        allocated_badguys = TRUE;
+    }
     rperm = v->badguys;
     for (i=0; i<v->NR; i++) {
         int ri = v->refperm[i];
@@ -1213,25 +1400,32 @@ static double real_verify_star_lists(verify_t* v,
         refcopy[2*i+0] = v->refxy[2*ri+0];
         refcopy[2*i+1] = v->refxy[2*ri+1];
     }
-    verify_nn_init(&nn, refcopy, v->NR,
-                   v->testsigma, v->testperm, v->NT);
+    if (!verify_nn_init(&nn, refcopy, v->NR,
+                        v->testsigma, v->testperm, v->NT)) {
+        goto fail;
+    }
 
     for (i=0; i<v->NR; i++) {
         rmatches[i] = -1;
         rprobs[i] = -LARGE_VAL;
     }
 
-    if (p_logodds || data_log_passes(DATALOG_MASK_VERIFY, DLOG_ODDS))
+    if (p_logodds || data_log_passes(DATALOG_MASK_VERIFY, DLOG_ODDS)) {
+        if (nt > SIZE_MAX / sizeof(double)) {
+            goto fail;
+        }
         all_logodds = calloc(v->NT, sizeof(double));
-    if (p_logodds)
-        *p_logodds = all_logodds;
-
-    if (p_ibailed)
-        *p_ibailed = -1;
-    if (p_istopped)
-        *p_istopped = -1;
-
-    theta = malloc(v->NT * sizeof(int));
+        if (!all_logodds) {
+            goto fail;
+        }
+    }
+    if (nt > SIZE_MAX / sizeof(int)) {
+        goto fail;
+    }
+    theta = malloc(nt * sizeof(int));
+    if (!theta) {
+        goto fail;
+    }
 
     logbg = log(1.0 / effective_area);
 
@@ -1246,6 +1440,7 @@ static double real_verify_star_lists(verify_t* v,
         double sig2;
         int refi;
         double d2;
+        anbool query_failed;
         //double reallogfg;
         double logfg;
         int ti;
@@ -1261,7 +1456,11 @@ static double real_verify_star_lists(verify_t* v,
         debug2("test star %i: (%.1f,%.1f), sigma: %.1f\n", i, testxy[0], testxy[1], sqrt(sig2));
 
         // find nearest ref star (within 5 sigma)
-        refi = verify_nn_query(&nn, testxy, sig2 * 25.0, &d2);
+        refi = verify_nn_query(
+            &nn, testxy, sig2 * 25.0, &d2, &query_failed);
+        if (query_failed) {
+            goto fail;
+        }
         if (refi == -1) {
             // no nearest neighbour within range.
             debug2("  No nearest neighbour.\n");
@@ -1471,24 +1670,54 @@ static double real_verify_star_lists(verify_t* v,
          */
     }
 
-    if (p_theta)
+    if (p_theta) {
         *p_theta = theta;
-    else
+        theta = NULL;
+    } else {
         free(theta);
+        theta = NULL;
+    }
 
-    if (p_besti)
+    if (p_besti) {
         *p_besti = besti;
+    }
 
-    if (p_worstlogodds)
+    if (p_worstlogodds) {
         *p_worstlogodds = bestworstlogodds;
+    }
 
-    if (all_logodds && !*p_logodds)
+    if (p_logodds) {
+        *p_logodds = all_logodds;
+        all_logodds = NULL;
+    } else {
         free(all_logodds);
+        all_logodds = NULL;
+    }
 
     verify_nn_cleanup(&nn);
     free(arrays);
+    if (p_completed) {
+        *p_completed = TRUE;
+    }
 
     return bestlogodds;
+
+fail:
+    verify_nn_cleanup(&nn);
+    free(theta);
+    free(all_logodds);
+    free(arrays);
+    if (allocated_badguys) {
+        free(v->badguys);
+        v->badguys = NULL;
+    }
+    if (p_logodds) {
+        *p_logodds = NULL;
+    }
+    if (p_theta) {
+        *p_theta = NULL;
+    }
+    return -LARGE_VAL;
 }
 
 typedef struct verify_projection_context {
@@ -1825,8 +2054,16 @@ static anbool* verify_deduplicate_field_stars(verify_t* v, const verify_field_t*
     double nsig2 = nsigmas*nsigmas;
     int options = KD_OPTIONS_NO_RESIZE_RESULTS | KD_OPTIONS_SMALL_RADIUS;
 
+    if (!v || !vf || v->NTall < 0 || v->NT < 0 ||
+        v->NT > v->NTall ||
+        (v->NT && (!v->testperm || !v->testsigma))) {
+        return NULL;
+    }
     // default to FALSE
-    keepers = calloc(v->NTall, sizeof(anbool));
+    keepers = calloc((size_t)v->NTall, sizeof(anbool));
+    if (v->NTall && !keepers) {
+        return NULL;
+    }
     for (i=0; i<v->NT; i++) {
         ti = v->testperm[i];
         keepers[ti] = TRUE;
@@ -1838,6 +2075,12 @@ static anbool* verify_deduplicate_field_stars(verify_t* v, const verify_field_t*
             continue;
         starxy_get(vf->field, ti, sxy);
         res = kdtree_rangesearch_options_reuse(vf->ftree, res, sxy, nsig2 * v->testsigma[ti], options);
+        if (!res || res->nres < 0 ||
+            (res->nres && !res->inds)) {
+            kdtree_free_query(res);
+            free(keepers);
+            return NULL;
+        }
         for (j=0; j<res->nres; j++) {
             int ind = res->inds[j];
             if (ind > i) {
@@ -1882,14 +2125,17 @@ void verify_get_uniformize_scale(int cutnside, double scale, int W, int H, int* 
         *cutnh = MAX(1, (int)round(H / cutpix));
 }
 
-void verify_uniformize_field(const double* xy,
-                             int* perm,
-                             int N,
-                             double fieldW, double fieldH,
-                             int nw, int nh,
-                             int** p_bincounts,
-                             int** p_binids) {
-    int* workspace;
+static int verify_uniformize_field_checked(
+    const double* xy,
+    int* perm,
+    int N,
+    double fieldW,
+    double fieldH,
+    int nw,
+    int nh,
+    int** p_bincounts,
+    int** p_binids) {
+    int* workspace = NULL;
     int* bincount;
     int* binoffset;
     int* binwrite;
@@ -1897,17 +2143,51 @@ void verify_uniformize_field(const double* xy,
     int* inputbins;
     int i,k,p;
     int activecount;
-    int nbins = nw * nh;
+    int nbins;
     int* bincounts = NULL;
     int* binids = NULL;
+    size_t workspace_count;
+    size_t nbins_size;
+    size_t n_size;
+
+    if (p_bincounts) {
+        *p_bincounts = NULL;
+    }
+    if (p_binids) {
+        *p_binids = NULL;
+    }
+    if (N < 0 || nw <= 0 || nh <= 0 ||
+        (N && (!xy || !perm)) ||
+        !isfinite(fieldW) || !isfinite(fieldH) ||
+        fieldW <= 0.0 || fieldH <= 0.0 ||
+        nw > INT_MAX / nh) {
+        return -1;
+    }
+    nbins = nw * nh;
+    nbins_size = (size_t)nbins;
+    n_size = (size_t)N;
+    if (n_size > SIZE_MAX / 2U ||
+        nbins_size > (SIZE_MAX - 2U * n_size) / 3U ||
+        3U * nbins_size + 2U * n_size >
+            SIZE_MAX / sizeof(int)) {
+        return -1;
+    }
+    workspace_count = 3U * nbins_size + 2U * n_size;
 
     if (p_binids) {
-        binids = malloc((size_t)N * sizeof(int));
-        *p_binids = binids;
+        if (n_size > SIZE_MAX / sizeof(int)) {
+            return -1;
+        }
+        binids = malloc(n_size * sizeof(int));
+        if (n_size && !binids) {
+            return -1;
+        }
     }
 
-    workspace = malloc(((size_t)3 * (size_t)nbins + (size_t)2 * (size_t)N) *
-                       sizeof(int));
+    workspace = malloc(workspace_count * sizeof(int));
+    if (workspace_count && !workspace) {
+        goto fail;
+    }
     bincount = workspace;
     binoffset = bincount + nbins;
     binwrite = binoffset + nbins;
@@ -1930,9 +2210,11 @@ void verify_uniformize_field(const double* xy,
 
     if (p_bincounts) {
         // note the bin occupancies.
-        bincounts = malloc((size_t)nbins * sizeof(int));
-        memcpy(bincounts, bincount, (size_t)nbins * sizeof(int));
-        *p_bincounts = bincounts;
+        bincounts = malloc(nbins_size * sizeof(int));
+        if (nbins_size && !bincounts) {
+            goto fail;
+        }
+        memcpy(bincounts, bincount, nbins_size * sizeof(int));
     }
 
     // Lay out each bin contiguously while preserving input permutation order.
@@ -1993,12 +2275,51 @@ void verify_uniformize_field(const double* xy,
     assert(p == N);
 
     free(workspace);
+    if (p_bincounts) {
+        *p_bincounts = bincounts;
+    }
+    if (p_binids) {
+        *p_binids = binids;
+    }
+    return 0;
+
+fail:
+    free(workspace);
+    free(bincounts);
+    free(binids);
+    return -1;
+}
+
+void verify_uniformize_field(const double* xy,
+                             int* perm,
+                             int N,
+                             double fieldW, double fieldH,
+                             int nw, int nh,
+                             int** p_bincounts,
+                             int** p_binids) {
+    (void)verify_uniformize_field_checked(
+        xy, perm, N, fieldW, fieldH, nw, nh,
+        p_bincounts, p_binids);
 }
 
 double* verify_uniformize_bin_centers(double fieldW, double fieldH,
                                       int nw, int nh) {
     int i,j;
-    double* bxy = malloc((size_t)nw * (size_t)nh * (size_t)2 * sizeof(double));
+    size_t count;
+    double* bxy;
+
+    if (nw <= 0 || nh <= 0 ||
+        !isfinite(fieldW) || !isfinite(fieldH) ||
+        nw > INT_MAX / nh ||
+        (size_t)nw * (size_t)nh >
+            SIZE_MAX / (2U * sizeof(double))) {
+        return NULL;
+    }
+    count = (size_t)nw * (size_t)nh * 2U;
+    bxy = malloc(count * sizeof(double));
+    if (!bxy) {
+        return NULL;
+    }
     for (j=0; j<nh; j++)
         for (i=0; i<nw; i++) {
             bxy[(j * nw + i)*2 +0] = (i + 0.5) * fieldW / (double)nw;
@@ -2073,13 +2394,120 @@ static void check_permutation(const int* perm, int N) {
     free(counts);
 }
 
-static void fixup_theta(int* theta, double* allodds, int ibailed, int istopped, verify_t* v,
-                        int besti, int NRimage, double* refxyz,
-                        int** p_etheta, double** p_eodds) {
-    int* etheta;
-    double* eodds;
-    int* invrperm;
+static void verify_permutation_apply_workspace(
+    const int* perm,
+    int count,
+    void* array,
+    size_t element_size,
+    void* workspace) {
+    const unsigned char* input = array;
+    unsigned char* output = workspace;
+    int i;
+
+    if (!count) {
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        memcpy(
+            output + (size_t)i * element_size,
+            input + (size_t)perm[i] * element_size,
+            element_size);
+    }
+    memcpy(array, workspace, (size_t)count * element_size);
+}
+
+static int fixup_theta(int* theta, double* allodds,
+                       int ibailed, int istopped, verify_t* v,
+                       int besti, int NRimage, double* refxyz,
+                       int** p_etheta, double** p_eodds) {
+    int* etheta = NULL;
+    double* eodds = NULL;
+    int* invrperm = NULL;
+    unsigned char* permutation_workspace = NULL;
+    size_t permutation_stride;
     int i, ti;
+
+    if (!p_etheta || !p_eodds) {
+        return -1;
+    }
+    *p_etheta = NULL;
+    *p_eodds = NULL;
+    if (!theta || !allodds || !v ||
+        v->NT < 0 || v->NTall < 0 ||
+        v->NRall < 0 || NRimage < 0 ||
+        v->NT > v->NTall || NRimage > v->NRall ||
+        (v->NTall && !v->testperm) ||
+        (NRimage && (!v->refperm || !v->refxy)) ||
+        ibailed < -1 || ibailed >= v->NT ||
+        istopped < -1 || istopped >= v->NT ||
+        (size_t)v->NTall > SIZE_MAX / sizeof(*etheta) ||
+        (size_t)v->NTall > SIZE_MAX / sizeof(*eodds) ||
+        (size_t)v->NRall > SIZE_MAX / sizeof(*invrperm)) {
+        return -1;
+    }
+    permutation_stride = refxyz
+        ? 3U * sizeof(double)
+        : 2U * sizeof(double);
+    if ((size_t)NRimage >
+        SIZE_MAX / permutation_stride) {
+        return -1;
+    }
+    for (i = 0; i < NRimage; i++) {
+        if (v->refperm[i] < 0 ||
+            v->refperm[i] >= v->NRall) {
+            return -1;
+        }
+    }
+    for (i = 0; i < v->NTall; i++) {
+        if (v->testperm[i] < 0 ||
+            v->testperm[i] >= v->NTall) {
+            return -1;
+        }
+    }
+    for (i = 0; i < v->NT; i++) {
+        if (theta[i] >= v->NRall) {
+            return -1;
+        }
+    }
+
+    if (v->NTall) {
+        etheta = malloc((size_t)v->NTall * sizeof(*etheta));
+        eodds = malloc((size_t)v->NTall * sizeof(*eodds));
+    }
+    if (v->NRall) {
+        invrperm = malloc((size_t)v->NRall * sizeof(*invrperm));
+    }
+    if (NRimage) {
+        permutation_workspace = malloc(
+            (size_t)NRimage * permutation_stride);
+    }
+    if ((v->NTall && (!etheta || !eodds)) ||
+        (v->NRall && !invrperm) ||
+        (NRimage && !permutation_workspace)) {
+        free(permutation_workspace);
+        free(invrperm);
+        free(eodds);
+        free(etheta);
+        return -1;
+    }
+
+#define BAD_PERM -1000000
+    for (i = 0; i < v->NRall; i++) {
+        invrperm[i] = BAD_PERM;
+    }
+    for (i = 0; i < NRimage; i++) {
+        invrperm[v->refperm[i]] = i;
+    }
+    for (i = 0; i < v->NT; i++) {
+        if (theta[i] >= 0 &&
+            invrperm[theta[i]] == BAD_PERM) {
+            free(permutation_workspace);
+            free(invrperm);
+            free(eodds);
+            free(etheta);
+            return -1;
+        }
+    }
 
     if (DEBUGVERIFY) {
         // The "testperm" permutation should be "complete".
@@ -2126,9 +2554,6 @@ static void fixup_theta(int* theta, double* allodds, int ibailed, int istopped, 
                    (v->refstarid ? v->refstarid[ri] : -1000), v->testxy[ti*2+0], v->testxy[ti*2+1], v->refxy[ri*2+0], v->refxy[ri*2+1]);
         }
     }
-    etheta = malloc(v->NTall * sizeof(int));
-    eodds = malloc(v->NTall * sizeof(double));
-
     // Apply the "refperm" permutation, mostly to cut out the stars that
     // aren't in the image (we want to have "nindex" = "NRimage" = "NRall").
     // This requires computing the inverse perm so we can fix theta to match.
@@ -2137,20 +2562,19 @@ static void fixup_theta(int* theta, double* allodds, int ibailed, int istopped, 
     // the field; we want to collapse the reference star list,
     // which will renumber them.
 
-    invrperm = malloc(v->NRall * sizeof(int));
-#define BAD_PERM -1000000
-    if (DEBUGVERIFY) {
-        for (i=0; i<v->NRall; i++)
-            invrperm[i] = BAD_PERM;
+    if (v->refstarid) {
+        verify_permutation_apply_workspace(
+            v->refperm, NRimage, v->refstarid,
+            sizeof(int), permutation_workspace);
     }
-    for (i=0; i<NRimage; i++)
-        invrperm[v->refperm[i]] = i;
-
-    if (v->refstarid)
-        permutation_apply(v->refperm, NRimage, v->refstarid, v->refstarid, sizeof(int));
-    permutation_apply(v->refperm, NRimage, v->refxy, v->refxy, 2*sizeof(double));
-    if (refxyz)
-        permutation_apply(v->refperm, NRimage, refxyz, refxyz, 3*sizeof(double));
+    verify_permutation_apply_workspace(
+        v->refperm, NRimage, v->refxy,
+        2U * sizeof(double), permutation_workspace);
+    if (refxyz) {
+        verify_permutation_apply_workspace(
+            v->refperm, NRimage, refxyz,
+            3U * sizeof(double), permutation_workspace);
+    }
 
     // New v->refstarid[i] is old v->refstarid[ v->refperm[i] ]
 
@@ -2176,6 +2600,7 @@ static void fixup_theta(int* theta, double* allodds, int ibailed, int istopped, 
         }
     }
 
+    free(permutation_workspace);
     free(invrperm);
 
     for (i=v->NT; i<v->NTall; i++) {
@@ -2202,6 +2627,7 @@ static void fixup_theta(int* theta, double* allodds, int ibailed, int istopped, 
 
     *p_etheta = etheta;
     *p_eodds = eodds;
+    return 0;
 }
 
 void verify_count_hits(int* theta, int besti, int* p_nmatch, int* p_nconflict, int* p_ndistractor) {
@@ -2247,6 +2673,7 @@ static void verify_hit_original(const startree_t* skdt, int index_cutnside,
     verify_t* v = &the_v;
     int NRimage;
     int ibailed, istopped;
+    anbool score_completed;
 
     assert(mo->wcs_valid || sip);
     assert(isfinite(logaccept));
@@ -2363,7 +2790,10 @@ static void verify_hit_original(const startree_t* skdt, int index_cutnside,
             igood++;
         }
         // remember the bad guys
-        memcpy(v->refperm + igood, v->badguys, ibad * sizeof(int));
+        if (ibad) {
+            memcpy(v->refperm + igood, v->badguys,
+                   (size_t)ibad * sizeof(int));
+        }
         v->NR = igood;
         debug2("After removing stars in the quad: %i reference stars.\n", v->NR);
     }
@@ -2378,16 +2808,22 @@ static void verify_hit_original(const startree_t* skdt, int index_cutnside,
     // and image radius.
 
     if (!fake_match) {
-        verify_apply_ror(v, index_cutnside, mo,
-                         vf, pix2, distractors, fieldW, fieldH,
-                         do_gamma, fake_match,
-                         &effA, NULL, NULL);
+        if (verify_apply_ror(v, index_cutnside, mo,
+                             vf, pix2, distractors,
+                             fieldW, fieldH,
+                             do_gamma, fake_match,
+                             &effA, NULL, NULL)) {
+            goto bailout;
+        }
         if (!v->NR) {
             logerr("After applying ROR, NR = 0!\n");
             goto bailout;
         }
     } else {
-        verify_get_test_stars(v, vf, mo, pix2, do_gamma, fake_match);
+        if (verify_get_test_stars(
+                v, vf, mo, pix2, do_gamma, fake_match)) {
+            goto bailout;
+        }
         effA = fieldW * fieldH;
         debug2("Number of test stars: %i\n", v->NT);
     }
@@ -2399,7 +2835,10 @@ static void verify_hit_original(const startree_t* skdt, int index_cutnside,
     worst = -LARGE_VAL;
     K = real_verify_star_lists(v, effA, distractors,
                                logbail, logstoplooking, &besti, &allodds, &theta, &worst,
-                               &ibailed, &istopped);
+                               &ibailed, &istopped, &score_completed);
+    if (!score_completed) {
+        goto bailout;
+    }
     mo->logodds = K;
     mo->worstlogodds = worst;
     // NTall so that caller knows how big 'etheta' is.
@@ -2424,8 +2863,12 @@ static void verify_hit_original(const startree_t* skdt, int index_cutnside,
         mo->nconflict = nc;
         mo->ndistractor = nd;
 
-        fixup_theta(theta, allodds, ibailed, istopped, v, besti, NRimage, refxyz,
-                    &etheta, &eodds);
+        if (fixup_theta(
+                theta, allodds, ibailed, istopped,
+                v, besti, NRimage, refxyz,
+                &etheta, &eodds)) {
+            goto bailout;
+        }
 
         // Reinsert the matched quad...
         if (!fake_match) {
@@ -2653,17 +3096,23 @@ int verify_prepare_hit_from_query(const startree_t* skdt,
     }
 
     if (!fake_match) {
-        verify_apply_ror(v, index_cutnside, (MatchObj*)mo,
-                         vf, pix2, distractors, fieldW, fieldH,
-                         do_gamma, fake_match,
-                         &context->effective_area, NULL, NULL);
+        if (verify_apply_ror(
+                v, index_cutnside, (MatchObj*)mo,
+                vf, pix2, distractors, fieldW, fieldH,
+                do_gamma, fake_match,
+                &context->effective_area, NULL, NULL)) {
+            goto fail;
+        }
         if (!v->NR) {
             context->state = VERIFY_PREPARED_NO_ROR_REFERENCE;
             goto done;
         }
     } else {
-        verify_get_test_stars(v, vf, (MatchObj*)mo,
-                              pix2, do_gamma, fake_match);
+        if (verify_get_test_stars(
+                v, vf, (MatchObj*)mo,
+                pix2, do_gamma, fake_match)) {
+            goto fail;
+        }
         context->effective_area = fieldW * fieldH;
     }
     if (!v->NR || !v->NT) {
@@ -2726,6 +3175,7 @@ int verify_prepare_hit(const startree_t* skdt, int index_cutnside,
 int verify_score_prepared_hit(const verify_prepared_hit_t* prepared,
                               verify_prepared_score_t* score) {
     verify_t local;
+    anbool score_completed;
 
     if (!prepared || !score || score->theta || score->allodds ||
         score->complete) {
@@ -2743,6 +3193,10 @@ int verify_score_prepared_hit(const verify_prepared_hit_t* prepared,
     }
 
     local = prepared->verify;
+    if (local.NR <= 0 ||
+        (size_t)local.NR > SIZE_MAX / sizeof(int)) {
+        return -1;
+    }
     local.badguys = malloc((size_t)local.NR * sizeof(int));
     if (!local.badguys) {
         return -1;
@@ -2759,8 +3213,13 @@ int verify_score_prepared_hit(const verify_prepared_hit_t* prepared,
         &score->theta,
         &score->worstlogodds,
         &score->ibailed,
-        &score->istopped);
+        &score->istopped,
+        &score_completed);
     free(local.badguys);
+    if (!score_completed) {
+        verify_destroy_prepared_score(score);
+        return -1;
+    }
     score->complete = TRUE;
     return 0;
 }
@@ -2810,10 +3269,6 @@ int verify_finish_prepared_hit(verify_prepared_hit_t* prepared,
     refxyz = prepared->refxyz;
     K = score->logodds;
     besti = score->besti;
-    mo->logodds = K;
-    mo->worstlogodds = score->worstlogodds;
-    mo->nfield = v->NTall;
-    mo->nindex = prepared->nrimage;
 
     if (log_get_level() >= LOG_ALL) {
         int nm;
@@ -2834,13 +3289,20 @@ int verify_finish_prepared_hit(verify_prepared_hit_t* prepared,
         int nd;
 
         verify_count_hits(score->theta, besti, &nm, &nc, &nd);
+        if (fixup_theta(
+                score->theta, score->allodds,
+                score->ibailed, score->istopped,
+                v, besti, prepared->nrimage, refxyz,
+                &etheta, &eodds)) {
+            return -1;
+        }
+        mo->logodds = K;
+        mo->worstlogodds = score->worstlogodds;
+        mo->nfield = v->NTall;
+        mo->nindex = prepared->nrimage;
         mo->nmatch = nm;
         mo->nconflict = nc;
         mo->ndistractor = nd;
-        fixup_theta(score->theta, score->allodds,
-                    score->ibailed, score->istopped,
-                    v, besti, prepared->nrimage, refxyz,
-                    &etheta, &eodds);
 
         if (!prepared->fake_match) {
             for (j = 0; j < mo->dimquads; j++) {
@@ -2868,6 +3330,11 @@ int verify_finish_prepared_hit(verify_prepared_hit_t* prepared,
         mo->testperm = v->testperm;
         v->testperm = NULL;
         matchobj_compute_derived(mo);
+    } else {
+        mo->logodds = K;
+        mo->worstlogodds = score->worstlogodds;
+        mo->nfield = v->NTall;
+        mo->nindex = prepared->nrimage;
     }
     verify_destroy_prepared_score(score);
     return 0;
@@ -2888,6 +3355,35 @@ static size_t verify_prepared_add_bytes(size_t total,
     return total + bytes;
 }
 
+static size_t verify_nn_kdtree_workspace_bytes(int npoints) {
+    size_t bottom = 1U;
+    size_t interior;
+    size_t quotient;
+    size_t total;
+
+    if (npoints <= 0) {
+        return 0U;
+    }
+    quotient = (size_t)npoints / 10U;
+    while (quotient) {
+        if (bottom > SIZE_MAX / 2U) {
+            return SIZE_MAX;
+        }
+        bottom *= 2U;
+        quotient >>= 1U;
+    }
+    interior = bottom - 1U;
+
+    total = sizeof(kdtree_t);
+    total = verify_prepared_add_bytes(
+        total, (size_t)npoints, sizeof(u32));
+    total = verify_prepared_add_bytes(
+        total, bottom, sizeof(int32_t));
+    total = verify_prepared_add_bytes(
+        total, interior, sizeof(double) + sizeof(u8));
+    return total;
+}
+
 size_t verify_prepared_hit_bytes(const verify_prepared_hit_t* prepared) {
     const verify_t* v;
     size_t total;
@@ -2896,6 +3392,9 @@ size_t verify_prepared_hit_bytes(const verify_prepared_hit_t* prepared) {
         return 0U;
     }
     v = &prepared->verify;
+    if (v->NRall < 0 || v->NTall < 0) {
+        return SIZE_MAX;
+    }
     total = sizeof(*prepared);
     total = verify_prepared_add_bytes(
         total, (size_t)v->NRall, 3U * sizeof(double));
@@ -2912,32 +3411,117 @@ size_t verify_prepared_hit_bytes(const verify_prepared_hit_t* prepared) {
     return total;
 }
 
+size_t verify_prepared_score_bytes(
+    const verify_prepared_hit_t* prepared) {
+    const verify_t* v;
+    size_t total = 0U;
+
+    if (!prepared) {
+        return 0U;
+    }
+    if (prepared->state != VERIFY_PREPARED_READY) {
+        return 0U;
+    }
+    v = &prepared->verify;
+    if (v->NT < 0) {
+        return SIZE_MAX;
+    }
+    total = verify_prepared_add_bytes(
+        total, (size_t)v->NT, sizeof(double));
+    total = verify_prepared_add_bytes(
+        total, (size_t)v->NT, sizeof(int));
+    return total;
+}
+
 size_t verify_prepared_hit_peak_bytes(
     const verify_prepared_hit_t* prepared) {
     const verify_t* v;
-    size_t total;
+    size_t finish_peak = 0U;
+    size_t grid_bytes;
+    size_t grid_coordoffset;
+    size_t grid_slots;
+    size_t kd_bytes;
+    size_t nn_bytes;
+    size_t retained;
+    size_t score_peak = 0U;
+    size_t transient_peak;
 
     if (!prepared) {
         return 0U;
     }
     v = &prepared->verify;
-    total = verify_prepared_hit_bytes(prepared);
+    if (v->NR < 0 || v->NRall < 0 ||
+        v->NT < 0 || v->NTall < 0 ||
+        prepared->nrimage < 0) {
+        return SIZE_MAX;
+    }
+    retained = verify_prepared_hit_bytes(prepared);
+    if (retained == SIZE_MAX) {
+        return SIZE_MAX;
+    }
+    switch (prepared->state) {
+    case VERIFY_PREPARED_NO_REFERENCE:
+    case VERIFY_PREPARED_NO_QUAD_REFERENCE:
+    case VERIFY_PREPARED_NO_ROR_REFERENCE:
+    case VERIFY_PREPARED_EMPTY_LISTS:
+        return retained;
+    case VERIFY_PREPARED_READY:
+        break;
+    default:
+        return SIZE_MAX;
+    }
+    if (!verify_nn_grid_workspace_size(
+            v->NR, &grid_slots, &grid_coordoffset, &grid_bytes)) {
+        return SIZE_MAX;
+    }
+    kd_bytes = verify_nn_kdtree_workspace_bytes(v->NR);
+    if (kd_bytes == SIZE_MAX) {
+        return SIZE_MAX;
+    }
+    nn_bytes = MAX(grid_bytes, kd_bytes);
+    (void)grid_slots;
+    (void)grid_coordoffset;
 
     /*
-     * Include score arrays, temporary conflict storage, and a conservative
-     * allowance for the flat-grid or KD nearest-neighbor workspace. This is
-     * an admission estimate, not an ownership size.
+     * Scoring retains one conflict array, the packed nearest-neighbor
+     * inputs, the result vectors, and at most one nearest-neighbor
+     * workspace. Grid and legacy KD storage never coexist, so use the
+     * larger exact payload bound.
      */
-    total = verify_prepared_add_bytes(
-        total, (size_t)v->NT, sizeof(double) + sizeof(int));
-    total = verify_prepared_add_bytes(
-        total, (size_t)v->NR,
-        6U * sizeof(int) + 2U * sizeof(int64_t) +
-            2U * sizeof(double));
-    total = verify_prepared_add_bytes(
-        total, (size_t)v->NTall,
+    score_peak = verify_prepared_add_bytes(
+        score_peak, (size_t)v->NR, sizeof(int));
+    score_peak = verify_prepared_add_bytes(
+        score_peak, (size_t)v->NR,
+        3U * sizeof(double) + sizeof(int));
+    score_peak = verify_prepared_add_bytes(
+        score_peak, (size_t)v->NT,
+        sizeof(double) + sizeof(unsigned char));
+    score_peak = verify_prepared_add_bytes(
+        score_peak, 1U, sizeof(double) + sizeof(unsigned char));
+    score_peak = verify_prepared_add_bytes(
+        score_peak, (size_t)v->NT,
+        sizeof(double) + sizeof(int));
+    score_peak = verify_prepared_add_bytes(
+        score_peak, nn_bytes, 1U);
+
+    /*
+     * Owner retirement keeps the score vectors while fixup_theta() builds
+     * its expanded result and permutation workspaces. These allocations do
+     * not overlap the scoring workspace, so admission uses the larger peak.
+     */
+    finish_peak = verify_prepared_add_bytes(
+        finish_peak, (size_t)v->NT,
+        sizeof(double) + sizeof(int));
+    finish_peak = verify_prepared_add_bytes(
+        finish_peak, (size_t)v->NTall,
         sizeof(int) + sizeof(double));
-    return total;
+    finish_peak = verify_prepared_add_bytes(
+        finish_peak, (size_t)v->NRall, sizeof(int));
+    finish_peak = verify_prepared_add_bytes(
+        finish_peak, (size_t)prepared->nrimage,
+        3U * sizeof(double));
+    transient_peak = MAX(score_peak, finish_peak);
+    return verify_prepared_add_bytes(retained, transient_peak, 1U);
 }
 
 unsigned long long
@@ -3078,6 +3662,7 @@ double verify_star_lists(double* refxys, int NR,
     int besti;
     int* theta;
     double* allodds;
+    anbool score_completed;
 
     memset(&v, 0, sizeof(verify_t));
     v.NRall = v.NR = NR;
@@ -3093,9 +3678,43 @@ double verify_star_lists(double* refxys, int NR,
     X = real_verify_star_lists(&v, effective_area, distractors,
                                logodds_bail, logodds_stoplooking, &besti,
                                &allodds, &theta,
-                               p_worstlogodds, &ibailed, &istopped);
-    fixup_theta(theta, allodds, ibailed, istopped, &v, besti, NR, NULL,
-                &etheta, &eodds);
+                               p_worstlogodds, &ibailed, &istopped,
+                               &score_completed);
+    if (!score_completed) {
+        if (p_all_logodds) {
+            *p_all_logodds = NULL;
+        }
+        if (p_theta) {
+            *p_theta = NULL;
+        }
+        if (p_testperm) {
+            *p_testperm = NULL;
+        }
+        free(v.testperm);
+        free(v.refperm);
+        free(v.badguys);
+        return -LARGE_VAL;
+    }
+    if (fixup_theta(
+            theta, allodds, ibailed, istopped,
+            &v, besti, NR, NULL,
+            &etheta, &eodds)) {
+        free(theta);
+        free(allodds);
+        free(v.testperm);
+        free(v.refperm);
+        free(v.badguys);
+        if (p_all_logodds) {
+            *p_all_logodds = NULL;
+        }
+        if (p_theta) {
+            *p_theta = NULL;
+        }
+        if (p_testperm) {
+            *p_testperm = NULL;
+        }
+        return -LARGE_VAL;
+    }
     free(theta);
     free(allodds);
 
@@ -3159,6 +3778,7 @@ double verify_star_lists_ror(double* refxys, int NR,
     int i, j;
     int Ngood;
     double effective_area;
+    anbool score_completed;
 
     memset(&v, 0, sizeof(verify_t));
     v.NRall = v.NR = NR;
@@ -3244,12 +3864,31 @@ double verify_star_lists_ror(double* refxys, int NR,
         X = real_verify_star_lists(&v, effective_area, distractors,
                                    logodds_bail, logodds_stoplooking, &besti,
                                    &allodds, &theta,
-                                   p_worstlogodds, &ibailed, &istopped);
-        fixup_theta(theta, allodds, ibailed, istopped, &v, besti, NR, NULL,
-                    &etheta, &eodds);
-        free(theta);
-        free(allodds);
-
+                                   p_worstlogodds, &ibailed, &istopped,
+                                   &score_completed);
+        if (!score_completed) {
+            X = -LARGE_VAL;
+            if (p_all_logodds) {
+                *p_all_logodds = NULL;
+            }
+            if (p_theta) {
+                *p_theta = NULL;
+            }
+            goto cleanup;
+        }
+        if (fixup_theta(
+                theta, allodds, ibailed, istopped,
+                &v, besti, NR, NULL,
+                &etheta, &eodds)) {
+            X = -LARGE_VAL;
+            if (p_all_logodds) {
+                *p_all_logodds = NULL;
+            }
+            if (p_theta) {
+                *p_theta = NULL;
+            }
+            goto cleanup;
+        }
         if (p_all_logodds)
             *p_all_logodds = eodds;
         else
@@ -3267,6 +3906,9 @@ double verify_star_lists_ror(double* refxys, int NR,
     }
 
 
+cleanup:
+    free(theta);
+    free(allodds);
     if (p_testperm)
         *p_testperm = v.testperm;
     else

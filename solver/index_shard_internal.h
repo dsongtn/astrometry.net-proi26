@@ -445,6 +445,12 @@ typedef struct index_shard_staged_run_stats {
 size_t index_shard_staged_capacity(void);
 
 /*
+ * Return the stable compute-lane width for a staged group. Unlike
+ * index_shard_staged_capacity(), this is not a task-storage bound.
+ */
+size_t index_shard_staged_compute_width(void);
+
+/*
  * Publish one bounded owner-scoped group. The group object is heap-backed and
  * remains published while its outwardly synchronous owner call schedules
  * preparation, submission, completion, execution, and ordered retirement.

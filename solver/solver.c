@@ -774,6 +774,13 @@ static int solver_handle_query_hit(
     anbool fake_match,
     verify_index_query_t** query);
 
+static int solver_handle_scored_query_hit(
+    solver_t* sp,
+    MatchObj* mo,
+    sip_t* sip,
+    anbool fake_match,
+    solver_candidate_delivery_record_t* record);
+
 static double solver_prepare_hit_for_verify(
     solver_t* sp,
     MatchObj* mo,
@@ -805,6 +812,8 @@ void solver_profile_accumulate(solver_profile_t* total,
     total->codekd_wall_seconds += profile->codekd_wall_seconds;
     total->resolve_wall_seconds += profile->resolve_wall_seconds;
     total->verify_wall_seconds += profile->verify_wall_seconds;
+    total->verification_score_wall_seconds +=
+        profile->verification_score_wall_seconds;
 
     total->codekd_calls += profile->codekd_calls;
     total->codekd_hits += profile->codekd_hits;
@@ -914,6 +923,27 @@ void solver_profile_accumulate(solver_profile_t* total,
         profile->candidate_math_prepared;
     total->candidate_math_reused +=
         profile->candidate_math_reused;
+    total->verification_score_batches_prepared +=
+        profile->verification_score_batches_prepared;
+    total->verification_score_contexts_prepared +=
+        profile->verification_score_contexts_prepared;
+    total->verification_score_batches_executed +=
+        profile->verification_score_batches_executed;
+    total->verification_score_contexts_completed +=
+        profile->verification_score_contexts_completed;
+    if (ULLONG_MAX -
+            total->verification_score_work_units_completed <
+        profile->verification_score_work_units_completed) {
+        total->verification_score_work_units_completed =
+            ULLONG_MAX;
+    } else {
+        total->verification_score_work_units_completed +=
+            profile->verification_score_work_units_completed;
+    }
+    total->verification_score_fallback_batches +=
+        profile->verification_score_fallback_batches;
+    total->verification_score_stopped_batches +=
+        profile->verification_score_stopped_batches;
     total->staged_owner_claims += profile->staged_owner_claims;
     total->staged_foreign_claims += profile->staged_foreign_claims;
     total->staged_io_submitted += profile->staged_io_submitted;
@@ -1042,7 +1072,9 @@ static void solver_profile_report(const solver_t* solver) {
            "rows=%llu/%llu/%llu/%llu "
            "verify_pages=%llu/%llu prefixes=%llu tickets=%llu/%llu "
            "fallback=%llu ready_rows=%llu ranges=%llu "
-           "bytes=%llu/%llu candidate_math=%llu/%llu\n",
+           "bytes=%llu/%llu candidate_math=%llu/%llu "
+           "verify_score=%llu/%llu/%llu/%llu/%llu/%llu "
+           "work=%llu work_wall_sum=%.6f\n",
            profile->page_plan_descriptors_total,
            profile->page_plan_descriptors_complete,
            profile->page_plan_descriptor_splits,
@@ -1090,7 +1122,15 @@ static void solver_profile_report(const solver_t* solver) {
            profile->verification_page_logical_bytes,
            profile->verification_page_aligned_bytes,
            profile->candidate_math_prepared,
-           profile->candidate_math_reused);
+           profile->candidate_math_reused,
+           profile->verification_score_batches_prepared,
+           profile->verification_score_contexts_prepared,
+           profile->verification_score_batches_executed,
+           profile->verification_score_contexts_completed,
+           profile->verification_score_fallback_batches,
+           profile->verification_score_stopped_batches,
+           profile->verification_score_work_units_completed,
+           profile->verification_score_wall_seconds);
 }
 
 static void check_scale(pquad* pq, solver_t* s) {
@@ -1728,11 +1768,11 @@ static void add_stars(const pquad* pq, int* field, int fieldoffset,
 #ifndef SOLVER_AB_CANDIDATE_LIMIT_BYTES
 #define SOLVER_AB_CANDIDATE_LIMIT_BYTES (768U * 1024U)
 #endif
-#define SOLVER_AB_DESCRIPTOR_MAX_TASKS 6U
 #define SOLVER_AB_DESCRIPTOR_CAPACITY 4096U
 /* Keep task splitting coarse, but admit one-task delivery by actual work. */
 #define SOLVER_AB_DESCRIPTOR_MIN_COMBINATIONS 64U
 #define SOLVER_AB_DESCRIPTOR_DELIVERY_MIN_HYPOTHESES 64U
+#define SOLVER_AB_DESCRIPTOR_TASK_MIN_HYPOTHESES 32U
 #define SOLVER_AB_DESCRIPTOR_MAX_FIELD_OBJECTS 1000
 #define SOLVER_AB_DESCRIPTOR_PAIR_CACHE_BYTES \
     (8U * 1024U * 1024U)
@@ -3825,10 +3865,22 @@ static int solver_ab_try_verification_wave(
                     slot->prepared,
                     &scores[slot_cursor - 1U],
                     &candidate_runtime->match)) {
-                solver->profile.execution_failed = TRUE;
-                solver->quit_now = TRUE;
-                handled = 1;
-                goto cleanup;
+                verify_destroy_prepared_score(
+                    &scores[slot_cursor - 1U]);
+                verify_destroy_prepared_hit(slot->prepared);
+                slot->prepared = NULL;
+                if (solver_handle_hit(
+                        solver,
+                        &candidate_runtime->match,
+                        NULL,
+                        FALSE)) {
+                    solver->quit_now = TRUE;
+                }
+                if (unlikely(solver->quit_now)) {
+                    handled = 1;
+                    goto cleanup;
+                }
+                break;
             }
             solver->profile.verify_calls++;
             if (solver_handle_hit_after_verify(
@@ -3886,6 +3938,7 @@ typedef struct solver_ab_descriptor_task_input {
 typedef struct solver_ab_descriptor_workspace {
     solver_ab_descriptor_planner_t planner;
     solver_ab_descriptor_output_t* outputs;
+    size_t output_capacity;
 } solver_ab_descriptor_workspace_t;
 
 static pthread_key_t solver_ab_descriptor_workspace_key;
@@ -3929,6 +3982,28 @@ static void solver_ab_descriptor_workspace_make_key(void) {
             solver_ab_descriptor_workspace_destroy);
 }
 
+static int solver_ab_descriptor_workspace_reserve_outputs(
+    solver_ab_descriptor_workspace_t* workspace,
+    size_t output_count) {
+    solver_ab_descriptor_output_t* outputs;
+
+    if (!workspace || !output_count ||
+        output_count > SIZE_MAX / sizeof(*outputs)) {
+        return -1;
+    }
+    if (output_count <= workspace->output_capacity) {
+        return 0;
+    }
+    outputs = calloc(output_count, sizeof(*outputs));
+    if (!outputs) {
+        return -1;
+    }
+    free(workspace->outputs);
+    workspace->outputs = outputs;
+    workspace->output_capacity = output_count;
+    return 0;
+}
+
 static solver_ab_descriptor_workspace_t*
 solver_ab_descriptor_workspace_get(void) {
     solver_ab_descriptor_workspace_t* workspace;
@@ -3946,13 +4021,6 @@ solver_ab_descriptor_workspace_get(void) {
     }
     workspace = calloc(1, sizeof(*workspace));
     if (!workspace) {
-        return NULL;
-    }
-    workspace->outputs = calloc(
-        SOLVER_AB_DESCRIPTOR_MAX_TASKS,
-        sizeof(*workspace->outputs));
-    if (!workspace->outputs) {
-        free(workspace);
         return NULL;
     }
     workspace->planner.pair_cache_limit_bytes =
@@ -4087,6 +4155,7 @@ static size_t solver_ab_descriptor_expansion(
     (2U * 1024U * 1024U)
 #define SOLVER_CANDIDATE_DELIVERY_LIMIT \
     (FITSBIN_PREAD_ASYNC_RANGE_LIMIT / 2U)
+#define SOLVER_VERIFY_QUERY_LOOKAHEAD 16U
 #define SOLVER_CANDIDATE_STAR_LIMIT \
     (SOLVER_CANDIDATE_DELIVERY_LIMIT * DQMAX)
 #if SOLVER_CANDIDATE_STAR_LIMIT > FITSBIN_MMAP_PREFETCH_RANGE_LIMIT
@@ -4112,7 +4181,6 @@ typedef enum solver_codekd_search_packet_state {
     SOLVER_CODEKD_PACKET_ALLOCATED = 0,
     SOLVER_CODEKD_PACKET_DESCRIPTORS_READY,
     SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE,
-    SOLVER_CODEKD_PACKET_IO_SUBMITTED,
     SOLVER_CODEKD_PACKET_COMPUTE_READY,
     SOLVER_CODEKD_PACKET_QUAD_SUBMIT_READY,
     SOLVER_CODEKD_PACKET_QUAD_IO_SUBMITTED,
@@ -4127,6 +4195,8 @@ typedef enum solver_codekd_search_packet_state {
     SOLVER_CODEKD_PACKET_VERIFY_SWEEP_SUBMIT_READY,
     SOLVER_CODEKD_PACKET_VERIFY_SWEEP_IO_SUBMITTED,
     SOLVER_CODEKD_PACKET_VERIFY_SWEEP_COMPUTE_READY,
+    SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER,
+    SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY,
     SOLVER_CODEKD_PACKET_VERIFY_COMPUTE_READY,
     SOLVER_CODEKD_PACKET_EXECUTING,
     SOLVER_CODEKD_PACKET_RESULTS_READY,
@@ -4191,6 +4261,23 @@ typedef struct solver_codekd_page_plan_stats {
     size_t refusal_counts[SOLVER_CODEKD_PAGE_PLAN_CANCELLED + 1U];
 } solver_codekd_page_plan_stats_t;
 
+typedef struct solver_codekd_verification_snapshot {
+    MatchObj match_template;
+    const verify_field_t* field;
+    int index_cutnside;
+    int indexid;
+    int healpix;
+    int hpnside;
+    double index_jitter;
+    double verify_pix;
+    double distractor_ratio;
+    double logratio_bail_threshold;
+    double logaccept;
+    double logratio_stoplooking;
+    anbool distance_from_quad_bonus;
+    anbool enabled;
+} solver_codekd_verification_snapshot_t;
+
 struct solver_candidate_delivery_record {
     unsigned int quadid;
     unsigned int stars[DQMAX];
@@ -4203,10 +4290,23 @@ struct solver_candidate_delivery_record {
     size_t descriptor_index;
     solver_ab_candidate_action_t plan_action;
     double verify_center[3];
+    double verify_radius;
     double verify_radius2;
+    double prepared_verify_pix2;
+    double prepared_logaccept;
+    double prepared_distractor_ratio;
+    double prepared_logratio_bail_threshold;
+    double prepared_logratio_stoplooking;
+    double prepared_field_maxx;
+    double prepared_field_maxy;
+    verify_prepared_hit_t* prepared_verification;
+    verify_prepared_score_t prepared_score;
     anbool prepared_parity;
     anbool candidate_prepared;
     anbool verify_delivery_fallback;
+    anbool verify_query_captured;
+    anbool prepared_distance_from_quad_bonus;
+    anbool verification_score_ready;
 };
 
 typedef struct solver_codekd_search_packet {
@@ -4245,6 +4345,9 @@ typedef struct solver_codekd_search_packet {
     size_t verify_plan_logical_bytes;
     size_t verify_query_budget;
     size_t verify_query_bytes;
+    size_t verify_prepared_count;
+    size_t verify_prepared_retained_bytes;
+    size_t verify_prepared_transient_bytes;
     size_t verify_sweep_range_count;
     size_t verify_sweep_aligned_bytes;
     size_t verify_sweep_storage_bytes;
@@ -4287,6 +4390,14 @@ typedef struct solver_codekd_search_packet {
     unsigned long long verification_page_logical_bytes;
     unsigned long long verification_page_aligned_bytes;
     unsigned long long candidate_math_prepared;
+    unsigned long long verification_score_batches_prepared;
+    unsigned long long verification_score_contexts_prepared;
+    unsigned long long verification_score_batches_executed;
+    unsigned long long verification_score_contexts_completed;
+    unsigned long long verification_score_work_units_completed;
+    unsigned long long verification_score_fallback_batches;
+    unsigned long long verification_score_stopped_batches;
+    double verification_score_wall_seconds;
     int dimquads;
     anbool plan_complete;
     anbool pending_descriptor_plan;
@@ -4318,16 +4429,54 @@ typedef struct solver_codekd_packet_task_input {
     double abscale_high;
     double funits_lower;
     double funits_upper;
+    solver_codekd_verification_snapshot_t verification;
 } solver_codekd_packet_task_input_t;
 
 typedef struct solver_codekd_packet_wave {
-    solver_codekd_packet_task_input_t
-        inputs[SOLVER_AB_DESCRIPTOR_MAX_TASKS];
-    solver_codekd_search_packet_t
-        packets[SOLVER_AB_DESCRIPTOR_MAX_TASKS];
-    index_shard_staged_task_t
-        tasks[SOLVER_AB_DESCRIPTOR_MAX_TASKS];
+    solver_codekd_packet_task_input_t* inputs;
+    solver_codekd_search_packet_t* packets;
+    index_shard_staged_task_t* tasks;
+    size_t capacity;
 } solver_codekd_packet_wave_t;
+
+static solver_codekd_packet_wave_t*
+solver_codekd_packet_wave_create(size_t capacity) {
+    solver_codekd_packet_wave_t* wave;
+
+    if (!capacity ||
+        capacity > SIZE_MAX / sizeof(*wave->inputs) ||
+        capacity > SIZE_MAX / sizeof(*wave->packets) ||
+        capacity > SIZE_MAX / sizeof(*wave->tasks)) {
+        return NULL;
+    }
+    wave = calloc(1, sizeof(*wave));
+    if (!wave) {
+        return NULL;
+    }
+    wave->inputs = calloc(capacity, sizeof(*wave->inputs));
+    wave->packets = calloc(capacity, sizeof(*wave->packets));
+    wave->tasks = calloc(capacity, sizeof(*wave->tasks));
+    if (!wave->inputs || !wave->packets || !wave->tasks) {
+        free(wave->tasks);
+        free(wave->packets);
+        free(wave->inputs);
+        free(wave);
+        return NULL;
+    }
+    wave->capacity = capacity;
+    return wave;
+}
+
+static void solver_codekd_packet_wave_destroy(
+    solver_codekd_packet_wave_t* wave) {
+    if (!wave) {
+        return;
+    }
+    free(wave->tasks);
+    free(wave->packets);
+    free(wave->inputs);
+    free(wave);
+}
 
 static int solver_codekd_packet_finish_codekd(
     solver_codekd_search_packet_t* packet);
@@ -4886,6 +5035,11 @@ static void solver_codekd_page_plan_record_refusal(
     packet->page_stats.refusal_counts[reason]++;
 }
 
+static anbool solver_codekd_packet_plan_cancelled(void* opaque) {
+    (void)opaque;
+    return index_shard_worker_stop_requested();
+}
+
 /*
  * Plan the next contiguous descriptor slice transactionally. A positive
  * result exposes one complete sealed plan. Zero means every descriptor now
@@ -4906,7 +5060,7 @@ static int solver_codekd_search_packet_prepare_next_plan(
         !packet->tree->io || !packet->tree->io_is_fitsbin ||
         !packet->descriptors || !packet->slots ||
         !packet->page_workspace || !cancelled ||
-        packet->state != SOLVER_CODEKD_PACKET_IO_SUBMITTED ||
+        packet->state != SOLVER_CODEKD_PACKET_DESCRIPTORS_READY ||
         packet->next_descriptor > packet->count) {
         return -1;
     }
@@ -5101,55 +5255,6 @@ static int solver_codekd_search_packet_prepare_next_plan(
         }
         packet->state = SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE;
     }
-    return 1;
-}
-
-static int solver_codekd_packet_plan_pages(
-    void* opaque,
-    fitsbin_payload_io_cancel_check_fn cancelled,
-    void* cancel_opaque,
-    fitsbin_prefetch_range_t* ranges,
-    size_t range_capacity,
-    size_t* range_count) {
-    solver_codekd_search_packet_t* packet = opaque;
-    int plan_status;
-
-    if (!packet || !cancelled || !ranges || !range_count) {
-        errno = EINVAL;
-        return -1;
-    }
-    *range_count = 0U;
-    plan_status = solver_codekd_search_packet_prepare_next_plan(
-        packet, cancelled, cancel_opaque);
-    if (plan_status < 0) {
-        packet->state = SOLVER_CODEKD_PACKET_FAILED;
-        errno = EIO;
-        return -1;
-    }
-    if (plan_status == 2) {
-        errno = ECANCELED;
-        return -1;
-    }
-    if (!plan_status) {
-        return 0;
-    }
-    if (!packet->plan_complete ||
-        packet->state != SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE ||
-        !packet->page_workspace || !packet->plan_range_count) {
-        packet->state = SOLVER_CODEKD_PACKET_FAILED;
-        errno = EINVAL;
-        return -1;
-    }
-    if (packet->plan_range_count > range_capacity) {
-        packet->state = SOLVER_CODEKD_PACKET_FAILED;
-        errno = E2BIG;
-        return -1;
-    }
-    memcpy(
-        ranges,
-        packet->page_workspace->sealed_ranges,
-        packet->plan_range_count * sizeof(*ranges));
-    *range_count = packet->plan_range_count;
     return 1;
 }
 
@@ -5494,6 +5599,36 @@ static void solver_codekd_packet_clear_sweep_storage(
     packet->verify_sweep_storage_bytes = 0U;
 }
 
+static void solver_codekd_record_clear_prepared_verification(
+    solver_candidate_delivery_record_t* record) {
+    if (!record) {
+        return;
+    }
+    verify_destroy_prepared_score(&record->prepared_score);
+    verify_destroy_prepared_hit(record->prepared_verification);
+    record->prepared_verification = NULL;
+    record->prepared_verify_pix2 = 0.0;
+    record->prepared_logaccept = 0.0;
+    record->prepared_distractor_ratio = 0.0;
+    record->prepared_logratio_bail_threshold = 0.0;
+    record->prepared_logratio_stoplooking = 0.0;
+    record->prepared_field_maxx = 0.0;
+    record->prepared_field_maxy = 0.0;
+    record->prepared_distance_from_quad_bonus = FALSE;
+    record->verification_score_ready = FALSE;
+}
+
+static void solver_codekd_record_clear_verification_speculation(
+    solver_candidate_delivery_record_t* record) {
+    if (!record) {
+        return;
+    }
+    verify_destroy_index_query(record->verify_query);
+    record->verify_query = NULL;
+    record->verify_query_captured = FALSE;
+    solver_codekd_record_clear_prepared_verification(record);
+}
+
 static int solver_codekd_search_packet_cleanup(
     solver_codekd_search_packet_t* packet) {
     size_t candidate_index;
@@ -5507,11 +5642,15 @@ static int solver_codekd_search_packet_cleanup(
          packet->candidate_records &&
          candidate_index < packet->candidate_capacity;
          candidate_index++) {
+        solver_codekd_record_clear_prepared_verification(
+            &packet->candidate_records[candidate_index]);
         verify_destroy_index_query(
             packet->candidate_records[
                 candidate_index].verify_query);
         packet->candidate_records[
             candidate_index].verify_query = NULL;
+        packet->candidate_records[
+            candidate_index].verify_query_captured = FALSE;
     }
     solver_codekd_page_workspace_cleanup(packet->page_workspace);
     free(packet->slots);
@@ -5608,6 +5747,35 @@ static void solver_codekd_packet_profile_accumulate(
         packet->verification_page_aligned_bytes;
     solver->profile.candidate_math_prepared +=
         packet->candidate_math_prepared;
+    solver->profile.verification_score_batches_prepared +=
+        packet->verification_score_batches_prepared;
+    solver->profile.verification_score_contexts_prepared +=
+        packet->verification_score_contexts_prepared;
+    solver->profile.verification_score_batches_executed +=
+        packet->verification_score_batches_executed;
+    solver->profile.verification_score_contexts_completed +=
+        packet->verification_score_contexts_completed;
+    if (ULLONG_MAX -
+            solver->profile.verification_score_work_units_completed <
+        packet->verification_score_work_units_completed) {
+        solver->profile.verification_score_work_units_completed =
+            ULLONG_MAX;
+    } else {
+        solver->profile.verification_score_work_units_completed +=
+            packet->verification_score_work_units_completed;
+    }
+    solver->profile.verification_score_fallback_batches +=
+        packet->verification_score_fallback_batches;
+    solver->profile.verification_score_stopped_batches +=
+        packet->verification_score_stopped_batches;
+    solver->profile.verification_score_wall_seconds +=
+        packet->verification_score_wall_seconds;
+    if (packet->detailed) {
+        solver->profile.verify_wall_seconds +=
+            packet->verification_score_wall_seconds;
+        solver->profile.resolve_wall_seconds +=
+            packet->verification_score_wall_seconds;
+    }
 }
 
 /*
@@ -5795,25 +5963,50 @@ static int solver_codekd_packet_mark_plan_owner_replay(
     return 0;
 }
 
-static int solver_codekd_packet_mark_remaining_owner_replay(
+/*
+ * A permanent pre-submission refusal invalidates the current sealed plan and
+ * makes another plan attempt uneconomic. Preserve the exact logical work by
+ * replaying the planned prefix and every still-unplanned descriptor at owner
+ * retirement.
+ */
+static int solver_codekd_packet_mark_outstanding_owner_replay(
     solver_codekd_search_packet_t* packet,
     solver_codekd_page_plan_reason_t reason) {
     size_t descriptor_index;
 
-    if (!packet || packet->next_descriptor > packet->count ||
-        (packet->state != SOLVER_CODEKD_PACKET_DESCRIPTORS_READY &&
-         packet->state != SOLVER_CODEKD_PACKET_IO_SUBMITTED)) {
+    if (!packet || !packet->plan_complete ||
+        packet->state != SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE ||
+        packet->plan_first >= packet->plan_end ||
+        packet->plan_end > packet->next_descriptor ||
+        packet->next_descriptor > packet->count) {
         return -1;
     }
-    for (descriptor_index = packet->next_descriptor;
-         descriptor_index < packet->count;
+    for (descriptor_index = packet->plan_first;
+         descriptor_index < packet->plan_end;
          descriptor_index++) {
         if (packet->slots[descriptor_index].state !=
             SOLVER_CODEKD_RESULT_UNUSED) {
             return -1;
         }
-        packet->slots[descriptor_index].state =
-            SOLVER_CODEKD_RESULT_OWNER_REPLAY;
+    }
+    for (descriptor_index = packet->plan_end;
+         descriptor_index < packet->count;
+         descriptor_index++) {
+        if (packet->slots[descriptor_index].state !=
+                SOLVER_CODEKD_RESULT_UNUSED &&
+            packet->slots[descriptor_index].state !=
+                SOLVER_CODEKD_RESULT_OWNER_REPLAY) {
+            return -1;
+        }
+    }
+    for (descriptor_index = packet->plan_first;
+         descriptor_index < packet->count;
+         descriptor_index++) {
+        if (packet->slots[descriptor_index].state ==
+            SOLVER_CODEKD_RESULT_UNUSED) {
+            packet->slots[descriptor_index].state =
+                SOLVER_CODEKD_RESULT_OWNER_REPLAY;
+        }
     }
     solver_codekd_page_plan_record_refusal(packet, reason);
     packet->next_descriptor = packet->count;
@@ -5840,8 +6033,14 @@ static int solver_codekd_packet_submit_pages(
     if (!packet || !packet->tree || !packet->tree->io ||
         !packet->tree->io_is_fitsbin || !packet->page_workspace ||
         packet->delivery_source || packet->delivery_ticket ||
-        packet->state != SOLVER_CODEKD_PACKET_DESCRIPTORS_READY ||
-        packet->next_descriptor >= packet->count) {
+        packet->state != SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE ||
+        !packet->plan_complete ||
+        packet->plan_first >= packet->plan_end ||
+        packet->plan_end > packet->next_descriptor ||
+        packet->next_descriptor > packet->count ||
+        !packet->plan_range_count ||
+        packet->plan_range_count >
+            packet->page_workspace->sealed_range_capacity) {
         return -1;
     }
     if (index_shard_worker_stop_requested()) {
@@ -5852,12 +6051,11 @@ static int solver_codekd_packet_submit_pages(
     }
     source = (fitsbin_t*)packet->tree->io;
     packet->delivery_source = source;
-    packet->state = SOLVER_CODEKD_PACKET_IO_SUBMITTED;
     errno = 0;
-    submit_status = fitsbin_prefetch_ranges_planned_submit(
+    submit_status = fitsbin_prefetch_ranges_submit(
         source,
-        solver_codekd_packet_plan_pages,
-        packet,
+        packet->page_workspace->sealed_ranges,
+        packet->plan_range_count,
         SOLVER_CODEKD_DELIVERY_BUDGET_BYTES,
         &packet->delivery_ticket);
     if (submit_status > 0 && packet->delivery_ticket) {
@@ -5866,7 +6064,6 @@ static int solver_codekd_packet_submit_pages(
     packet->delivery_ticket = NULL;
     packet->delivery_source = NULL;
     if (!submit_status && errno == EAGAIN) {
-        packet->state = SOLVER_CODEKD_PACKET_DESCRIPTORS_READY;
         return 0;
     }
     if (index_shard_worker_stop_requested()) {
@@ -5875,8 +6072,7 @@ static int solver_codekd_packet_submit_pages(
             packet, SOLVER_CODEKD_PAGE_PLAN_CANCELLED);
         return -1;
     }
-    packet->state = SOLVER_CODEKD_PACKET_DESCRIPTORS_READY;
-    if (solver_codekd_packet_mark_remaining_owner_replay(
+    if (solver_codekd_packet_mark_outstanding_owner_replay(
             packet,
             submit_status < 0
                 ? SOLVER_CODEKD_PAGE_PLAN_SERVICE_ERROR
@@ -5945,6 +6141,9 @@ static int solver_codekd_packet_begin_candidate_window(
     packet->verify_plan_range_count = 0U;
     packet->verify_plan_logical_bytes = 0U;
     packet->verify_query_bytes = 0U;
+    packet->verify_prepared_count = 0U;
+    packet->verify_prepared_retained_bytes = 0U;
+    packet->verify_prepared_transient_bytes = 0U;
     packet->verify_sweep_range_count = 0U;
     packet->verify_sweep_aligned_bytes = 0U;
     packet->verify_sweep_storage_bytes = 0U;
@@ -5975,11 +6174,15 @@ static void solver_codekd_packet_clear_candidate_window(
     for (candidate_index = 0U;
          candidate_index < packet->candidate_window_count;
          candidate_index++) {
+        solver_codekd_record_clear_prepared_verification(
+            &packet->candidate_records[candidate_index]);
         verify_destroy_index_query(
             packet->candidate_records[
                 candidate_index].verify_query);
         packet->candidate_records[
             candidate_index].verify_query = NULL;
+        packet->candidate_records[
+            candidate_index].verify_query_captured = FALSE;
     }
     packet->candidate_window_first = packet->candidate_cursor;
     packet->candidate_window_count = 0U;
@@ -5994,6 +6197,9 @@ static void solver_codekd_packet_clear_candidate_window(
     packet->verify_plan_range_count = 0U;
     packet->verify_plan_logical_bytes = 0U;
     packet->verify_query_bytes = 0U;
+    packet->verify_prepared_count = 0U;
+    packet->verify_prepared_retained_bytes = 0U;
+    packet->verify_prepared_transient_bytes = 0U;
     packet->verify_sweep_range_count = 0U;
     packet->verify_sweep_aligned_bytes = 0U;
     packet->verify_sweep_storage_bytes = 0U;
@@ -6054,6 +6260,7 @@ static int solver_codekd_packet_build_verify_queries(
         record->plan_action = SOLVER_AB_CANDIDATE_SCALE_SKIP;
         record->candidate_prepared = FALSE;
         memset(record->verify_center, 0, sizeof(record->verify_center));
+        record->verify_radius = 0.0;
         record->verify_radius2 = 0.0;
         if (record->descriptor_index >= packet->count) {
             return -1;
@@ -6127,9 +6334,11 @@ static int solver_codekd_packet_build_verify_queries(
             &wcs, input->field_minx, input->field_miny, corner);
         radius = sqrt(distsq(
             record->verify_center, corner, 3));
+        record->verify_radius = radius;
         record->verify_radius2 = square(radius);
         if (!isfinite(record->verify_radius2) ||
             record->verify_radius2 < 0.0) {
+            record->verify_radius = 0.0;
             record->verify_radius2 = 0.0;
             record->verify_delivery_fallback = TRUE;
             continue;
@@ -6608,10 +6817,10 @@ static int solver_codekd_packet_collect_pages(
         return -1;
     }
     /*
-     * Planned-ticket output is owned by the I/O lane until terminal
-     * publication. Poll's payload_io mutex edge makes its state writes
-     * visible here; reading packet state before terminal collection races
-     * the planner.
+     * Verification planned-ticket output is owned by the I/O lane until
+     * terminal publication. Poll's payload_io mutex edge makes those state
+     * writes visible here. Initial CodeKD tickets use an immutable sealed
+     * plan, so their packet remains PAGE_PLAN_COMPLETE while queued.
      */
     io_state = packet->state;
     if (fitsbin_payload_io_ticket_destroy_checked(
@@ -6735,15 +6944,6 @@ static int solver_codekd_packet_collect_pages(
         return packet->state == SOLVER_CODEKD_PACKET_RESULTS_READY
             ? 3
             : 2;
-    }
-    if (ticket_result < 0 && !packet->plan_complete &&
-        packet->state == SOLVER_CODEKD_PACKET_IO_SUBMITTED) {
-        if (solver_codekd_packet_mark_remaining_owner_replay(
-                packet, SOLVER_CODEKD_PAGE_PLAN_SERVICE_ERROR)) {
-            packet->state = SOLVER_CODEKD_PACKET_FAILED;
-            return -1;
-        }
-        return 3;
     }
     packet->delivery_source = NULL;
     packet->state = SOLVER_CODEKD_PACKET_FAILED;
@@ -6997,6 +7197,7 @@ solver_codekd_packet_query_verification_ready(
     size_t unique_pages = 0U;
     size_t range_count = 0U;
     size_t aligned_bytes = 0U;
+    size_t captured_queries = 0U;
     int seal_status;
 
     if (!packet || !more_work || !packet->starkd ||
@@ -7035,7 +7236,10 @@ solver_codekd_packet_query_verification_ready(
     packet->verify_pending_query_logical_bytes = 0U;
     solver_codekd_page_set_reset(&workspace->descriptor);
     solver_codekd_page_set_reset(&workspace->group);
-    plan_end = packet->verify_plan_end;
+    plan_end = MIN(
+        packet->verify_plan_end,
+        packet->verify_plan_first +
+            (size_t)SOLVER_VERIFY_QUERY_LOOKAHEAD);
     segment_end = packet->verify_plan_first;
     packet->verify_sweep_range_count = 0U;
     packet->verify_sweep_aligned_bytes = 0U;
@@ -7055,6 +7259,14 @@ solver_codekd_packet_query_verification_ready(
 
         if (record->plan_action !=
             SOLVER_AB_CANDIDATE_VERIFY) {
+            segment_end = candidate_index + 1U;
+            continue;
+        }
+        if (record->verify_query_captured) {
+            if (!record->verify_query) {
+                return INDEX_SHARD_HELPER_TASK_ERROR;
+            }
+            captured_queries++;
             segment_end = candidate_index + 1U;
             continue;
         }
@@ -7169,6 +7381,17 @@ solver_codekd_packet_query_verification_ready(
     if (segment_end <= packet->verify_plan_first) {
         goto sweep_fallback;
     }
+    if (!workspace->group.count) {
+        packet->verify_plan_end = segment_end;
+        packet->verify_sweep_range_count = 0U;
+        packet->verify_sweep_aligned_bytes = 0U;
+        packet->verify_sweep_plan_complete = FALSE;
+        packet->state = captured_queries
+            ? SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER
+            : SOLVER_CODEKD_PACKET_RESULTS_READY;
+        *more_work = captured_queries != 0U;
+        return INDEX_SHARD_HELPER_TASK_OK;
+    }
     seal_status = solver_codekd_page_plan_seal_union(
         workspace,
         FALSE,
@@ -7212,6 +7435,7 @@ solver_codekd_packet_capture_sweep_ready(
     solver_codekd_search_packet_t* packet,
     anbool* more_work) {
     size_t candidate_index;
+    size_t captured_queries = 0U;
     anbool direct;
     anbool storage_valid = TRUE;
     anbool capture_failed = FALSE;
@@ -7258,6 +7482,14 @@ solver_codekd_packet_capture_sweep_ready(
             packet->state = SOLVER_CODEKD_PACKET_STOPPED;
             return INDEX_SHARD_HELPER_TASK_STOPPED;
         }
+        if (record->verify_query_captured) {
+            if (!record->verify_query) {
+                solver_codekd_packet_clear_sweep_storage(packet);
+                return INDEX_SHARD_HELPER_TASK_ERROR;
+            }
+            captured_queries++;
+            continue;
+        }
         if (record->verify_query &&
             (!direct || storage_valid)) {
             int capture_status = direct
@@ -7272,6 +7504,9 @@ solver_codekd_packet_capture_sweep_ready(
 
             if (capture_status) {
                 capture_failed = TRUE;
+            } else {
+                record->verify_query_captured = TRUE;
+                captured_queries++;
             }
         }
     }
@@ -7283,8 +7518,408 @@ solver_codekd_packet_capture_sweep_ready(
     if (capture_failed) {
         packet->verification_page_fallback++;
     }
-    packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+    packet->state = captured_queries
+        ? SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER
+        : SOLVER_CODEKD_PACKET_RESULTS_READY;
+    *more_work =
+        packet->state == SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER;
     return INDEX_SHARD_HELPER_TASK_OK;
+}
+
+static int solver_codekd_packet_build_verification_match(
+    const solver_codekd_packet_task_input_t* input,
+    const solver_codekd_search_packet_t* packet,
+    const solver_candidate_delivery_record_t* record,
+    size_t candidate_index,
+    MatchObj* match,
+    double* verify_pix2,
+    double* logaccept) {
+    const solver_codekd_verification_snapshot_t* snapshot;
+    const solver_codekd_result_slot_t* slot;
+    size_t global_candidate;
+    size_t slot_end;
+    double radius2;
+    int star_index;
+
+    if (!input || !packet || !record || !match ||
+        !verify_pix2 || !logaccept ||
+        candidate_index >= packet->candidate_window_count ||
+        packet->candidate_window_first >
+            packet->candidate_count ||
+        candidate_index >=
+            packet->candidate_count -
+                packet->candidate_window_first ||
+        record->descriptor_index >= packet->count ||
+        record->plan_action != SOLVER_AB_CANDIDATE_VERIFY ||
+        !record->candidate_prepared ||
+        packet->dimquads <= 0 || packet->dimquads > DQMAX) {
+        return -1;
+    }
+    snapshot = &input->verification;
+    if (!snapshot->enabled || !snapshot->field ||
+        !isfinite(record->prepared_scale) ||
+        record->prepared_scale == 0.0 ||
+        !isfinite(record->verify_radius) ||
+        record->verify_radius < 0.0 ||
+        !isfinite(snapshot->verify_pix) ||
+        !isfinite(snapshot->index_jitter) ||
+        !isfinite(snapshot->logaccept) ||
+        !isfinite(snapshot->logratio_bail_threshold)) {
+        return -1;
+    }
+    global_candidate =
+        packet->candidate_window_first + candidate_index;
+    slot = &packet->slots[record->descriptor_index];
+    if (slot->state != SOLVER_CODEKD_RESULT_READY ||
+        !slot->hit_count ||
+        slot->hit_first > packet->hit_count ||
+        (size_t)slot->hit_count >
+            packet->hit_count - slot->hit_first) {
+        return -1;
+    }
+    slot_end = slot->hit_first + (size_t)slot->hit_count;
+    if (global_candidate < slot->hit_first ||
+        global_candidate >= slot_end ||
+        packet->inds[global_candidate] != record->quadid) {
+        return -1;
+    }
+    radius2 = square(record->verify_radius);
+    if (memcmp(&radius2, &record->verify_radius2, sizeof(radius2))) {
+        return -1;
+    }
+
+    memcpy(match, &snapshot->match_template, sizeof(*match));
+    memcpy(&match->wcstan, &record->prepared_wcs,
+           sizeof(match->wcstan));
+    match->wcs_valid = TRUE;
+    match->code_err = packet->sdists[global_candidate];
+    match->scale = record->prepared_scale;
+    match->parity = record->prepared_parity;
+    match->quad_npeers = slot->hit_count;
+    match->quadno = record->quadid;
+    match->dimquads = packet->dimquads;
+    for (star_index = 0;
+         star_index < packet->dimquads;
+         star_index++) {
+        match->star[star_index] = record->stars[star_index];
+        match->field[star_index] =
+            record->prepared_fieldstars[star_index];
+        match->ids[star_index] = 0;
+    }
+    memcpy(match->quadpix, record->prepared_fieldxy,
+           (size_t)packet->dimquads * 2U *
+               sizeof(*match->quadpix));
+    memcpy(match->quadxyz, record->starxyz,
+           (size_t)packet->dimquads * 3U *
+               sizeof(*match->quadxyz));
+    memcpy(match->center, record->verify_center,
+           sizeof(match->center));
+    match->radius = record->verify_radius;
+    match->radius_deg = dist2deg(match->radius);
+    match->indexid = snapshot->indexid;
+    match->healpix = snapshot->healpix;
+    match->hpnside = snapshot->hpnside;
+    match->wcstan.imagew = input->field_maxx;
+    match->wcstan.imageh = input->field_maxy;
+    *verify_pix2 = square(snapshot->verify_pix) +
+        square(snapshot->index_jitter / match->scale);
+    *logaccept = snapshot->logaccept;
+    return isfinite(*verify_pix2) ? 0 : -1;
+}
+
+static void solver_codekd_packet_discard_prepared_verification(
+    solver_codekd_search_packet_t* packet) {
+    size_t candidate_index;
+
+    if (!packet || !packet->candidate_records) {
+        return;
+    }
+    for (candidate_index = 0U;
+         candidate_index < packet->candidate_window_count;
+         candidate_index++) {
+        solver_codekd_record_clear_prepared_verification(
+            &packet->candidate_records[candidate_index]);
+    }
+    packet->verify_prepared_count = 0U;
+    packet->verify_prepared_retained_bytes = 0U;
+    packet->verify_prepared_transient_bytes = 0U;
+}
+
+static int solver_codekd_packet_retired_verification_complete(
+    solver_codekd_search_packet_t* packet) {
+    size_t candidate_index;
+
+    if (!packet || !packet->candidate_records ||
+        !packet->verify_plan_complete ||
+        packet->verify_plan_end > packet->candidate_window_count) {
+        return -1;
+    }
+    for (candidate_index = packet->verify_plan_first;
+         candidate_index < packet->verify_plan_end;
+         candidate_index++) {
+        const solver_candidate_delivery_record_t* record =
+            &packet->candidate_records[candidate_index];
+
+        if (record->prepared_verification ||
+            record->verification_score_ready ||
+            record->prepared_score.complete ||
+            record->prepared_score.theta ||
+            record->prepared_score.allodds) {
+            return -1;
+        }
+    }
+    packet->verify_prepared_count = 0U;
+    packet->verify_prepared_retained_bytes = 0U;
+    packet->verify_prepared_transient_bytes = 0U;
+    return 0;
+}
+
+/*
+ * The owner consumes only fully captured native query results and creates
+ * immutable, index-free score contexts. No solver or reducer state is touched.
+ */
+static int solver_codekd_packet_prepare_verification_owner(
+    const solver_codekd_packet_task_input_t* input,
+    solver_codekd_search_packet_t* packet) {
+    const solver_codekd_verification_snapshot_t* snapshot;
+    size_t candidate_index;
+    size_t verify_index;
+
+    if (!input || !packet || !packet->candidate_records ||
+        packet->state != SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER ||
+        !packet->verify_plan_complete ||
+        packet->verify_plan_first !=
+            packet->candidate_window_offset ||
+        packet->verify_plan_end <= packet->verify_plan_first ||
+        packet->verify_plan_end > packet->candidate_window_count ||
+        packet->verify_prepared_count ||
+        packet->verify_prepared_retained_bytes ||
+        packet->verify_prepared_transient_bytes) {
+        return -1;
+    }
+    snapshot = &input->verification;
+    if (!snapshot->enabled || !snapshot->field ||
+        verify_datalog_enabled()) {
+        packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+        return 0;
+    }
+    verify_index = packet->verify_plan_end;
+    for (candidate_index = packet->verify_plan_first;
+         candidate_index < packet->verify_plan_end;
+         candidate_index++) {
+        if (packet->candidate_records[candidate_index].plan_action ==
+                SOLVER_AB_CANDIDATE_VERIFY) {
+            verify_index = candidate_index;
+            break;
+        }
+    }
+    if (verify_index == packet->verify_plan_end) {
+        packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+        return 0;
+    }
+    if (verify_index > packet->verify_plan_first) {
+        packet->verify_plan_end = verify_index;
+        packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+        return 0;
+    }
+    packet->verify_plan_end = verify_index + 1U;
+    {
+        solver_candidate_delivery_record_t* record =
+            &packet->candidate_records[verify_index];
+        verify_prepared_hit_t* prepared = NULL;
+        MatchObj match;
+        size_t query_bytes;
+        size_t prepared_bytes;
+        size_t score_bytes;
+        size_t peak_bytes;
+        size_t retained_bytes;
+        size_t transient_bytes;
+        size_t retained_total;
+        size_t transient_max;
+        double verify_pix2;
+        double logaccept;
+
+        if (!record->candidate_prepared ||
+            !record->verify_query ||
+            !record->verify_query_captured) {
+            packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+            return 0;
+        }
+        if (index_shard_worker_stop_requested()) {
+            packet->state = SOLVER_CODEKD_PACKET_STOPPED;
+            return 2;
+        }
+        query_bytes = verify_index_query_bytes(record->verify_query);
+        if (query_bytes == SIZE_MAX ||
+            query_bytes > packet->verify_query_bytes ||
+            solver_codekd_packet_build_verification_match(
+                input, packet, record, verify_index,
+                &match, &verify_pix2, &logaccept) ||
+            verify_prepare_hit_from_query(
+                packet->starkd,
+                &record->verify_query,
+                snapshot->index_cutnside,
+                &match,
+                NULL,
+                snapshot->field,
+                verify_pix2,
+                snapshot->distractor_ratio,
+                input->field_maxx,
+                input->field_maxy,
+                snapshot->logratio_bail_threshold,
+                logaccept,
+                snapshot->logratio_stoplooking,
+                snapshot->distance_from_quad_bonus,
+                FALSE,
+                &prepared)) {
+            verify_destroy_prepared_hit(prepared);
+            goto native_fallback;
+        }
+        record->verify_query_captured = FALSE;
+        packet->verify_query_bytes -= query_bytes;
+        prepared_bytes = verify_prepared_hit_bytes(prepared);
+        score_bytes = verify_prepared_score_bytes(prepared);
+        peak_bytes = verify_prepared_hit_peak_bytes(prepared);
+        if (prepared_bytes == SIZE_MAX ||
+            score_bytes == SIZE_MAX ||
+            peak_bytes == SIZE_MAX ||
+            prepared_bytes > SIZE_MAX - score_bytes ||
+            peak_bytes < prepared_bytes + score_bytes ||
+            packet->verify_query_bytes >
+                packet->verify_query_budget ||
+            packet->verify_prepared_retained_bytes >
+                SIZE_MAX - prepared_bytes - score_bytes) {
+            verify_destroy_prepared_hit(prepared);
+            goto native_fallback;
+        }
+        retained_bytes = prepared_bytes + score_bytes;
+        transient_bytes = peak_bytes - retained_bytes;
+        retained_total =
+            packet->verify_prepared_retained_bytes +
+            retained_bytes;
+        transient_max = MAX(
+            packet->verify_prepared_transient_bytes,
+            transient_bytes);
+        if (retained_total >
+                packet->verify_query_budget -
+                    packet->verify_query_bytes ||
+            transient_max >
+                packet->verify_query_budget -
+                    packet->verify_query_bytes -
+                    retained_total) {
+            verify_destroy_prepared_hit(prepared);
+            goto native_fallback;
+        }
+        record->prepared_verification = prepared;
+        record->prepared_verify_pix2 = verify_pix2;
+        record->prepared_logaccept = logaccept;
+        record->prepared_distractor_ratio =
+            snapshot->distractor_ratio;
+        record->prepared_logratio_bail_threshold =
+            snapshot->logratio_bail_threshold;
+        record->prepared_logratio_stoplooking =
+            snapshot->logratio_stoplooking;
+        record->prepared_field_maxx = input->field_maxx;
+        record->prepared_field_maxy = input->field_maxy;
+        record->prepared_distance_from_quad_bonus =
+            snapshot->distance_from_quad_bonus;
+        packet->verify_prepared_retained_bytes =
+            retained_total;
+        packet->verify_prepared_transient_bytes =
+            transient_max;
+        packet->verify_prepared_count++;
+    }
+    if (packet->verify_prepared_count != 1U) {
+        goto native_fallback;
+    }
+    packet->verification_score_batches_prepared++;
+    packet->verification_score_contexts_prepared++;
+    packet->state =
+        SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY;
+    return 1;
+
+native_fallback:
+    packet->verification_score_fallback_batches++;
+    solver_codekd_packet_discard_prepared_verification(packet);
+    packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+    return 0;
+}
+
+static index_shard_helper_task_status_t
+solver_codekd_packet_score_verification_ready(
+    solver_codekd_search_packet_t* packet) {
+    solver_candidate_delivery_record_t* record;
+    index_shard_helper_task_status_t status =
+        INDEX_SHARD_HELPER_TASK_OK;
+    double wall_start = 0.0;
+
+    if (!packet || !packet->candidate_records ||
+        packet->state !=
+            SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY ||
+        !packet->verify_plan_complete ||
+        packet->verify_plan_first !=
+            packet->candidate_window_offset ||
+        packet->verify_plan_first == SIZE_MAX ||
+        packet->verify_plan_end !=
+            packet->verify_plan_first + 1U ||
+        packet->verify_plan_end > packet->candidate_window_count ||
+        packet->verify_prepared_count != 1U ||
+        !packet->verify_prepared_retained_bytes) {
+        return INDEX_SHARD_HELPER_TASK_ERROR;
+    }
+    record =
+        &packet->candidate_records[packet->verify_plan_first];
+    if (record->plan_action != SOLVER_AB_CANDIDATE_VERIFY ||
+        !record->prepared_verification ||
+        record->verification_score_ready) {
+        return INDEX_SHARD_HELPER_TASK_ERROR;
+    }
+    if (packet->detailed) {
+        wall_start = monotonic_seconds();
+    }
+    packet->verification_score_batches_executed++;
+    if (index_shard_worker_stop_requested()) {
+        packet->verification_score_stopped_batches++;
+        packet->state = SOLVER_CODEKD_PACKET_STOPPED;
+        status = INDEX_SHARD_HELPER_TASK_STOPPED;
+        goto done;
+    }
+    if (verify_score_prepared_hit(
+            record->prepared_verification,
+            &record->prepared_score)) {
+        packet->verification_score_fallback_batches++;
+        solver_codekd_packet_discard_prepared_verification(packet);
+        packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+        goto done;
+    }
+    record->verification_score_ready = TRUE;
+    packet->verification_score_contexts_completed++;
+    {
+        unsigned long long work_units =
+            verify_prepared_hit_work_units(
+                record->prepared_verification);
+
+        if (packet->verification_score_work_units_completed ==
+                ULLONG_MAX ||
+            work_units == ULLONG_MAX ||
+            ULLONG_MAX -
+                packet->verification_score_work_units_completed <
+                    work_units) {
+            packet->verification_score_work_units_completed =
+                ULLONG_MAX;
+        } else {
+            packet->verification_score_work_units_completed +=
+                work_units;
+        }
+    }
+    packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+
+done:
+    if (packet->detailed) {
+        packet->verification_score_wall_seconds +=
+            monotonic_seconds() - wall_start;
+    }
+    return status;
 }
 
 /*
@@ -7329,6 +7964,11 @@ solver_codekd_packet_execute_ready(
             SOLVER_CODEKD_PACKET_VERIFY_SWEEP_COMPUTE_READY) {
         return solver_codekd_packet_capture_sweep_ready(
             packet, more_work);
+    }
+    if (packet && more_work &&
+        packet->state ==
+            SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY) {
+        return solver_codekd_packet_score_verification_ready(packet);
     }
     if (packet && more_work &&
         packet->state == SOLVER_CODEKD_PACKET_VERIFY_COMPUTE_READY) {
@@ -7469,6 +8109,7 @@ solver_codekd_packet_staged_prepare(
     size_t output_size) {
     solver_codekd_search_packet_t* packet = output_bytes;
     index_shard_helper_task_status_t descriptor_status;
+    int plan_status;
 
     if (!packet || output_size != sizeof(*packet)) {
         return INDEX_SHARD_STAGED_PREPARE_ERROR;
@@ -7488,6 +8129,30 @@ solver_codekd_packet_staged_prepare(
     }
     if (packet->state != SOLVER_CODEKD_PACKET_DESCRIPTORS_READY) {
         if (packet->state ==
+                SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE) {
+            return packet->plan_complete &&
+                    packet->plan_first < packet->plan_end &&
+                    packet->plan_end <= packet->next_descriptor &&
+                    packet->next_descriptor <= packet->count &&
+                    packet->plan_range_count &&
+                    packet->plan_range_count <=
+                        packet->page_workspace->sealed_range_capacity
+                ? INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY
+                : INDEX_SHARD_STAGED_PREPARE_ERROR;
+        }
+        if (packet->state ==
+                SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER) {
+            return INDEX_SHARD_STAGED_PREPARE_OWNER_READY;
+        }
+        if (packet->state ==
+                SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY ||
+            packet->state ==
+                SOLVER_CODEKD_PACKET_VERIFY_SWEEP_COMPUTE_READY ||
+            packet->state ==
+                SOLVER_CODEKD_PACKET_VERIFY_COMPUTE_READY) {
+            return INDEX_SHARD_STAGED_PREPARE_COMPUTE_READY;
+        }
+        if (packet->state ==
                 SOLVER_CODEKD_PACKET_VERIFY_QUERY_COMPUTE_READY) {
             if (!packet->verify_plan_complete ||
                 packet->verify_plan_first !=
@@ -7498,6 +8163,15 @@ solver_codekd_packet_staged_prepare(
                     packet->verify_topology_end ||
                 packet->verify_topology_end >
                     packet->candidate_window_count) {
+                logerr("[solver] invalid verification query packet "
+                       "state=%i first=%zu end=%zu topology_end=%zu "
+                       "window_offset=%zu window_count=%zu\n",
+                       (int)packet->state,
+                       packet->verify_plan_first,
+                       packet->verify_plan_end,
+                       packet->verify_topology_end,
+                       packet->candidate_window_offset,
+                       packet->candidate_window_count);
                 return INDEX_SHARD_STAGED_PREPARE_ERROR;
             }
             return INDEX_SHARD_STAGED_PREPARE_COMPUTE_READY;
@@ -7509,16 +8183,69 @@ solver_codekd_packet_staged_prepare(
                 SOLVER_CODEKD_PACKET_VERIFY_SWEEP_SUBMIT_READY) {
             return INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY;
         }
-        if (packet->state != SOLVER_CODEKD_PACKET_RESULTS_READY ||
-            solver_codekd_packet_finish_codekd(packet)) {
+        if (packet->state != SOLVER_CODEKD_PACKET_RESULTS_READY) {
+            logerr("[solver] unexpected packet state during prepare "
+                   "state=%i sequence=%llu\n",
+                   (int)packet->state,
+                   packet->sequence);
+            return INDEX_SHARD_STAGED_PREPARE_ERROR;
+        }
+        if (solver_codekd_packet_finish_codekd(packet)) {
+            logerr("[solver] packet finish failed during prepare "
+                   "state=%i sequence=%llu retire=%zu/%zu "
+                   "verify=%zu/%zu prepared=%zu\n",
+                   (int)packet->state,
+                   packet->sequence,
+                   packet->retire_descriptor,
+                   packet->count,
+                   packet->verify_plan_first,
+                   packet->verify_plan_end,
+                   packet->verify_prepared_count);
             return INDEX_SHARD_STAGED_PREPARE_ERROR;
         }
         return packet->state == SOLVER_CODEKD_PACKET_RESULTS_READY
             ? INDEX_SHARD_STAGED_PREPARE_RESULTS_READY
             : INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY;
     }
-    if (packet->next_descriptor == packet->count) {
+    if (packet->next_descriptor < packet->count) {
+        plan_status = solver_codekd_search_packet_prepare_next_plan(
+            packet,
+            solver_codekd_packet_plan_cancelled,
+            NULL);
+        if (plan_status < 0) {
+            packet->state = SOLVER_CODEKD_PACKET_FAILED;
+            return INDEX_SHARD_STAGED_PREPARE_ERROR;
+        }
+        if (plan_status == 2) {
+            return INDEX_SHARD_STAGED_PREPARE_STOPPED;
+        }
+        if (plan_status > 0) {
+            return packet->state ==
+                        SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE &&
+                    packet->plan_complete &&
+                    packet->plan_first < packet->plan_end &&
+                    packet->plan_end <= packet->next_descriptor &&
+                    packet->next_descriptor <= packet->count &&
+                    packet->plan_range_count &&
+                    packet->plan_range_count <=
+                        packet->page_workspace->sealed_range_capacity
+                ? INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY
+                : INDEX_SHARD_STAGED_PREPARE_ERROR;
+        }
+    }
+    if (packet->state == SOLVER_CODEKD_PACKET_RESULTS_READY ||
+        packet->next_descriptor == packet->count) {
         if (solver_codekd_packet_finish_codekd(packet)) {
+            logerr("[solver] packet finish failed after planning "
+                   "state=%i sequence=%llu retire=%zu/%zu "
+                   "verify=%zu/%zu prepared=%zu\n",
+                   (int)packet->state,
+                   packet->sequence,
+                   packet->retire_descriptor,
+                   packet->count,
+                   packet->verify_plan_first,
+                   packet->verify_plan_end,
+                   packet->verify_prepared_count);
             packet->state = SOLVER_CODEKD_PACKET_FAILED;
             return INDEX_SHARD_STAGED_PREPARE_ERROR;
         }
@@ -7526,7 +8253,14 @@ solver_codekd_packet_staged_prepare(
             ? INDEX_SHARD_STAGED_PREPARE_RESULTS_READY
             : INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY;
     }
-    return INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY;
+    logerr("[solver] invalid terminal packet prepare state=%i "
+           "sequence=%llu next=%zu count=%zu\n",
+           (int)packet->state,
+           packet->sequence,
+           packet->next_descriptor,
+           packet->count);
+    packet->state = SOLVER_CODEKD_PACKET_FAILED;
+    return INDEX_SHARD_STAGED_PREPARE_ERROR;
 }
 
 static index_shard_staged_submit_status_t
@@ -7673,10 +8407,10 @@ solver_codekd_packet_staged_owner(
     size_t input_size,
     void* output_bytes,
     size_t output_size) {
+    const solver_codekd_packet_task_input_t* input = input_bytes;
     solver_codekd_search_packet_t* packet = output_bytes;
+    int prepare_status;
 
-    (void)input_bytes;
-    (void)input_size;
     if (!packet || output_size != sizeof(*packet)) {
         return INDEX_SHARD_STAGED_EXECUTE_ERROR;
     }
@@ -7687,6 +8421,26 @@ solver_codekd_packet_staged_owner(
     }
     if (packet->state == SOLVER_CODEKD_PACKET_DESCRIPTORS_READY) {
         return INDEX_SHARD_STAGED_EXECUTE_MORE;
+    }
+    if (packet->state ==
+            SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER) {
+        if (!input || input_size != sizeof(*input)) {
+            packet->state = SOLVER_CODEKD_PACKET_FAILED;
+            return INDEX_SHARD_STAGED_EXECUTE_ERROR;
+        }
+        prepare_status =
+            solver_codekd_packet_prepare_verification_owner(
+                input, packet);
+        if (prepare_status == 2) {
+            return INDEX_SHARD_STAGED_EXECUTE_STOPPED;
+        }
+        if (prepare_status < 0) {
+            packet->state = SOLVER_CODEKD_PACKET_FAILED;
+            return INDEX_SHARD_STAGED_EXECUTE_ERROR;
+        }
+        return prepare_status
+            ? INDEX_SHARD_STAGED_EXECUTE_MORE
+            : INDEX_SHARD_STAGED_EXECUTE_OK;
     }
     if (packet->state == SOLVER_CODEKD_PACKET_RESULTS_READY) {
         if (solver_codekd_packet_finish_codekd(packet)) {
@@ -8229,6 +8983,15 @@ solver_codekd_search_packet_retire_window(
                 !packet->verification_delivery_disabled &&
                 packet->candidate_window_offset ==
                     packet->verify_plan_end &&
+                solver_codekd_packet_retired_verification_complete(
+                    packet)) {
+                packet->state = SOLVER_CODEKD_PACKET_FAILED;
+                return INDEX_SHARD_STAGED_RETIRE_ERROR;
+            }
+            if (packet->verify_plan_complete &&
+                !packet->verification_delivery_disabled &&
+                packet->candidate_window_offset ==
+                    packet->verify_plan_end &&
                 packet->candidate_window_offset <
                     packet->candidate_window_count) {
                 size_t topology_end =
@@ -8539,6 +9302,8 @@ static int solver_ab_descriptor_execute_phase(
     unsigned long long combination_cursor = 0U;
     unsigned long long reduced = 0U;
     unsigned long long parallel_reduced = 0U;
+    size_t staged_capacity;
+    size_t compute_width;
     size_t participants;
     size_t expansion;
     size_t max_task_combinations;
@@ -8569,9 +9334,9 @@ static int solver_ab_descriptor_execute_phase(
             FITSBIN_MMAP_ADVICE_RANDOM) {
         return 0;
     }
-    participants = MIN(
-        SOLVER_AB_DESCRIPTOR_MAX_TASKS,
-        index_shard_staged_capacity());
+    staged_capacity = index_shard_staged_capacity();
+    compute_width = index_shard_staged_compute_width();
+    participants = MIN(staged_capacity, compute_width);
     if (!participants) {
         return 0;
     }
@@ -8590,7 +9355,9 @@ static int solver_ab_descriptor_execute_phase(
     }
 
     workspace = solver_ab_descriptor_workspace_get();
-    if (!workspace) {
+    if (!workspace ||
+        solver_ab_descriptor_workspace_reserve_outputs(
+            workspace, participants)) {
         return 0;
     }
     planner = &workspace->planner;
@@ -8621,7 +9388,7 @@ static int solver_ab_descriptor_execute_phase(
         solver_ab_descriptor_release_pairs(workspace);
         return 0;
     }
-    wave = calloc(1, sizeof(*wave));
+    wave = solver_codekd_packet_wave_create(participants);
     if (!wave) {
         solver_ab_descriptor_release_pairs(workspace);
         return 0;
@@ -8638,6 +9405,15 @@ static int solver_ab_descriptor_execute_phase(
             (unsigned long long)participants;
         unsigned long long wave_combinations =
             MIN(remaining, wave_capacity);
+        unsigned long long expanded_work =
+            wave_combinations * (unsigned long long)expansion;
+        unsigned long long work_task_count =
+            expanded_work /
+                SOLVER_AB_DESCRIPTOR_TASK_MIN_HYPOTHESES +
+            (expanded_work %
+                 SOLVER_AB_DESCRIPTOR_TASK_MIN_HYPOTHESES
+             ? 1ULL
+             : 0ULL);
         unsigned long long base;
         unsigned long long remainder;
         unsigned long long task_cursor = combination_cursor;
@@ -8656,10 +9432,14 @@ static int solver_ab_descriptor_execute_phase(
         anbool wave_assisted = FALSE;
         unsigned long long reduced_before = reduced;
 
-        if (task_count < 2U &&
-            wave_combinations >=
-                2U * SOLVER_AB_DESCRIPTOR_MIN_COMBINATIONS) {
-            task_count = 2U;
+        work_task_count = MIN(
+            work_task_count,
+            (unsigned long long)participants);
+        work_task_count = MIN(
+            work_task_count,
+            wave_combinations);
+        if (task_count < (size_t)work_task_count) {
+            task_count = (size_t)work_task_count;
         }
         if (!task_count) {
             result = -1;
@@ -8671,7 +9451,15 @@ static int solver_ab_descriptor_execute_phase(
             (unsigned long long)task_count;
         remainder = wave_combinations %
             (unsigned long long)task_count;
-        memset(wave, 0, sizeof(*wave));
+        memset(
+            inputs, 0,
+            participants * sizeof(*inputs));
+        memset(
+            packets, 0,
+            participants * sizeof(*packets));
+        memset(
+            tasks, 0,
+            participants * sizeof(*tasks));
         memset(&run_stats, 0, sizeof(run_stats));
         memset(&retire_context, 0, sizeof(retire_context));
         retire_context.solver = solver;
@@ -8722,6 +9510,38 @@ static int solver_ab_descriptor_execute_phase(
             inputs[task_index].abscale_high = solver->abscale_high;
             inputs[task_index].funits_lower = solver->funits_lower;
             inputs[task_index].funits_upper = solver->funits_upper;
+            if (solver->mo_template) {
+                memcpy(
+                    &inputs[task_index].verification.match_template,
+                    solver->mo_template,
+                    sizeof(*solver->mo_template));
+            }
+            inputs[task_index].verification.field = solver->vf;
+            inputs[task_index].verification.index_cutnside =
+                solver->index->cutnside;
+            inputs[task_index].verification.indexid =
+                solver->index->indexid;
+            inputs[task_index].verification.healpix =
+                solver->index->healpix;
+            inputs[task_index].verification.hpnside =
+                solver->index->hpnside;
+            inputs[task_index].verification.index_jitter =
+                solver->index->index_jitter;
+            inputs[task_index].verification.verify_pix =
+                solver->verify_pix;
+            inputs[task_index].verification.distractor_ratio =
+                solver->distractor_ratio;
+            inputs[task_index].verification.logratio_bail_threshold =
+                solver->logratio_bail_threshold;
+            inputs[task_index].verification.logaccept = MIN(
+                solver->logratio_tokeep,
+                solver->logratio_totune);
+            inputs[task_index].verification.logratio_stoplooking =
+                solver->logratio_stoplooking;
+            inputs[task_index].verification.distance_from_quad_bonus =
+                solver->distance_from_quad_bonus;
+            inputs[task_index].verification.enabled =
+                solver->vf && !verify_datalog_enabled();
 
             work_units = task_combinations *
                 (unsigned long long)expansion;
@@ -8953,7 +9773,7 @@ cleanup:
     }
     solver_ab_descriptor_release_pairs(workspace);
     if (!packet_cleanup_failed) {
-        free(wave);
+        solver_codekd_packet_wave_destroy(wave);
     }
     return result;
 }
@@ -10157,6 +10977,10 @@ static void resolve_matches_native_range(
                         sizeof(*starxyz));
             }
         }
+        if (record && !prepared_candidate) {
+            solver_codekd_record_clear_verification_speculation(
+                record);
+        }
 
 
         if (solver->use_radec) {
@@ -10278,6 +11102,10 @@ static void resolve_matches_native_range(
                 break;
             }
         }
+        if (record && !prepared_candidate) {
+            solver_codekd_record_clear_verification_speculation(
+                record);
+        }
         if (!prepared_candidate) {
             // Quick-n-dirty scale estimate based on two stars.
             // in (rad per pix)**2
@@ -10384,6 +11212,19 @@ static void resolve_matches_native_range(
             record->verify_query = NULL;
         }
         if (record && prepared_candidate &&
+            record->plan_action ==
+                SOLVER_AB_CANDIDATE_VERIFY &&
+            record->prepared_verification &&
+            record->verification_score_ready) {
+            if (solver_handle_scored_query_hit(
+                    solver,
+                    &mo,
+                    NULL,
+                    FALSE,
+                    record)) {
+                solver->quit_now = TRUE;
+            }
+        } else if (record && prepared_candidate &&
             record->plan_action ==
                 SOLVER_AB_CANDIDATE_VERIFY &&
             record->verify_query) {
@@ -10621,11 +11462,123 @@ static int solver_handle_query_hit(
             prepared, &score, mo)) {
         verify_destroy_prepared_score(&score);
         verify_destroy_prepared_hit(prepared);
-        sp->profile.execution_failed = TRUE;
-        sp->quit_now = TRUE;
-        return FALSE;
+        return solver_handle_hit(
+            sp, mo, verifysip, fake_match);
     }
     verify_destroy_prepared_hit(prepared);
+    sp->profile.verify_calls++;
+    if (sp->profile.detailed) {
+        sp->profile.verify_wall_seconds +=
+            monotonic_seconds() - verify_wall_start;
+    }
+    return solver_handle_hit_after_verify(
+        sp,
+        mo,
+        verifysip,
+        fake_match,
+        match_distance_in_pixels2);
+}
+
+/*
+ * Finish one already scored immutable verification context on the solver
+ * owner. Any changed live verification parameter invalidates speculation and
+ * replays the exact native path before scientific state is published.
+ */
+static int solver_handle_scored_query_hit(
+    solver_t* sp,
+    MatchObj* mo,
+    sip_t* verifysip,
+    anbool fake_match,
+    solver_candidate_delivery_record_t* record) {
+    double match_distance_in_pixels2;
+    double verify_wall_start = 0.0;
+    double logaccept;
+
+    assert(sp);
+    assert(mo);
+
+    if (!record || fake_match ||
+        record->verify_query ||
+        !record->prepared_verification ||
+        !record->verification_score_ready) {
+        if (record) {
+            if (record->verification_score_ready) {
+                sp->profile.verification_score_fallback_batches++;
+            }
+            solver_codekd_record_clear_prepared_verification(record);
+        }
+        return solver_handle_hit(
+            sp, mo, verifysip, fake_match);
+    }
+    if (solver_poll_worker_stop(sp)) {
+        solver_codekd_record_clear_prepared_verification(record);
+        return FALSE;
+    }
+
+    match_distance_in_pixels2 =
+        solver_prepare_hit_for_verify(
+            sp, mo, &logaccept);
+    if (memcmp(
+            mo->center,
+            record->verify_center,
+            sizeof(mo->center)) ||
+        memcmp(
+            &mo->radius,
+            &record->verify_radius,
+            sizeof(mo->radius)) ||
+        memcmp(
+            &match_distance_in_pixels2,
+            &record->prepared_verify_pix2,
+            sizeof(match_distance_in_pixels2)) ||
+        memcmp(
+            &logaccept,
+            &record->prepared_logaccept,
+            sizeof(logaccept)) ||
+        memcmp(
+            &sp->distractor_ratio,
+            &record->prepared_distractor_ratio,
+            sizeof(sp->distractor_ratio)) ||
+        memcmp(
+            &sp->logratio_bail_threshold,
+            &record->prepared_logratio_bail_threshold,
+            sizeof(sp->logratio_bail_threshold)) ||
+        memcmp(
+            &sp->logratio_stoplooking,
+            &record->prepared_logratio_stoplooking,
+            sizeof(sp->logratio_stoplooking)) ||
+        memcmp(
+            &sp->field_maxx,
+            &record->prepared_field_maxx,
+            sizeof(sp->field_maxx)) ||
+        memcmp(
+            &sp->field_maxy,
+            &record->prepared_field_maxy,
+            sizeof(sp->field_maxy)) ||
+        sp->distance_from_quad_bonus !=
+            record->prepared_distance_from_quad_bonus) {
+        sp->profile.verification_score_fallback_batches++;
+        solver_codekd_record_clear_prepared_verification(record);
+        return solver_handle_hit(
+            sp, mo, verifysip, fake_match);
+    }
+
+    if (sp->profile.detailed) {
+        verify_wall_start = monotonic_seconds();
+    }
+    if (verify_finish_prepared_hit(
+            record->prepared_verification,
+            &record->prepared_score,
+            mo)) {
+        sp->profile.verification_score_fallback_batches++;
+        if (sp->profile.detailed) {
+            sp->profile.verify_wall_seconds +=
+                monotonic_seconds() - verify_wall_start;
+        }
+        solver_codekd_record_clear_prepared_verification(record);
+        return solver_handle_hit(
+            sp, mo, verifysip, fake_match);
+    }
+    solver_codekd_record_clear_prepared_verification(record);
     sp->profile.verify_calls++;
     if (sp->profile.detailed) {
         sp->profile.verify_wall_seconds +=
