@@ -163,6 +163,12 @@ anbool index_shard_worker_stop_requested(void);
  * outer owner retains its source lease until the synchronous group is fully
  * quiescent. execute() must be reentrant and thread-safe and must not mutate
  * global state or retain any task or source pointer after it returns.
+ *
+ * A staged task owner may call index_shard_helper_run() only from its typed
+ * owner callback. This publishes one same-pool synchronous child group while
+ * the staged task retains every input lifetime. Recursive helper publication
+ * and calls from staged prepare/submit/poll/foreign-execute callbacks remain
+ * unavailable.
  */
 typedef enum index_shard_helper_run_status {
   INDEX_SHARD_HELPER_FATAL = -3,

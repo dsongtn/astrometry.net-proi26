@@ -505,6 +505,14 @@ typedef struct index_shard_worker_context {
   unsigned long long helper_group_epoch;
   index_shard_staged_group_t *published_staged_group;
   unsigned long long staged_group_epoch;
+  /*
+   * True only while this worker is running the owner callback for its
+   * published staged group. That callback may publish one bounded synchronous
+   * helper group for immutable child computation; recursive publication is
+   * forbidden.
+   */
+  anbool staged_owner_callback_active;
+  index_shard_staged_group_t *staged_owner_callback_group;
   anbool helper_preparation_active;
   unsigned long helper_preparation_generation;
   size_t helper_preparation_index_order;
@@ -4101,11 +4109,27 @@ static int index_shard_staged_execute_claim(
     break;
   case INDEX_SHARD_STAGED_CLAIM_OWNER:
     if (group->ops->owner) {
+      index_shard_worker_context_t *ctx =
+          index_shard_get_tls();
+
+      if (!ctx || ctx->pool != group->pool ||
+          ctx->worker_id != group->owner_worker ||
+          ctx->published_staged_group != group ||
+          ctx->staged_owner_callback_active ||
+          ctx->staged_owner_callback_group) {
+        callback_status =
+            INDEX_SHARD_STAGED_EXECUTE_ERROR;
+        break;
+      }
+      ctx->staged_owner_callback_active = TRUE;
+      ctx->staged_owner_callback_group = group;
       callback_status = group->ops->owner(
           task->input,
           task->input_bytes,
           task->output,
           task->output_bytes);
+      ctx->staged_owner_callback_group = NULL;
+      ctx->staged_owner_callback_active = FALSE;
     }
     break;
   case INDEX_SHARD_STAGED_CLAIM_NONE:
@@ -4435,6 +4459,21 @@ static int index_shard_helper_retire_one(
   return status == INDEX_SHARD_HELPER_RETIRE_OK ? 0 : -1;
 }
 
+/*
+ * A staged owner may temporarily expose one synchronous helper group while its
+ * owner callback is executing. The staged task remains the lifetime owner; the
+ * child group receives only immutable inputs and disjoint output ranges.
+ */
+static anbool index_shard_helper_staged_child_allowed(
+    const index_shard_worker_context_t *ctx) {
+  return ctx &&
+      ctx->staged_owner_callback_active &&
+      ctx->staged_owner_callback_group &&
+      ctx->published_staged_group ==
+          ctx->staged_owner_callback_group &&
+      !ctx->published_helper_group;
+}
+
 size_t index_shard_helper_available_workers(void) {
   index_shard_worker_context_t *ctx = index_shard_get_tls();
   index_shard_thread_state_t *shared;
@@ -4450,7 +4489,8 @@ size_t index_shard_helper_available_workers(void) {
   pthread_mutex_lock(&shared->queue_mutex);
   if (ctx->generation_seen == ctx->pool->generation &&
       !ctx->published_helper_group &&
-      !ctx->published_staged_group &&
+      (!ctx->published_staged_group ||
+       index_shard_helper_staged_child_allowed(ctx)) &&
       !ctx->helper_preparation_active &&
       !shared->helper_preparations_active) {
     available = index_shard_helper_idle_workers_locked(
@@ -4554,6 +4594,7 @@ index_shard_helper_run_internal(
   int fatal_requested = FALSE;
   int prepublish_fatal = FALSE;
   int preparation_permit = FALSE;
+  int staged_child_permit = FALSE;
   int helper_window_active = FALSE;
 
   if (stats) {
@@ -4602,6 +4643,8 @@ index_shard_helper_run_internal(
 
   shared = &ctx->pool->shared;
   pthread_mutex_lock(&shared->queue_mutex);
+  staged_child_permit =
+      index_shard_helper_staged_child_allowed(ctx);
   preparation_permit =
       ctx->helper_preparation_active &&
       ctx->helper_preparation_generation ==
@@ -4610,7 +4653,8 @@ index_shard_helper_run_internal(
           ctx->current_index_order;
   if (ctx->generation_seen != ctx->pool->generation ||
       ctx->published_helper_group ||
-      ctx->published_staged_group ||
+      (ctx->published_staged_group &&
+       !staged_child_permit) ||
       (!preparation_permit &&
        shared->helper_preparations_active)) {
     if (index_shard_helper_prepare_clear_locked(
@@ -7228,6 +7272,8 @@ static int index_shard_pool_submit(
   for (i = 0; i < worker_count; i++) {
     if (pool->contexts[i].published_helper_group ||
         pool->contexts[i].published_staged_group ||
+        pool->contexts[i].staged_owner_callback_active ||
+        pool->contexts[i].staged_owner_callback_group ||
         pool->contexts[i].helper_preparation_active) {
       logerr("[index-shard] inner state remained active "
              "before pass worker=%i\n", i);
@@ -7578,6 +7624,8 @@ index_shard_solve_impl(onefield_t *bp,
   for (i = 0U; i < (size_t)pool->shared.worker_count; i++) {
     if (pool->contexts[i].published_helper_group ||
         pool->contexts[i].published_staged_group ||
+        pool->contexts[i].staged_owner_callback_active ||
+        pool->contexts[i].staged_owner_callback_group ||
         pool->contexts[i].helper_preparation_active) {
       logerr("[index-shard] inner state remained active "
              "after worker quiescence worker=%zu\n", i);
@@ -8447,9 +8495,39 @@ static int index_shard_staged_retire_test_terminal(void) {
   return failures;
 }
 
+static int index_shard_staged_child_helper_test(void) {
+  index_shard_worker_context_t context;
+  index_shard_staged_group_t group;
+  index_shard_helper_group_t helper;
+  int failures = 0;
+
+  memset(&context, 0, sizeof(context));
+  memset(&group, 0, sizeof(group));
+  memset(&helper, 0, sizeof(helper));
+
+  failures += index_shard_helper_staged_child_allowed(
+      &context) != FALSE;
+  context.published_staged_group = &group;
+  failures += index_shard_helper_staged_child_allowed(
+      &context) != FALSE;
+  context.staged_owner_callback_active = TRUE;
+  context.staged_owner_callback_group = &group;
+  failures += index_shard_helper_staged_child_allowed(
+      &context) != TRUE;
+  context.published_helper_group = &helper;
+  failures += index_shard_helper_staged_child_allowed(
+      &context) != FALSE;
+  context.published_helper_group = NULL;
+  context.staged_owner_callback_group = NULL;
+  failures += index_shard_helper_staged_child_allowed(
+      &context) != FALSE;
+  return failures;
+}
+
 int index_shard_test_staged_retire_more(void) {
   return index_shard_staged_retire_test_order() +
-      index_shard_staged_retire_test_terminal();
+      index_shard_staged_retire_test_terminal() +
+      index_shard_staged_child_helper_test();
 }
 
 #endif
