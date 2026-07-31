@@ -34,7 +34,6 @@ jobs:
 
           test "$(git rev-parse --abbrev-ref HEAD)" = \
             "assistant/verification-reorder-buffer"
-          test -f tools/proi26-production/verify_theta_tail_fix.patch
 
           git show \
             4b85abbdd235072117178fec387577243fa88a19:include/astrometry/tweak2.h \
@@ -42,10 +41,335 @@ jobs:
 
           rm -rf tools/proi26-diagnostics
 
-          git apply --check \
-            tools/proi26-production/verify_theta_tail_fix.patch
-          git apply \
-            tools/proi26-production/verify_theta_tail_fix.patch
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+
+          def replace_once(path: Path, old: str, new: str) -> None:
+              text = path.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(
+                      f'{path}: expected one replacement anchor, found {count}')
+              path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          verify = Path('solver/verify.c')
+          replace_once(
+              verify,
+              '#include "sip-utils.h"\n'
+              '#include "healpix.h"\n'
+              '#include "datalog.h"\n'
+              '#include "index_shard_internal.h"\n',
+              '#include "sip-utils.h"\n'
+              '#include "healpix.h"\n'
+              '#include "datalog.h"\n'
+              '#include "index_shard_internal.h"\n'
+              '#include "verify_theta_tail.h"\n')
+
+          replace_once(
+              verify,
+              '        (size_t)v->NTall > SIZE_MAX / sizeof(*etheta) ||\n'
+              '        (size_t)v->NTall > SIZE_MAX / sizeof(*eodds) ||\n'
+              '        (size_t)v->NRall > SIZE_MAX / sizeof(*invrperm)) {\n'
+              '        return -1;\n'
+              '    }\n'
+              '    permutation_stride = refxyz\n'
+              '        ? 3U * sizeof(double)\n'
+              '        : 2U * sizeof(double);\n',
+              '        (size_t)v->NTall > SIZE_MAX / sizeof(*etheta) ||\n'
+              '        (size_t)v->NTall > SIZE_MAX / sizeof(*eodds) ||\n'
+              '        (size_t)v->NRall > SIZE_MAX / sizeof(*invrperm)) {\n'
+              '        return -1;\n'
+              '    }\n'
+              '    if (verify_theta_mark_unprocessed(\n'
+              '            theta, v->NT, ibailed, istopped)) {\n'
+              '        return -1;\n'
+              '    }\n'
+              '    permutation_stride = refxyz\n'
+              '        ? 3U * sizeof(double)\n'
+              '        : 2U * sizeof(double);\n')
+
+          replace_once(
+              verify,
+              '    // "theta" has length v->NT.\n'
+              '\n'
+              '    if (ibailed != -1)\n'
+              '        for (i=ibailed+1; i<v->NT; i++)\n'
+              '            theta[i] = THETA_BAILEDOUT;\n'
+              '\n'
+              '    if (istopped != -1)\n'
+              '        for (i=istopped+1; i<v->NT; i++)\n'
+              '            theta[i] = THETA_STOPPEDLOOKING;\n'
+              '\n',
+              '')
+
+          Path('solver/verify_theta_tail.h').write_text(dedent(r'''
+          /*
+           # This file is part of the Astrometry.net suite.
+           # Licensed under a 3-clause BSD style license - see LICENSE
+           */
+
+          #ifndef VERIFY_THETA_TAIL_H
+          #define VERIFY_THETA_TAIL_H
+
+          #include "verify.h"
+
+          /*
+           * real_verify_star_lists() stops immediately after the star that
+           * crosses a bailout or stop-looking threshold. The remaining theta
+           * entries have never been written and must receive their semantic
+           * sentinel before any full-array validation or permutation pass
+           * reads them.
+           *
+           * When both markers are present, preserve the historical ordering:
+           * bailout markers are written first and stop-looking markers
+           * overwrite the later suffix.
+           */
+          static inline int verify_theta_mark_unprocessed(
+              int* theta,
+              int count,
+              int ibailed,
+              int istopped) {
+              int i;
+
+              if (count < 0 ||
+                  (count && !theta) ||
+                  ibailed < -1 || ibailed >= count ||
+                  istopped < -1 || istopped >= count) {
+                  return -1;
+              }
+
+              if (ibailed != -1) {
+                  for (i = ibailed + 1; i < count; i++) {
+                      theta[i] = THETA_BAILEDOUT;
+                  }
+              }
+
+              if (istopped != -1) {
+                  for (i = istopped + 1; i < count; i++) {
+                      theta[i] = THETA_STOPPEDLOOKING;
+                  }
+              }
+
+              return 0;
+          }
+
+          #endif
+          ''').lstrip(), encoding='utf-8')
+
+          Path('solver/test-verify-theta-tail.c').write_text(dedent(r'''
+          /*
+           # This file is part of the Astrometry.net suite.
+           # Licensed under a 3-clause BSD style license - see LICENSE
+           */
+
+          #include <limits.h>
+          #include <stdio.h>
+          #include <string.h>
+
+          #include "verify_theta_tail.h"
+
+          #define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
+
+          static int expect_value(const char* case_name,
+                                  const int* values,
+                                  size_t index,
+                                  int expected) {
+              if (values[index] == expected) {
+                  return 0;
+              }
+              fprintf(stderr,
+                      "%s: theta[%zu]=%d, expected %d\n",
+                      case_name, index, values[index], expected);
+              return -1;
+          }
+
+          static int test_bailout_tail(void) {
+              int theta[] = { 0, 1, 2, INT_MAX, INT_MAX, INT_MAX };
+              size_t i;
+
+              if (verify_theta_mark_unprocessed(
+                      theta, (int)ARRAY_SIZE(theta), 2, -1)) {
+                  return -1;
+              }
+              for (i = 0; i <= 2; i++) {
+                  if (expect_value(
+                          "bailout-prefix", theta, i, (int)i)) {
+                      return -1;
+                  }
+              }
+              for (i = 3; i < ARRAY_SIZE(theta); i++) {
+                  if (expect_value(
+                          "bailout-tail", theta, i, THETA_BAILEDOUT)) {
+                      return -1;
+                  }
+              }
+              return 0;
+          }
+
+          static int test_stop_tail(void) {
+              int theta[] = { 3, 2, 1, 0, INT_MAX, INT_MAX };
+              const int prefix[] = { 3, 2, 1, 0 };
+              size_t i;
+
+              if (verify_theta_mark_unprocessed(
+                      theta, (int)ARRAY_SIZE(theta), -1, 3)) {
+                  return -1;
+              }
+              for (i = 0; i < ARRAY_SIZE(prefix); i++) {
+                  if (expect_value("stop-prefix", theta, i, prefix[i])) {
+                      return -1;
+                  }
+              }
+              for (i = ARRAY_SIZE(prefix); i < ARRAY_SIZE(theta); i++) {
+                  if (expect_value(
+                          "stop-tail", theta, i,
+                          THETA_STOPPEDLOOKING)) {
+                      return -1;
+                  }
+              }
+              return 0;
+          }
+
+          static int test_historical_overlap_order(void) {
+              int theta[] = { 7, 6, INT_MAX, INT_MAX, INT_MAX, INT_MAX };
+
+              if (verify_theta_mark_unprocessed(
+                      theta, (int)ARRAY_SIZE(theta), 1, 3)) {
+                  return -1;
+              }
+              if (expect_value("overlap-prefix-0", theta, 0, 7) ||
+                  expect_value("overlap-prefix-1", theta, 1, 6) ||
+                  expect_value(
+                      "overlap-bail-2", theta, 2, THETA_BAILEDOUT) ||
+                  expect_value(
+                      "overlap-bail-3", theta, 3, THETA_BAILEDOUT) ||
+                  expect_value(
+                      "overlap-stop-4", theta, 4,
+                      THETA_STOPPEDLOOKING) ||
+                  expect_value(
+                      "overlap-stop-5", theta, 5,
+                      THETA_STOPPEDLOOKING)) {
+                  return -1;
+              }
+              return 0;
+          }
+
+          static int test_no_termination_marker(void) {
+              int theta[] = { 4, 3, 2, 1 };
+              int expected[ARRAY_SIZE(theta)];
+
+              memcpy(expected, theta, sizeof(theta));
+              if (verify_theta_mark_unprocessed(
+                      theta, (int)ARRAY_SIZE(theta), -1, -1)) {
+                  return -1;
+              }
+              if (memcmp(theta, expected, sizeof(theta))) {
+                  fprintf(stderr,
+                          "no-marker: theta changed unexpectedly\n");
+                  return -1;
+              }
+              return 0;
+          }
+
+          static int test_invalid_arguments(void) {
+              int theta[] = { 0, 1 };
+
+              if (!verify_theta_mark_unprocessed(NULL, 1, -1, -1) ||
+                  !verify_theta_mark_unprocessed(theta, -1, -1, -1) ||
+                  !verify_theta_mark_unprocessed(theta, 2, 2, -1) ||
+                  !verify_theta_mark_unprocessed(theta, 2, -1, 2) ||
+                  verify_theta_mark_unprocessed(NULL, 0, -1, -1)) {
+                  fprintf(stderr,
+                          "invalid-arguments: validation contract failed\n");
+                  return -1;
+              }
+              return 0;
+          }
+
+          int main(void) {
+              if (test_bailout_tail() ||
+                  test_stop_tail() ||
+                  test_historical_overlap_order() ||
+                  test_no_termination_marker() ||
+                  test_invalid_arguments()) {
+                  return 1;
+              }
+              printf("VERIFY_THETA_TAIL_OK\n");
+              return 0;
+          }
+          ''').lstrip(), encoding='utf-8')
+
+          makefile = Path('solver/Makefile')
+          replace_once(
+              makefile,
+              'test-solver: test-solver.o solver_test.o $(SLIB)\n'
+              'test-solver-2: test-solver-2.o solver_test_2.o $(SLIB)\n'
+              'test-engine-passes: test-engine-passes.o $(SLIB)\n'
+              'test-index-shard-config: '
+              'test-index-shard-config.o index_shard_config.o\n',
+              'test-solver: test-solver.o solver_test.o $(SLIB)\n'
+              'test-solver-2: test-solver-2.o solver_test_2.o $(SLIB)\n'
+              'test-engine-passes: test-engine-passes.o $(SLIB)\n'
+              'test-verify-theta-tail: test-verify-theta-tail.o\n'
+              '\t$(CC) $(LDFLAGS) -o $@ $^\n'
+              'test-index-shard-config: '
+              'test-index-shard-config.o index_shard_config.o\n')
+
+          replace_once(
+              makefile,
+              '\ttest_ab_integration_asan.o test_ab_integration_tsan.o \\\n'
+              '\tindex_shard_staged_test.o\n'
+              'ALL_OBJ += test-solver.o test-solver-2.o '
+              'test-engine-passes.o \\\n'
+              '\ttest-index-shard-config.o test-index-shard-staged.o \\\n'
+              '\ttest-ab-block-integration.o\n'
+              'ALL_EXECS += test-index-shard-config '
+              'test-ab-block-integration \\\n'
+              '\ttest-index-shard-staged test-engine-passes \\\n'
+              '\ttest-ab-stream-integration test-ab-stream-asan '
+              'test-ab-stream-tsan \\\n',
+              '\ttest_ab_integration_asan.o test_ab_integration_tsan.o \\\n'
+              '\tindex_shard_staged_test.o test-verify-theta-tail.o\n'
+              'ALL_OBJ += test-solver.o test-solver-2.o '
+              'test-engine-passes.o \\\n'
+              '\ttest-index-shard-config.o test-index-shard-staged.o \\\n'
+              '\ttest-ab-block-integration.o test-verify-theta-tail.o\n'
+              'ALL_EXECS += test-index-shard-config '
+              'test-ab-block-integration \\\n'
+              '\ttest-index-shard-staged test-engine-passes \\\n'
+              '\ttest-verify-theta-tail \\\n'
+              '\ttest-ab-stream-integration test-ab-stream-asan '
+              'test-ab-stream-tsan \\\n')
+
+          replace_once(
+              makefile,
+              'test-engine-passes.o: '
+              'test-engine-passes.c engine_internal.h\n'
+              '\t$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -o $@ -c $<\n'
+              'index_shard_staged_test.o: '
+              'index_shard.c $(CORE_STATE_HEADERS)\n',
+              'test-engine-passes.o: '
+              'test-engine-passes.c engine_internal.h\n'
+              '\t$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -o $@ -c $<\n'
+              'test-verify-theta-tail.o: '
+              'test-verify-theta-tail.c verify_theta_tail.h\n'
+              '\t$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -o $@ -c $<\n'
+              'index_shard_staged_test.o: '
+              'index_shard.c $(CORE_STATE_HEADERS)\n')
+
+          replace_once(
+              makefile,
+              'tests: $(ALL_TEST_FILES) test-index-shard-config \\\n'
+              '\ttest-index-shard-staged \\\n'
+              '\ttest-engine-passes test-ab-block-integration\n'
+              '.PHONY: tests\n',
+              'tests: $(ALL_TEST_FILES) test-index-shard-config \\\n'
+              '\ttest-index-shard-staged \\\n'
+              '\ttest-engine-passes test-ab-block-integration \\\n'
+              '\ttest-verify-theta-tail\n'
+              '.PHONY: tests\n')
+          PY
 
           rm -rf tools/proi26-production
 
@@ -116,7 +440,7 @@ jobs:
           git diff --cached --name-status
 
           git diff --cached --quiet && {
-            echo 'ERROR: production patch produced no staged changes' >&2
+            echo 'ERROR: production rewrite produced no staged changes' >&2
             exit 1
           }
 
