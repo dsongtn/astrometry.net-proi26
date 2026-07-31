@@ -1,0 +1,150 @@
+     }
+-    packet->verify_plan_end = verify_index + 1U;
+-    {
++    if (!index_shard_helper_available_workers()) {
++        original_plan_end = verify_index + 1U;
++        packet->verify_plan_end = original_plan_end;
++    }
++
++    for (candidate_index = verify_index;
++         candidate_index < original_plan_end;
++         candidate_index++) {
+         solver_candidate_delivery_record_t* record =
+-            &packet->candidate_records[verify_index];
++            &packet->candidate_records[candidate_index];
+         verify_prepared_hit_t* prepared = NULL;
+         MatchObj match;
+         size_t query_bytes;
++        size_t remaining_query_bytes;
+         size_t prepared_bytes;
+         size_t score_bytes;
+         size_t peak_bytes;
+@@ -7739,21 +7974,25 @@
+         double verify_pix2;
+         double logaccept;
+ 
+-        if (!record->candidate_prepared ||
+-            !record->verify_query ||
+-            !record->verify_query_captured) {
+-            packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+-            return 0;
++        if (record->plan_action != SOLVER_AB_CANDIDATE_VERIFY) {
++            continue;
+         }
+         if (index_shard_worker_stop_requested()) {
++            solver_codekd_packet_discard_prepared_verification(packet);
+             packet->state = SOLVER_CODEKD_PACKET_STOPPED;
+             return 2;
+         }
++        if (!record->candidate_prepared ||
++            !record->verify_query ||
++            !record->verify_query_captured) {
++            record->verify_delivery_fallback = TRUE;
++            goto close_prefix;
++        }
+         query_bytes = verify_index_query_bytes(record->verify_query);
+         if (query_bytes == SIZE_MAX ||
+             query_bytes > packet->verify_query_bytes ||
+             solver_codekd_packet_build_verification_match(
+-                input, packet, record, verify_index,
++                input, packet, record, candidate_index,
+                 &match, &verify_pix2, &logaccept) ||
+             verify_prepare_hit_from_query(
+                 packet->starkd,
+@@ -7773,10 +8012,12 @@
+                 FALSE,
+                 &prepared)) {
+             verify_destroy_prepared_hit(prepared);
+-            goto native_fallback;
++            record->verify_delivery_fallback = TRUE;
++            goto close_prefix;
+         }
+         record->verify_query_captured = FALSE;
+-        packet->verify_query_bytes -= query_bytes;
++        remaining_query_bytes =
++            packet->verify_query_bytes - query_bytes;
+         prepared_bytes = verify_prepared_hit_bytes(prepared);
+         score_bytes = verify_prepared_score_bytes(prepared);
+         peak_bytes = verify_prepared_hit_peak_bytes(prepared);
+@@ -7785,12 +8026,13 @@
+             peak_bytes == SIZE_MAX ||
+             prepared_bytes > SIZE_MAX - score_bytes ||
+             peak_bytes < prepared_bytes + score_bytes ||
+-            packet->verify_query_bytes >
+-                packet->verify_query_budget ||
++            remaining_query_bytes > packet->verify_query_budget ||
+             packet->verify_prepared_retained_bytes >
+                 SIZE_MAX - prepared_bytes - score_bytes) {
+             verify_destroy_prepared_hit(prepared);
+-            goto native_fallback;
++            record->verify_delivery_fallback = TRUE;
++            packet->verify_query_bytes = remaining_query_bytes;
++            goto close_prefix;
+         }
+         retained_bytes = prepared_bytes + score_bytes;
+         transient_bytes = peak_bytes - retained_bytes;
+@@ -7802,14 +8044,17 @@
+             transient_bytes);
+         if (retained_total >
+                 packet->verify_query_budget -
+-                    packet->verify_query_bytes ||
++                    remaining_query_bytes ||
+             transient_max >
+                 packet->verify_query_budget -
+-                    packet->verify_query_bytes -
++                    remaining_query_bytes -
+                     retained_total) {
+             verify_destroy_prepared_hit(prepared);
+-            goto native_fallback;
++            record->verify_delivery_fallback = TRUE;
++            packet->verify_query_bytes = remaining_query_bytes;
++            goto close_prefix;
+         }
++        packet->verify_query_bytes = remaining_query_bytes;
+         record->prepared_verification = prepared;
+         record->prepared_verify_pix2 = verify_pix2;
+         record->prepared_logaccept = logaccept;
+@@ -7828,29 +8073,72 @@
+         packet->verify_prepared_transient_bytes =
+             transient_max;
+         packet->verify_prepared_count++;
++        continue;
++
++close_prefix:
++        if (!packet->verify_prepared_count) {
++            packet->verify_plan_end = candidate_index + 1U;
++            packet->verification_score_fallback_batches++;
++            solver_codekd_packet_discard_prepared_verification(packet);
++            packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
++            return 0;
++        }
++        packet->verify_plan_end = candidate_index;
++        packet->verify_topology_end = candidate_index;
++        break;
+     }
+-    if (packet->verify_prepared_count != 1U) {
+-        goto native_fallback;
++
++    if (!packet->verify_prepared_count ||
++        packet->verify_plan_end <= packet->verify_plan_first) {
++        packet->verification_score_fallback_batches++;
++        solver_codekd_packet_discard_prepared_verification(packet);
++        packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
++        return 0;
+     }
+     packet->verification_score_batches_prepared++;
+-    packet->verification_score_contexts_prepared++;
+-    packet->state =
+-        SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY;
+-    return 1;
++    packet->verification_score_contexts_prepared +=
++        packet->verify_prepared_count;
++    if (packet->verify_prepared_count == 1U) {
++        packet->state =
++            SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY;
++        return 1;
++    }
+ 
+-native_fallback:
+-    packet->verification_score_fallback_batches++;
++    window_status =
