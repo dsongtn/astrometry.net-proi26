@@ -11,6 +11,7 @@
 
 #include "fit-wcs.h"
 #include "sip.h"
+#include "sip-utils.h"
 
 //sip_t* wcs_shift(sip_t* wcs, double xs, double ys);
 
@@ -157,6 +158,97 @@ void test_wcs_shift(CuTest* tc) {
      -1.0094e-05 -3.7012e-07
      -8.7938e-06
      */
+}
+
+
+static void initialize_test_tan(tan_t* tan) {
+    memset(tan, 0, sizeof(*tan));
+    tan->crval[0] = 180.0;
+    tan->crval[1] = 20.0;
+    tan->crpix[0] = 50.0;
+    tan->crpix[1] = 40.0;
+    tan->cd[0][0] = -0.01;
+    tan->cd[0][1] = 0.0;
+    tan->cd[1][0] = 0.0;
+    tan->cd[1][1] = 0.01;
+    tan->imagew = 100.0;
+    tan->imageh = 80.0;
+}
+
+void test_fit_sip_wcs_failure_is_transactional(CuTest* tc) {
+    double starxyz[18];
+    double fieldxy[12] = {
+        20.0, 20.0, 40.0, 20.0, 60.0, 20.0,
+        20.0, 60.0, 40.0, 60.0, 60.0, 60.0
+    };
+    double weights[6] = { 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
+    tan_t tan;
+    sip_t output;
+    sip_t before;
+    int i;
+
+    initialize_test_tan(&tan);
+    for (i=0; i<6; i++) {
+        tan_pixelxy2xyzarr(&tan,
+                           fieldxy[2*i], fieldxy[2*i+1],
+                           starxyz + 3*i);
+    }
+    memset(&output, 0x5a, sizeof(output));
+    memcpy(&before, &output, sizeof(before));
+    CuAssertIntEquals(tc, -1,
+        fit_sip_wcs(starxyz, fieldxy, NULL, 2,
+                    &tan, 2, 2, 1, &output));
+    CuAssertTrue(tc, !memcmp(&output, &before, sizeof(output)));
+
+    CuAssertIntEquals(tc, -1,
+        fit_sip_wcs(starxyz, fieldxy, weights, 6,
+                    &tan, 2, 2, 1, &output));
+    CuAssertTrue(tc, !memcmp(&output, &before, sizeof(output)));
+}
+
+void test_fit_sip_wcs_success_commits(CuTest* tc) {
+    double starxyz[18];
+    double fieldxy[12] = {
+        20.0, 20.0, 40.0, 20.0, 60.0, 20.0,
+        20.0, 60.0, 40.0, 60.0, 60.0, 60.0
+    };
+    tan_t tan;
+    sip_t output;
+    int i;
+
+    initialize_test_tan(&tan);
+    for (i=0; i<6; i++) {
+        tan_pixelxy2xyzarr(&tan,
+                           fieldxy[2*i], fieldxy[2*i+1],
+                           starxyz + 3*i);
+    }
+    memset(&output, 0, sizeof(output));
+    CuAssertIntEquals(tc, 0,
+        fit_sip_wcs(starxyz, fieldxy, NULL, 6,
+                    &tan, 1, 1, 1, &output));
+    CuAssertTrue(tc, isfinite(output.wcstan.crval[0]));
+    CuAssertTrue(tc, isfinite(output.wcstan.crval[1]));
+    CuAssertTrue(tc, isfinite(output.wcstan.cd[0][0]));
+    CuAssertTrue(tc, isfinite(output.wcstan.cd[1][1]));
+    CuAssertIntEquals(tc, 1, output.a_order);
+    CuAssertIntEquals(tc, 1, output.ap_order);
+}
+
+void test_sip_inverse_failure_is_transactional(CuTest* tc) {
+    sip_t sip;
+    sip_t before;
+
+    memset(&sip, 0, sizeof(sip));
+    initialize_test_tan(&sip.wcstan);
+    sip.a_order = sip.b_order = 1;
+    sip.ap_order = sip.bp_order = 1;
+    sip.a[1][0] = 0.01;
+    memcpy(&before, &sip, sizeof(before));
+
+    CuAssertIntEquals(tc, -1,
+        sip_compute_inverse_polynomials(
+            &sip, 1, 1, 0.0, 0.0, 0.0, 0.0));
+    CuAssertTrue(tc, !memcmp(&sip, &before, sizeof(sip)));
 }
 
 #if 0

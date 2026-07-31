@@ -3,6 +3,7 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 #include <math.h>
+#include <string.h>
 #include <assert.h>
 
 #include "gsl/gsl_matrix.h"
@@ -85,29 +86,44 @@ int fit_sip_wcs(const double* starxyz,
     int sip_coeffs;
     double xyzcrval[3];
     double cdinv[2][2];
-    double sx, sy, sU, sV, su, sv;
+    double sx=0.0, sy=0.0, sU, sV, su, sv;
     int N;
     int i, j, p, q, order;
     double totalweight;
     int rtn;
-    gsl_matrix *mA;
-    gsl_vector *b1, *b2, *x1, *x2;
+    int status = -1;
+    gsl_matrix *mA=NULL;
+    gsl_vector *b1=NULL, *b2=NULL, *x1=NULL, *x2=NULL;
     gsl_vector *r1=NULL, *r2=NULL;
     tan_t tanin2;
+    sip_t candidate;
     int ngood;
     const tan_t* tanin = &tanin2;
+
+    if (!starxyz || !fieldxy || !tanin1 || !sipout || M <= 0) {
+        ERROR("Invalid SIP fit arguments");
+        return -1;
+    }
+
     // We need at least the linear terms to compute CD.
-    if (sip_order < 1)
+    if (sip_order < 1) {
         sip_order = 1;
+    }
+    if (sip_order >= SIP_MAXORDER ||
+        inv_order < 0 || inv_order >= SIP_MAXORDER) {
+        ERROR("Invalid SIP orders: forward=%i inverse=%i",
+              sip_order, inv_order);
+        return -1;
+    }
 
     // convenience: allow the user to call like:
     //    fit_sip_wcs(... &(sipout.wcstan), ..., sipout);
     memcpy(&tanin2, tanin1, sizeof(tan_t));
 
-    memset(sipout, 0, sizeof(sip_t));
-    memcpy(&(sipout->wcstan), tanin, sizeof(tan_t));
-    sipout->a_order  = sipout->b_order  = sip_order;
-    sipout->ap_order = sipout->bp_order = inv_order;
+    memset(&candidate, 0, sizeof(candidate));
+    memcpy(&(candidate.wcstan), tanin, sizeof(tan_t));
+    candidate.a_order  = candidate.b_order  = sip_order;
+    candidate.ap_order = candidate.bp_order = inv_order;
 
     // The SIP coefficients form an (order x order) upper triangular
     // matrix missing the 0,0 element.
@@ -122,9 +138,10 @@ int fit_sip_wcs(const double* starxyz,
     mA = gsl_matrix_alloc(M, N);
     b1 = gsl_vector_alloc(M);
     b2 = gsl_vector_alloc(M);
-    assert(mA);
-    assert(b1);
-    assert(b2);
+    if (!mA || !b1 || !b2) {
+        ERROR("Failed to allocate SIP fit workspace");
+        goto cleanup;
+    }
 
     /*
      *  We use a clever trick to estimate CD, A, and B terms in two
@@ -240,10 +257,14 @@ int fit_sip_wcs(const double* starxyz,
         double weight = 1.0;
         double u;
         double v;
-        Unused anbool ok;
+        anbool ok;
 
         u = fieldxy[2*i + 0] - tanin->crpix[0];
         v = fieldxy[2*i + 1] - tanin->crpix[1];
+        if (!isfinite(u) || !isfinite(v)) {
+            ERROR("Non-finite field coordinate in SIP fit");
+            goto cleanup;
+        }
 
         // B contains Intermediate World Coordinates (in degrees)
         // tangent-plane projection
@@ -252,14 +273,25 @@ int fit_sip_wcs(const double* starxyz,
             logverb("Skipping star that cannot be projected to tangent plane\n");
             continue;
         }
+        if (!isfinite(x) || !isfinite(y)) {
+            ERROR("Non-finite projected coordinate in SIP fit");
+            goto cleanup;
+        }
 
         if (weights) {
             weight = weights[i];
-            assert(weight >= 0.0);
-            assert(weight <= 1.0);
+            if (!isfinite(weight) || weight < 0.0 || weight > 1.0) {
+                ERROR("Invalid SIP correspondence weight: %g", weight);
+                goto cleanup;
+            }
             totalweight += weight;
-            if (weight == 0.0)
+            if (!isfinite(totalweight)) {
+                ERROR("Non-finite SIP total correspondence weight");
+                goto cleanup;
+            }
+            if (weight == 0.0) {
                 continue;
+            }
         }
 
         gsl_vector_set(b1, ngood, weight * rad2deg(x));
@@ -279,34 +311,42 @@ int fit_sip_wcs(const double* starxyz,
         j = 0;
         for (order=0; order<=sip_order; order++) {
             for (q=0; q<=order; q++) {
+                double term;
+
                 p = order - q;
                 assert(j >= 0);
                 assert(j < N);
                 assert(p >= 0);
                 assert(q >= 0);
                 assert(p + q <= sip_order);
-                gsl_matrix_set(mA, ngood, j,
-                               weight * pow(u, (double)p) * pow(v, (double)q));
+                term = weight * pow(u, (double)p) * pow(v, (double)q);
+                if (!isfinite(term)) {
+                    ERROR("Non-finite SIP polynomial term");
+                    goto cleanup;
+                }
+                gsl_matrix_set(mA, ngood, j, term);
                 j++;
             }
         }
         assert(j == N);
 
         // The shift - aka (0,0) - SIP coefficient must be 1.
-        assert(gsl_matrix_get(mA, i, 0) == 1.0 * weight);
-        assert(fabs(gsl_matrix_get(mA, i, 1) - u * weight) < 1e-12);
-        assert(fabs(gsl_matrix_get(mA, i, 2) - v * weight) < 1e-12);
+        assert(gsl_matrix_get(mA, ngood, 0) == 1.0 * weight);
+        assert(fabs(gsl_matrix_get(mA, ngood, 1) - u * weight) < 1e-12);
+        assert(fabs(gsl_matrix_get(mA, ngood, 2) - v * weight) < 1e-12);
 
         ngood++;
     }
 
-    if (ngood == 0) {
-        ERROR("No stars projected within the image\n");
-        return -1;
+    if (ngood < N) {
+        ERROR("Too few usable correspondences for the SIP order specified (%i < %i)\n",
+              ngood, N);
+        goto cleanup;
     }
 
-    if (weights)
+    if (weights) {
         logverb("Total weight: %g\n", totalweight);
+    }
 
     if (ngood < M) {
         _gsl_vector_view sub_b1 = gsl_vector_subvector(b1, 0, ngood);
@@ -321,9 +361,9 @@ int fit_sip_wcs(const double* starxyz,
         // Solve the equation.
         rtn = gslutils_solve_leastsquares_v(mA, 2, b1, &x1, NULL, b2, &x2, NULL);
     }
-    if (rtn) {
+    if (rtn || !x1 || !x2) {
         ERROR("Failed to solve SIP matrix equation!");
-        return -1;
+        goto cleanup;
     }
 
     // Row 0 of X are the shift (p=0, q=0) terms.
@@ -332,15 +372,18 @@ int fit_sip_wcs(const double* starxyz,
 
     if (doshift) {
         // Grab CD.
-        sipout->wcstan.cd[0][0] = gsl_vector_get(x1, 1);
-        sipout->wcstan.cd[0][1] = gsl_vector_get(x1, 2);
-        sipout->wcstan.cd[1][0] = gsl_vector_get(x2, 1);
-        sipout->wcstan.cd[1][1] = gsl_vector_get(x2, 2);
+        candidate.wcstan.cd[0][0] = gsl_vector_get(x1, 1);
+        candidate.wcstan.cd[0][1] = gsl_vector_get(x1, 2);
+        candidate.wcstan.cd[1][0] = gsl_vector_get(x2, 1);
+        candidate.wcstan.cd[1][1] = gsl_vector_get(x2, 2);
 
         // Compute inv(CD)
-        i = invert_2by2_arr((const double*)(sipout->wcstan.cd),
+        i = invert_2by2_arr((const double*)(candidate.wcstan.cd),
                             (double*)cdinv);
-        assert(i == 0);
+        if (i) {
+            ERROR("Singular CD matrix in SIP fit");
+            goto cleanup;
+        }
 
         // Grab the shift.
         sx = gsl_vector_get(x1, 0);
@@ -348,9 +391,12 @@ int fit_sip_wcs(const double* starxyz,
 
     } else {
         // Compute inv(CD)
-        i = invert_2by2_arr((const double*)(sipout->wcstan.cd),
+        i = invert_2by2_arr((const double*)(candidate.wcstan.cd),
                             (double*)cdinv);
-        assert(i == 0);
+        if (i) {
+            ERROR("Singular CD matrix in SIP fit");
+            goto cleanup;
+        }
     }
 
     // Extract the SIP coefficients.
@@ -358,6 +404,9 @@ int fit_sip_wcs(const double* starxyz,
     j = 0;
     for (order=0; order<=sip_order; order++) {
         for (q=0; q<=order; q++) {
+            double a;
+            double b;
+
             p = order - q;
             assert(j >= 0);
             assert(j < N);
@@ -365,13 +414,16 @@ int fit_sip_wcs(const double* starxyz,
             assert(q >= 0);
             assert(p + q <= sip_order);
 
-            sipout->a[p][q] =
-                cdinv[0][0] * gsl_vector_get(x1, j) +
+            a = cdinv[0][0] * gsl_vector_get(x1, j) +
                 cdinv[0][1] * gsl_vector_get(x2, j);
-
-            sipout->b[p][q] =
-                cdinv[1][0] * gsl_vector_get(x1, j) +
+            b = cdinv[1][0] * gsl_vector_get(x1, j) +
                 cdinv[1][1] * gsl_vector_get(x2, j);
+            if (!isfinite(a) || !isfinite(b)) {
+                ERROR("Non-finite SIP coefficient");
+                goto cleanup;
+            }
+            candidate.a[p][q] = a;
+            candidate.b[p][q] = b;
             j++;
         }
     }
@@ -380,15 +432,18 @@ int fit_sip_wcs(const double* starxyz,
     if (doshift) {
         // We have already dealt with the shift and linear terms, so zero them out
         // in the SIP coefficient matrix.
-        sipout->a[0][0] = 0.0;
-        sipout->a[0][1] = 0.0;
-        sipout->a[1][0] = 0.0;
-        sipout->b[0][0] = 0.0;
-        sipout->b[0][1] = 0.0;
-        sipout->b[1][0] = 0.0;
+        candidate.a[0][0] = 0.0;
+        candidate.a[0][1] = 0.0;
+        candidate.a[1][0] = 0.0;
+        candidate.b[0][0] = 0.0;
+        candidate.b[0][1] = 0.0;
+        candidate.b[1][0] = 0.0;
     }
 
-    sip_compute_inverse_polynomials(sipout, 0, 0, 0, 0, 0, 0);
+    if (sip_compute_inverse_polynomials(
+            &candidate, 0, 0, 0, 0, 0, 0)) {
+        goto cleanup;
+    }
 
     if (doshift) {
         sU =
@@ -397,32 +452,54 @@ int fit_sip_wcs(const double* starxyz,
         sV =
             cdinv[1][0] * sx +
             cdinv[1][1] * sy;
+        if (!isfinite(sU) || !isfinite(sV)) {
+            ERROR("Non-finite SIP WCS shift");
+            goto cleanup;
+        }
         logverb("Applying shift of sx,sy = %g,%g deg (%g,%g pix) to CRVAL and CD.\n",
                 sx, sy, sU, sV);
 
-        sip_calc_inv_distortion(sipout, sU, sV, &su, &sv);
+        sip_calc_inv_distortion(&candidate, sU, sV, &su, &sv);
+        if (!isfinite(su) || !isfinite(sv)) {
+            ERROR("Non-finite inverse SIP WCS shift");
+            goto cleanup;
+        }
 
         debug("sx = %g, sy = %g\n", sx, sy);
         debug("sU = %g, sV = %g\n", sU, sV);
         debug("su = %g, sv = %g\n", su, sv);
 
-        wcs_shift(&(sipout->wcstan), -su, -sv);
+        wcs_shift(&(candidate.wcstan), -su, -sv);
     }
 
-    if (r1)
+    memcpy(sipout, &candidate, sizeof(*sipout));
+    status = 0;
+
+cleanup:
+    if (r1) {
         gsl_vector_free(r1);
-    if (r2)
+    }
+    if (r2) {
         gsl_vector_free(r2);
+    }
+    if (mA) {
+        gsl_matrix_free(mA);
+    }
+    if (b1) {
+        gsl_vector_free(b1);
+    }
+    if (b2) {
+        gsl_vector_free(b2);
+    }
+    if (x1) {
+        gsl_vector_free(x1);
+    }
+    if (x2) {
+        gsl_vector_free(x2);
+    }
 
-    gsl_matrix_free(mA);
-    gsl_vector_free(b1);
-    gsl_vector_free(b2);
-    gsl_vector_free(x1);
-    gsl_vector_free(x2);
-
-    return 0;
+    return status;
 }
-
 
 
 

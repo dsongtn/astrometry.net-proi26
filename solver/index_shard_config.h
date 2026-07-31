@@ -10,6 +10,11 @@
 #define INDEX_SHARD_WORKERS_AUTO 0
 #define INDEX_SHARD_WORKERS_UNSET (-1)
 
+typedef struct index_shard_width_plan {
+  size_t producer_width;
+  size_t helper_width;
+} index_shard_width_plan_t;
+
 /*
  * Return the number of logical CPUs currently available to this process.
  * Linux process affinity is preferred; portable online-CPU detection is the
@@ -44,5 +49,16 @@ int index_shard_config_resolve_workers(int requested_workers,
  */
 int index_shard_config_effective_workers(int configured_workers,
                                          size_t nindexes);
+
+/*
+ * Bound simultaneous cold outer owners by detached delivery capacity.
+ * Surplus compute threads remain available to execute staged work.
+ * Without detached completion, retain the conservative fixed-helper policy.
+ */
+int index_shard_config_plan_widths(
+    int worker_count,
+    int payload_io_width,
+    int detached_completion,
+    index_shard_width_plan_t *plan);
 
 #endif

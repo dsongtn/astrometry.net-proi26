@@ -1,3 +1,4 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -29,6 +30,21 @@ static void check_parse_failure(const char *text) {
 
   CHECK(index_shard_config_parse_workers(text, 8, &parsed) != 0);
   CHECK(parsed == 77);
+}
+
+static void check_width_plan(int workers,
+                             int io_width,
+                             int detached,
+                             size_t expected_producers,
+                             size_t expected_helpers) {
+  index_shard_width_plan_t plan = { SIZE_MAX, SIZE_MAX };
+
+  CHECK(index_shard_config_plan_widths(
+      workers, io_width, detached, &plan) == 0);
+  CHECK(plan.producer_width == expected_producers);
+  CHECK(plan.helper_width == expected_helpers);
+  CHECK(plan.producer_width + plan.helper_width ==
+        (size_t)workers);
 }
 
 int main(void) {
@@ -71,6 +87,26 @@ int main(void) {
   CHECK(index_shard_config_effective_workers(8, 3) == 8);
   CHECK(index_shard_config_effective_workers(1, 9) == 1);
   CHECK(index_shard_config_effective_workers(0, 9) == 1);
+
+  check_width_plan(1, 0, 0, 1U, 0U);
+  check_width_plan(2, 1, 1, 2U, 0U);
+  check_width_plan(3, 1, 1, 2U, 1U);
+  check_width_plan(4, 2, 1, 4U, 0U);
+  check_width_plan(5, 2, 1, 4U, 1U);
+  check_width_plan(7, 2, 1, 4U, 3U);
+  check_width_plan(8, 2, 1, 4U, 4U);
+  check_width_plan(4, 0, 0, 3U, 1U);
+  {
+    index_shard_width_plan_t invalid_plan = { 9U, 9U };
+
+    CHECK(index_shard_config_plan_widths(
+        0, 1, 1, &invalid_plan) != 0);
+    CHECK(index_shard_config_plan_widths(
+        4, -1, 1, &invalid_plan) != 0);
+    CHECK(index_shard_config_plan_widths(
+        4, 1, 1, NULL) != 0);
+  }
+
   CHECK(detected_available >= 1);
   if (expected_available) {
     CHECK(detected_available == atoi(expected_available));
