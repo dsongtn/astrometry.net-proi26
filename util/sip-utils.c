@@ -2,6 +2,7 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -53,18 +54,25 @@ int sip_compute_inverse_polynomials(sip_t* sip, int NX, int NY,
     int inv_sip_order;
     int M, N;
     int i, j, p, q, gu, gv;
+    int status = -1;
     double maxu, maxv, minu, minv;
     double u, v, U, V;
-    gsl_matrix *mA;
-    gsl_vector *b1, *b2, *x1, *x2;
+    gsl_matrix *mA=NULL;
+    gsl_vector *b1=NULL, *b2=NULL, *x1=NULL, *x2=NULL;
+    sip_t candidate;
     tan_t* tan;
 
-    assert(sip->a_order == sip->b_order);
-    assert(sip->ap_order == sip->bp_order);
-    tan = &(sip->wcstan);
+    if (!sip || sip->a_order != sip->b_order ||
+        sip->ap_order != sip->bp_order ||
+        sip->a_order < 0 || sip->a_order >= SIP_MAXORDER ||
+        sip->ap_order < 0 || sip->ap_order >= SIP_MAXORDER) {
+        return -1;
+    }
+    memcpy(&candidate, sip, sizeof(candidate));
+    tan = &(candidate.wcstan);
 
     logverb("sip_compute-inverse_polynomials: A %i, AP %i\n",
-            sip->a_order, sip->ap_order);
+            candidate.a_order, candidate.ap_order);
 
     /*
      basic idea: lay down a grid in image, for each gridpoint, push
@@ -73,17 +81,28 @@ int sip_compute_inverse_polynomials(sip_t* sip, int NX, int NY,
      set of warped gridpoints as inputs, fit back to their original
      grid locations as targets.
      */
-    inv_sip_order = sip->ap_order;
+    inv_sip_order = candidate.ap_order;
 
     // Number of grid points to use:
-    if (NX == 0)
+    if (NX == 0) {
         NX = 10 * (inv_sip_order + 1);
-    if (NY == 0)
+    }
+    if (NY == 0) {
         NY = 10 * (inv_sip_order + 1);
-    if (xhi == 0)
+    }
+    if (NX < 2 || NY < 2 || NX > INT_MAX / NY) {
+        return -1;
+    }
+    if (xhi == 0) {
         xhi = tan->imagew;
-    if (yhi == 0)
+    }
+    if (yhi == 0) {
         yhi = tan->imageh;
+    }
+    if (!isfinite(xlo) || !isfinite(xhi) ||
+        !isfinite(ylo) || !isfinite(yhi)) {
+        return -1;
+    }
 
     logverb("NX,NY %i,%i, x range [%f, %f], y range [%f, %f]\n",
             NX,NY, xlo, xhi, ylo, yhi);
@@ -94,13 +113,16 @@ int sip_compute_inverse_polynomials(sip_t* sip, int NX, int NY,
 
     // Number of samples to fit.
     M = NX * NY;
+    if (M < N) {
+        return -1;
+    }
 
     mA = gsl_matrix_alloc(M, N);
     b1 = gsl_vector_alloc(M);
     b2 = gsl_vector_alloc(M);
-    assert(mA);
-    assert(b1);
-    assert(b2);
+    if (!mA || !b1 || !b2) {
+        goto cleanup;
+    }
 
     /*
      *  Rearranging formula (4), (5), and (6) from the SIP paper gives the
@@ -146,20 +168,30 @@ int sip_compute_inverse_polynomials(sip_t* sip, int NX, int NY,
             u = (gu * (maxu - minu) / (NX-1)) + minu;
             v = (gv * (maxv - minv) / (NY-1)) + minv;
             // compute U=u+f(u,v) and V=v+g(u,v)
-            sip_calc_distortion(sip, u, v, &U, &V);
+            sip_calc_distortion(&candidate, u, v, &U, &V);
+            if (!isfinite(U) || !isfinite(V)) {
+                goto cleanup;
+            }
             fuv = U - u;
             guv = V - v;
             // Polynomial terms...
             j = 0;
-            for (p = 0; p <= inv_sip_order; p++)
+            for (p = 0; p <= inv_sip_order; p++) {
                 for (q = 0; q <= inv_sip_order; q++) {
-                    if (p + q > inv_sip_order)
+                    double term;
+
+                    if (p + q > inv_sip_order) {
                         continue;
+                    }
                     assert(j < N);
-                    gsl_matrix_set(mA, i, j,
-                                   pow(U, (double)p) * pow(V, (double)q));
+                    term = pow(U, (double)p) * pow(V, (double)q);
+                    if (!isfinite(term)) {
+                        goto cleanup;
+                    }
+                    gsl_matrix_set(mA, i, j, term);
                     j++;
                 }
+            }
             assert(j == N);
             gsl_vector_set(b1, i, -fuv);
             gsl_vector_set(b2, i, -guv);
@@ -169,22 +201,34 @@ int sip_compute_inverse_polynomials(sip_t* sip, int NX, int NY,
     assert(i == M);
 
     // Solve the linear equation.
-    if (gslutils_solve_leastsquares_v(mA, 2, b1, &x1, NULL, b2, &x2, NULL)) {
+    if (gslutils_solve_leastsquares_v(
+            mA, 2, b1, &x1, NULL, b2, &x2, NULL) ||
+        !x1 || !x2) {
         ERROR("Failed to solve SIP inverse matrix equation!");
-        return -1;
+        goto cleanup;
     }
 
     // Extract the coefficients
     j = 0;
-    for (p = 0; p <= inv_sip_order; p++)
+    for (p = 0; p <= inv_sip_order; p++) {
         for (q = 0; q <= inv_sip_order; q++) {
-            if ((p + q > inv_sip_order))
+            double ap;
+            double bp;
+
+            if ((p + q > inv_sip_order)) {
                 continue;
+            }
             assert(j < N);
-            sip->ap[p][q] = gsl_vector_get(x1, j);
-            sip->bp[p][q] = gsl_vector_get(x2, j);
+            ap = gsl_vector_get(x1, j);
+            bp = gsl_vector_get(x2, j);
+            if (!isfinite(ap) || !isfinite(bp)) {
+                goto cleanup;
+            }
+            candidate.ap[p][q] = ap;
+            candidate.bp[p][q] = bp;
             j++;
         }
+    }
     assert(j == N);
 
     // Check that we found values that actually invert the polynomial.
@@ -200,8 +244,8 @@ int sip_compute_inverse_polynomials(sip_t* sip, int NX, int NY,
                 // Calculate grid position in original image pixels
                 u = (gu * (maxu - minu) / (NX-1)) + minu;
                 v = (gv * (maxv - minv) / (NY-1)) + minv;
-                sip_calc_distortion(sip, u, v, &U, &V);
-                sip_calc_inv_distortion(sip, U, V, &newu, &newv);
+                sip_calc_distortion(&candidate, u, v, &U, &V);
+                sip_calc_inv_distortion(&candidate, U, V, &newu, &newv);
                 sumdu += square(u - newu);
                 sumdv += square(v - newv);
             }
@@ -210,7 +254,7 @@ int sip_compute_inverse_polynomials(sip_t* sip, int NX, int NY,
         sumdv /= (NX*NY);
         debug("RMS error of inverting a distortion (at the grid points, in pixels):\n");
         debug("  du: %g\n", sqrt(sumdu));
-        debug("  dv: %g\n", sqrt(sumdu));
+        debug("  dv: %g\n", sqrt(sumdv));
         debug("  dist: %g\n", sqrt(sumdu + sumdv));
 
         sumdu = 0;
@@ -220,8 +264,8 @@ int sip_compute_inverse_polynomials(sip_t* sip, int NX, int NY,
             double newu, newv;
             u = uniform_sample(minu, maxu);
             v = uniform_sample(minv, maxv);
-            sip_calc_distortion(sip, u, v, &U, &V);
-            sip_calc_inv_distortion(sip, U, V, &newu, &newv);
+            sip_calc_distortion(&candidate, u, v, &U, &V);
+            sip_calc_inv_distortion(&candidate, U, V, &newu, &newv);
             sumdu += square(u - newu);
             sumdv += square(v - newv);
         }
@@ -229,17 +273,31 @@ int sip_compute_inverse_polynomials(sip_t* sip, int NX, int NY,
         sumdv /= Z;
         debug("RMS error of inverting a distortion (at random points, in pixels):\n");
         debug("  du: %g\n", sqrt(sumdu));
-        debug("  dv: %g\n", sqrt(sumdu));
+        debug("  dv: %g\n", sqrt(sumdv));
         debug("  dist: %g\n", sqrt(sumdu + sumdv));
     }
 
-    gsl_matrix_free(mA);
-    gsl_vector_free(b1);
-    gsl_vector_free(b2);
-    gsl_vector_free(x1);
-    gsl_vector_free(x2);
+    memcpy(sip, &candidate, sizeof(*sip));
+    status = 0;
 
-    return 0;
+cleanup:
+    if (mA) {
+        gsl_matrix_free(mA);
+    }
+    if (b1) {
+        gsl_vector_free(b1);
+    }
+    if (b2) {
+        gsl_vector_free(b2);
+    }
+    if (x1) {
+        gsl_vector_free(x1);
+    }
+    if (x2) {
+        gsl_vector_free(x2);
+    }
+
+    return status;
 }
 
 anbool tan_pixel_is_inside_image(const tan_t* wcs, double x, double y) {
