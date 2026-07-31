@@ -1,0 +1,150 @@
++  failures += index_shard_helper_staged_child_allowed(
++      &context) != FALSE;
++  return failures;
++}
++
+ int index_shard_test_staged_retire_more(void) {
+   return index_shard_staged_retire_test_order() +
+-      index_shard_staged_retire_test_terminal();
++      index_shard_staged_retire_test_terminal() +
++      index_shard_staged_child_helper_test();
+ }
+ 
+ #endif
+--- a/solver/index_shard_internal.h
++++ b/solver/index_shard_internal.h
+@@ -163,6 +163,12 @@
+  * outer owner retains its source lease until the synchronous group is fully
+  * quiescent. execute() must be reentrant and thread-safe and must not mutate
+  * global state or retain any task or source pointer after it returns.
++ *
++ * A staged task owner may call index_shard_helper_run() only from its typed
++ * owner callback. This publishes one same-pool synchronous child group while
++ * the staged task retains every input lifetime. Recursive helper publication
++ * and calls from staged prepare/submit/poll/foreign-execute callbacks remain
++ * unavailable.
+  */
+ typedef enum index_shard_helper_run_status {
+   INDEX_SHARD_HELPER_FATAL = -3,
+--- a/solver/solver.c
++++ b/solver/solver.c
+@@ -7675,15 +7675,242 @@
+ }
+ 
+ /*
+- * The owner consumes only fully captured native query results and creates
+- * immutable, index-free score contexts. No solver or reducer state is touched.
++ * Saturating score-work accounting is diagnostic only; it must never alter
++ * packet control flow.
++ */
++static void solver_codekd_packet_add_verification_score_work(
++    solver_codekd_search_packet_t* packet,
++    unsigned long long work_units) {
++    if (!packet) {
++        return;
++    }
++    if (packet->verification_score_work_units_completed ==
++            ULLONG_MAX ||
++        work_units == ULLONG_MAX ||
++        ULLONG_MAX -
++            packet->verification_score_work_units_completed <
++                work_units) {
++        packet->verification_score_work_units_completed =
++            ULLONG_MAX;
++    } else {
++        packet->verification_score_work_units_completed +=
++            work_units;
++    }
++}
++
++static void solver_codekd_packet_destroy_score_array(
++    verify_prepared_score_t* scores,
++    size_t count) {
++    size_t score_index;
++
++    if (!scores) {
++        return;
++    }
++    for (score_index = 0U; score_index < count; score_index++) {
++        verify_destroy_prepared_score(&scores[score_index]);
++    }
++    free(scores);
++}
++
++typedef enum solver_codekd_verification_window_status {
++    SOLVER_CODEKD_VERIFY_WINDOW_ERROR = -1,
++    SOLVER_CODEKD_VERIFY_WINDOW_UNAVAILABLE = 0,
++    SOLVER_CODEKD_VERIFY_WINDOW_SCORED = 1,
++    SOLVER_CODEKD_VERIFY_WINDOW_STOPPED = 2,
++    SOLVER_CODEKD_VERIFY_WINDOW_FAILED = 3
++} solver_codekd_verification_window_status_t;
++
++/*
++ * Score one bounded immutable window on the existing shard pool. Each helper
++ * receives only prepared verification contexts and a disjoint score range.
++ * Candidate records remain owner-only until the synchronous group is fully
++ * quiescent, after which scores are moved into their canonical record slots.
++ */
++static solver_codekd_verification_window_status_t
++solver_codekd_packet_score_verification_window_parallel(
++    solver_codekd_search_packet_t* packet) {
++    solver_verification_score_slot_t* slots = NULL;
++    verify_prepared_score_t* scores = NULL;
++    index_shard_helper_task_t tasks[INDEX_SHARD_HELPER_MAX_TASKS];
++    solver_verification_task_input_t
++        inputs[INDEX_SHARD_HELPER_MAX_TASKS];
++    index_shard_helper_run_stats_t run_stats;
++    index_shard_helper_run_status_t run_status;
++    size_t task_count;
++    size_t task_index;
++    size_t slot_index = 0U;
++    size_t candidate_index;
++    double wall_start = 0.0;
++
++    if (!packet || !packet->candidate_records ||
++        packet->state != SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER ||
++        !packet->verify_plan_complete ||
++        packet->verify_plan_first !=
++            packet->candidate_window_offset ||
++        packet->verify_plan_end <= packet->verify_plan_first ||
++        packet->verify_plan_end > packet->candidate_window_count ||
++        packet->verify_prepared_count < 2U ||
++        packet->verify_prepared_count >
++            INDEX_SHARD_HELPER_MAX_TASKS) {
++        return SOLVER_CODEKD_VERIFY_WINDOW_ERROR;
++    }
++    slots = calloc(packet->verify_prepared_count, sizeof(*slots));
++    scores = calloc(packet->verify_prepared_count, sizeof(*scores));
++    if (!slots || !scores) {
++        free(slots);
++        free(scores);
++        return SOLVER_CODEKD_VERIFY_WINDOW_UNAVAILABLE;
++    }
++    memset(tasks, 0, sizeof(tasks));
++    memset(inputs, 0, sizeof(inputs));
++    memset(&run_stats, 0, sizeof(run_stats));
++
++    for (candidate_index = packet->verify_plan_first;
++         candidate_index < packet->verify_plan_end;
++         candidate_index++) {
++        solver_candidate_delivery_record_t* record =
++            &packet->candidate_records[candidate_index];
++
++        if (!record->prepared_verification) {
++            continue;
++        }
++        if (record->plan_action != SOLVER_AB_CANDIDATE_VERIFY ||
++            record->verification_score_ready ||
++            slot_index >= packet->verify_prepared_count) {
++            solver_codekd_packet_destroy_score_array(
++                scores, packet->verify_prepared_count);
++            free(slots);
++            return SOLVER_CODEKD_VERIFY_WINDOW_ERROR;
++        }
++        slots[slot_index].prepared =
++            record->prepared_verification;
++        slot_index++;
++    }
++    if (slot_index != packet->verify_prepared_count) {
++        solver_codekd_packet_destroy_score_array(
++            scores, packet->verify_prepared_count);
