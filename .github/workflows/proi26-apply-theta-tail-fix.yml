@@ -4,13 +4,20 @@ on:
   push:
     branches:
       - assistant/verification-reorder-buffer
+  pull_request:
+    types:
+      - ready_for_review
 
 permissions:
   contents: write
 
 jobs:
   apply-production-fix:
-    if: contains(github.event.head_commit.message, '[apply-theta-tail]')
+    if: >-
+      (github.event_name == 'push' &&
+       contains(github.event.head_commit.message, '[apply-theta-tail]')) ||
+      (github.event_name == 'pull_request' &&
+       github.head_ref == 'assistant/verification-reorder-buffer')
     runs-on: ubuntu-latest
     steps:
       - name: Check out assistant branch
@@ -29,12 +36,10 @@ jobs:
             "assistant/verification-reorder-buffer"
           test -f tools/proi26-production/verify_theta_tail_fix.patch
 
-          # Remove the temporary tuning fingerprint/status wrapper.
           git show \
             4b85abbdd235072117178fec387577243fa88a19:include/astrometry/tweak2.h \
             > include/astrometry/tweak2.h
 
-          # Remove temporary verifier diagnostics and their apply helper.
           rm -rf tools/proi26-diagnostics
 
           git apply --check \
@@ -42,7 +47,6 @@ jobs:
           git apply \
             tools/proi26-production/verify_theta_tail_fix.patch
 
-          # The production patch itself is not part of the final source tree.
           rm -rf tools/proi26-production
 
       - name: Validate regression and source ordering
