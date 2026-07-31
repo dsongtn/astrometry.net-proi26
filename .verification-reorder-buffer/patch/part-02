@@ -1,0 +1,150 @@
++        free(slots);
++        return SOLVER_CODEKD_VERIFY_WINDOW_ERROR;
++    }
++
++    /*
++     * One prepared context is the smallest safe score unit. The window is
++     * capped by SOLVER_VERIFY_QUERY_LOOKAHEAD and the packet memory budget, so
++     * the bounded task count cannot flood the shared queue.
++     */
++    task_count = packet->verify_prepared_count;
++    for (task_index = 0U; task_index < task_count; task_index++) {
++        unsigned long long work_units =
++            verify_prepared_hit_work_units(
++                slots[task_index].prepared);
++
++        if (!work_units) {
++            work_units = 1U;
++        }
++        inputs[task_index].slots = &slots[task_index];
++        inputs[task_index].slot_first = task_index;
++        inputs[task_index].slot_count = 1U;
++        tasks[task_index].input = &inputs[task_index];
++        tasks[task_index].input_bytes = sizeof(inputs[task_index]);
++        tasks[task_index].output = &scores[task_index];
++        tasks[task_index].output_bytes = sizeof(scores[task_index]);
++        tasks[task_index].work_units = work_units;
++    }
++
++    if (packet->detailed) {
++        wall_start = monotonic_seconds();
++    }
++    run_status = index_shard_helper_run(
++        &solver_verification_helper_ops,
++        tasks,
++        task_count,
++        &run_stats);
++    if (packet->detailed &&
++        run_status != INDEX_SHARD_HELPER_UNAVAILABLE) {
++        packet->verification_score_wall_seconds +=
++            monotonic_seconds() - wall_start;
++    }
++    if (run_status == INDEX_SHARD_HELPER_UNAVAILABLE) {
++        solver_codekd_packet_destroy_score_array(
++            scores, packet->verify_prepared_count);
++        free(slots);
++        return SOLVER_CODEKD_VERIFY_WINDOW_UNAVAILABLE;
++    }
++    if (run_status == INDEX_SHARD_HELPER_STOPPED) {
++        solver_codekd_packet_destroy_score_array(
++            scores, packet->verify_prepared_count);
++        free(slots);
++        return SOLVER_CODEKD_VERIFY_WINDOW_STOPPED;
++    }
++    if (run_status == INDEX_SHARD_HELPER_FATAL) {
++        solver_codekd_packet_destroy_score_array(
++            scores, packet->verify_prepared_count);
++        free(slots);
++        return SOLVER_CODEKD_VERIFY_WINDOW_ERROR;
++    }
++    if (run_status != INDEX_SHARD_HELPER_OK) {
++        solver_codekd_packet_destroy_score_array(
++            scores, packet->verify_prepared_count);
++        free(slots);
++        return SOLVER_CODEKD_VERIFY_WINDOW_FAILED;
++    }
++
++    slot_index = 0U;
++    for (candidate_index = packet->verify_plan_first;
++         candidate_index < packet->verify_plan_end;
++         candidate_index++) {
++        solver_candidate_delivery_record_t* record =
++            &packet->candidate_records[candidate_index];
++        unsigned long long work_units;
++
++        if (!record->prepared_verification) {
++            continue;
++        }
++        if (slot_index >= packet->verify_prepared_count ||
++            !scores[slot_index].complete) {
++            solver_codekd_packet_destroy_score_array(
++                scores, packet->verify_prepared_count);
++            free(slots);
++            return SOLVER_CODEKD_VERIFY_WINDOW_ERROR;
++        }
++        record->prepared_score = scores[slot_index];
++        memset(&scores[slot_index], 0, sizeof(scores[slot_index]));
++        record->verification_score_ready = TRUE;
++        work_units = verify_prepared_hit_work_units(
++            record->prepared_verification);
++        solver_codekd_packet_add_verification_score_work(
++            packet, work_units);
++        slot_index++;
++    }
++    if (slot_index != packet->verify_prepared_count) {
++        solver_codekd_packet_destroy_score_array(
++            scores, packet->verify_prepared_count);
++        free(slots);
++        return SOLVER_CODEKD_VERIFY_WINDOW_ERROR;
++    }
++    packet->verification_score_batches_executed++;
++    packet->verification_score_contexts_completed +=
++        packet->verify_prepared_count;
++    solver_codekd_packet_destroy_score_array(
++        scores, packet->verify_prepared_count);
++    free(slots);
++    return SOLVER_CODEKD_VERIFY_WINDOW_SCORED;
++}
++
++/*
++ * The owner consumes only fully captured native query results and creates a
++ * bounded contiguous set of immutable, index-free score contexts. No solver
++ * or reducer state is touched. Foreign scoring is attempted only after every
++ * context in the selected prefix has been completely prepared.
+  */
+ static int solver_codekd_packet_prepare_verification_owner(
+     const solver_codekd_packet_task_input_t* input,
+     solver_codekd_search_packet_t* packet) {
+     const solver_codekd_verification_snapshot_t* snapshot;
++    size_t original_plan_end;
+     size_t candidate_index;
+     size_t verify_index;
++    solver_codekd_verification_window_status_t window_status;
+ 
+     if (!input || !packet || !packet->candidate_records ||
+         packet->state != SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER ||
+@@ -7703,9 +7930,10 @@
+         packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+         return 0;
+     }
+-    verify_index = packet->verify_plan_end;
++    original_plan_end = packet->verify_plan_end;
++    verify_index = original_plan_end;
+     for (candidate_index = packet->verify_plan_first;
+-         candidate_index < packet->verify_plan_end;
++         candidate_index < original_plan_end;
+          candidate_index++) {
+         if (packet->candidate_records[candidate_index].plan_action ==
+                 SOLVER_AB_CANDIDATE_VERIFY) {
+@@ -7713,7 +7941,7 @@
+             break;
+         }
+     }
+-    if (verify_index == packet->verify_plan_end) {
++    if (verify_index == original_plan_end) {
+         packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+         return 0;
+     }
+@@ -7722,13 +7950,20 @@
+         packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+         return 0;
