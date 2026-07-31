@@ -4,6 +4,8 @@
  */
 #include <stdio.h>
 #include <assert.h>
+#include <math.h>
+#include <stdint.h>
 
 #include "os-features.h"
 #include "bl.h"
@@ -211,6 +213,7 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
               int* testperm,
               int startorder) {
     int order;
+    sip_t original_wcs;
     sip_t* sipout;
     int* indexin;
     double* indexpix;
@@ -225,9 +228,33 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
     double* odds = NULL;
     int* refperm = NULL;
     int* verify_testperm = NULL;
+    int* output_theta = NULL;
     double qc[2];
 
+    if (newtheta) {
+        *newtheta = NULL;
+    }
+    if (newodds) {
+        *newodds = NULL;
+    }
+    if (p_logodds) {
+        *p_logodds = -LARGE_VAL;
+    }
+    if (p_besti) {
+        *p_besti = -1;
+    }
+    if (!fieldxy || Nfield <= 0 ||
+        !indexradec || Nindex <= 0 ||
+        !quadcenter || !startwcs ||
+        W <= 0 || H <= 0 ||
+        !isfinite(quadR2) || quadR2 <= 0.0 ||
+        (size_t)Nindex > SIZE_MAX / (2U * sizeof(double)) ||
+        (size_t)Nfield > SIZE_MAX / (3U * sizeof(double))) {
+        return NULL;
+    }
+
     memcpy(qc, quadcenter, 2*sizeof(double));
+    memcpy(&original_wcs, startwcs, sizeof(original_wcs));
 
     if (destwcs)
         sipout = destwcs;
@@ -240,6 +267,10 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
     weights = malloc(Nfield * sizeof(double));
     matchxyz = malloc(Nfield * 3 * sizeof(double));
     matchxy = malloc(Nfield * 2 * sizeof(double));
+    if (!sipout || !indexin || !indexpix || !fieldsigma2s ||
+        !weights || !matchxyz || !matchxy) {
+        goto tweak_failed;
+    }
 
     // FIXME --- hmmm, how do the annealing steps and iterating up to
     // higher orders interact?
@@ -278,9 +309,14 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
             // clean up from last round (we do it here so that they're
             // valid when we leave the loop)
             free(theta);
+            theta = NULL;
             free(odds);
+            odds = NULL;
             free(refperm);
+            refperm = NULL;
             free(verify_testperm);
+            verify_testperm = NULL;
+            besti = -1;
 
             // Anneal
             gamma = pow(0.9, step);
@@ -313,14 +349,9 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
             //logverb("CRPIX is (%g,%g)\n", sip.wcstan.crpix[0], sip.wcstan.crpix[1]);
 
             if (Nin == 0) {
-                sip_free(sipout);
-                free(matchxy);
-                free(matchxyz);
-                free(weights);
-                free(fieldsigma2s);
-                free(indexpix);
-                free(indexin);
-                return NULL;
+                logverb("tweak2: no reference sources remain; "
+                        "preserving input WCS\n");
+                goto tweak_failed;
             }
 
             iscale = sip_pixel_scale(sipout);
@@ -366,6 +397,14 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
                                             &besti, &odds, &theta, NULL,
                                             &verify_testperm, &refperm);
 
+            if (!theta || !odds || !verify_testperm || !refperm ||
+                besti < 0 || besti >= Nfield) {
+                logverb("tweak2: verification produced no usable "
+                        "correspondence set at order %i step %i; "
+                        "preserving input WCS\n",
+                        order, step);
+                goto tweak_failed;
+            }
             logverb("Logodds: %g\n", logodds);
             verify_count_hits(theta, besti, &nmatch, &nconf, &ndist);
             logverb("%i matches, %i distractors, %i conflicts (at best log-odds); %i field sources, %i index sources\n", nmatch, ndist, nconf, Nfield, Nin);
@@ -431,18 +470,7 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
 
             if (Nmatch < 2) {
                 logverb("No matches -- aborting tweak attempt\n");
-                free(theta);
-                free(odds);
-                free(refperm);
-                free(verify_testperm);
-                sip_free(sipout);
-                free(matchxy);
-                free(matchxyz);
-                free(weights);
-                free(fieldsigma2s);
-                free(indexpix);
-                free(indexin);
-                return NULL;
+                goto tweak_failed;
             }
 
             // Update the "quad center" to be the weighted average matched star posn.
@@ -452,6 +480,11 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
                 qc[0] += (weights[i] * matchxy[2*i+0]);
                 qc[1] += (weights[i] * matchxy[2*i+1]);
                 totalweight += weights[i];
+            }
+            if (!isfinite(totalweight) || totalweight <= 0.0) {
+                logverb("tweak2: invalid total match weight; "
+                        "preserving input WCS\n");
+                goto tweak_failed;
             }
             qc[0] /= totalweight;
             qc[1] /= totalweight;
@@ -472,9 +505,14 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
             }
 
             int doshift = 1;
-            fit_sip_wcs(matchxyz, matchxy, weights, Nmatch,
-                        &(sipout->wcstan), order, sip_invorder,
-                        doshift, sipout);
+            if (fit_sip_wcs(matchxyz, matchxy, weights, Nmatch,
+                            &(sipout->wcstan), order, sip_invorder,
+                            doshift, sipout)) {
+                logverb("tweak2: SIP fit failed at order %i step %i; "
+                        "preserving input WCS\n",
+                        order, step);
+                goto tweak_failed;
+            }
 
             debug("Got SIP:\n");
             if (log_get_level() > LOG_VERB)
@@ -498,9 +536,14 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
         double pix2;
 
         free(theta);
+        theta = NULL;
         free(odds);
+        odds = NULL;
         free(refperm);
+        refperm = NULL;
         free(verify_testperm);
+        verify_testperm = NULL;
+        besti = -1;
         gamma = 1.0;
         // Project reference sources into pixel space; keep the ones inside image bounds.
         Nin = 0;
@@ -536,6 +579,12 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
                                         logodds_bail, LARGE_VAL,
                                         &besti, &odds, &theta, NULL,
                                         &verify_testperm, &refperm);
+        if (!theta || !odds || !verify_testperm || !refperm ||
+            besti < 0 || besti >= Nfield) {
+            logverb("tweak2: final verification produced no usable "
+                    "correspondence set; preserving input WCS\n");
+            goto tweak_failed;
+        }
         logverb("Logodds: %g\n", logodds);
         verify_count_hits(theta, besti, &nmatch, &nconf, &ndist);
         logverb("%i matches, %i distractors, %i conflicts (at best log-odds); %i field sources, %i index sources\n", nmatch, ndist, nconf, Nfield, Nin);
@@ -559,24 +608,32 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
 
     if (newtheta) {
         // undo the "indexpix" inside-image-bounds cut.
-        (*newtheta) = malloc(Nfield * sizeof(int));
+        output_theta = malloc((size_t)Nfield * sizeof(int));
+        if (!output_theta) {
+            goto tweak_failed;
+        }
         for (i=0; i<Nfield; i++) {
             int nt;
             if (theta[i] < 0)
                 nt = theta[i];
             else
                 nt = indexin[refperm[theta[i]]];
-            (*newtheta)[i] = nt;
+            output_theta[i] = nt;
         }
+        *newtheta = output_theta;
+        output_theta = NULL;
     }
     free(theta);
     free(refperm);
     free(verify_testperm);
 
-    if (newodds)
+    if (newodds) {
         *newodds = odds;
-    else
+        odds = NULL;
+    } else {
         free(odds);
+        odds = NULL;
+    }
 
     logverb("Tweak2: final WCS:\n");
     if (log_get_level() >= LOG_VERB)
@@ -595,4 +652,23 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
     free(matchxy);
 
     return sipout;
+
+tweak_failed:
+    free(output_theta);
+    free(theta);
+    free(odds);
+    free(refperm);
+    free(verify_testperm);
+    free(indexin);
+    free(indexpix);
+    free(fieldsigma2s);
+    free(weights);
+    free(matchxyz);
+    free(matchxy);
+    if (destwcs) {
+        memcpy(destwcs, &original_wcs, sizeof(*destwcs));
+    } else if (sipout) {
+        sip_free(sipout);
+    }
+    return NULL;
 }

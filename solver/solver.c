@@ -252,14 +252,21 @@ void solver_tweak2(solver_t* sp, MatchObj* mo, int order, sip_t* verifysip) {
     double Q2;
     // initial WCS
     sip_t startsip;
-    int* theta;
-    double* odds;
+    int* theta = NULL;
+    double* odds = NULL;
+    sip_t* tuned_sip = NULL;
     double* refradec;
     int i;
     double newodds;
     int nm, nc, nd;
     int besti;
     int startorder;
+
+    if (!sp || !mo || !sp->fieldxy ||
+        !mo->refxyz || mo->nindex <= 0 ||
+        (size_t)mo->nindex > SIZE_MAX / (2U * sizeof(double))) {
+        return;
+    }
 
     indexjitter = mo->index_jitter; // ref cat positional error, in arcsec.
     xy = starxy_to_xy_array(sp->fieldxy, NULL);
@@ -276,7 +283,14 @@ void solver_tweak2(solver_t* sp, MatchObj* mo, int order, sip_t* verifysip) {
     }
 
     // mo->refradec may be NULL at this point, so get it from refxyz instead...
-    refradec = malloc(3 * mo->nindex * sizeof(double));
+    refradec = malloc(2 * mo->nindex * sizeof(double));
+    if (!xy || !refradec) {
+        free(refradec);
+        free(xy);
+        logverb("solver_tweak2: allocation failed; "
+                "preserving verified TAN solution\n");
+        return;
+    }
     for (i=0; i<mo->nindex; i++)
         xyzarr2radecdegarr(mo->refxyz + i*3, refradec + i*2);
 
@@ -294,12 +308,11 @@ void solver_tweak2(solver_t* sp, MatchObj* mo, int order, sip_t* verifysip) {
     logverb("solver_tweak2: setting orders %i, %i\n", sp->tweak_aborder, sp->tweak_abporder);
 
     // for TWEAK_DEBUG_PLOTs
-    theta = mo->theta;
     besti = mo->nbest-1;//mo->nmatch + mo->nconflict + mo->ndistractor;
 
     logverb("solver_tweak2: set_crpix %i, crpix (%.1f,%.1f)\n",
             sp->set_crpix, sp->crpix[0], sp->crpix[1]);
-    mo->sip = tweak2(xy, Nxy,
+    tuned_sip = tweak2(xy, Nxy,
                      sp->verify_pix, // pixel positional noise sigma
                      solver_field_width(sp),
                      solver_field_height(sp),
@@ -312,11 +325,26 @@ void solver_tweak2(solver_t* sp, MatchObj* mo, int order, sip_t* verifysip) {
                      sp->set_crpix ? sp->crpix : NULL,
                      &newodds, &besti, mo->testperm, startorder);
     free(refradec);
+    free(xy);
+    xy = NULL;
 
-    // FIXME -- update refxy?  Nobody uses it, right?
+    if (!tuned_sip || !theta || !odds ||
+        besti < 0 || besti >= Nxy || !isfinite(newodds)) {
+        sip_free(tuned_sip);
+        free(theta);
+        free(odds);
+        logverb("solver_tweak2: tune failed; "
+                "preserving verified TAN solution\n");
+        return;
+    }
+
+    // Commit the tuned result only after every output is complete.
+    if (mo->sip) {
+        sip_free(mo->sip);
+    }
+    mo->sip = tuned_sip;
     free(mo->refxy);
     mo->refxy = NULL;
-    // FIXME -- and testperm?
     free(mo->testperm);
     mo->testperm = NULL;
 
@@ -338,7 +366,6 @@ void solver_tweak2(solver_t* sp, MatchObj* mo, int order, sip_t* verifysip) {
         mo->ndistractor = nd;
         matchobj_compute_derived(mo);
     }
-    free(xy);
 }
 
 void solver_log_params(const solver_t* sp) {
