@@ -112,6 +112,7 @@ int main(int argc, char** args) {
     anbool tostderr = FALSE;
     char* infn = NULL;
     FILE* fin = NULL;
+    int exit_status = 0;
     anbool fromstdin = FALSE;
 
     bl* opts = opts_from_array(myopts, sizeof(myopts)/sizeof(an_option_t), NULL);
@@ -347,8 +348,10 @@ int main(int argc, char** args) {
             job_set_output_base_dir(job, basedir);
 	}
 
-        if (engine_run_job(engine, job))
+        if (engine_run_job(engine, job)) {
             logerr("Failed to run_job()\n");
+            exit_status = 1;
+        }
 
         job_free(job);
         gettimeofday(&tv2, NULL);
@@ -363,5 +366,5 @@ int main(int argc, char** args) {
     if (fin && !fromstdin)
         fclose(fin);
 
-    return 0;
+    return exit_status;
 }

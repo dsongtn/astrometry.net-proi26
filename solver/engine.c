@@ -20,12 +20,17 @@
 #include <getopt.h>
 #include <dirent.h>
 #include <assert.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include "math.h"
 
 #include "an-bool.h"
 #include "anqfits.h"
 #include "astrometry/index_shard.h"
+#include "astrometry/index_residency.h"
 #include "bl.h"
 #include "engine.h"
 #include "errors.h"
@@ -43,6 +48,81 @@
 #include "solver.h"
 #include "solverutils.h"
 #include "tic.h"
+#include "index_shard_config.h"
+#include "engine_internal.h"
+
+void engine_pass_cursor_init(engine_pass_cursor_t* cursor) {
+    if (!cursor) {
+        return;
+    }
+    memset(cursor, 0, sizeof(*cursor));
+}
+
+anbool engine_pass_cursor_next(const job_t* job,
+                               double default_lower,
+                               double default_upper,
+                               engine_pass_cursor_t* cursor,
+                               engine_pass_t* pass) {
+    size_t depth_count;
+    size_t scale_count;
+    int raw_start;
+    int raw_end;
+    double raw_lower;
+    double raw_upper;
+
+    if (!job || !job->depths || !job->scales || !cursor || !pass) {
+        return FALSE;
+    }
+    depth_count = (size_t)il_size(job->depths) / 2U;
+    scale_count = (size_t)dl_size(job->scales) / 2U;
+    if (!depth_count || !scale_count ||
+        cursor->next_depth_index >= depth_count) {
+        return FALSE;
+    }
+
+    memset(pass, 0, sizeof(*pass));
+    pass->ordinal = cursor->next_ordinal;
+    pass->depth_index = cursor->next_depth_index;
+    pass->scale_index = cursor->next_scale_index;
+
+    raw_start = il_get(job->depths, pass->depth_index * 2U);
+    raw_end = il_get(job->depths, pass->depth_index * 2U + 1U);
+    if (raw_start < 0 || raw_end < 0) {
+        return FALSE;
+    }
+    pass->startobj = raw_start ? raw_start - 1 : 0;
+    /*
+     * The user-facing upper bound is inclusive and one-based. Its numeric
+     * value is therefore already the zero-based exclusive bound. Zero is the
+     * native open-upper sentinel and must be written on every pass.
+     */
+    pass->endobj = raw_end;
+
+    raw_lower = dl_get(job->scales, pass->scale_index * 2U);
+    raw_upper = dl_get(job->scales, pass->scale_index * 2U + 1U);
+    pass->funits_lower =
+        raw_lower == 0.0 ? default_lower : raw_lower;
+    pass->funits_upper =
+        raw_upper == 0.0 ? default_upper : raw_upper;
+
+    cursor->next_scale_index++;
+    cursor->next_ordinal++;
+    if (cursor->next_scale_index >= scale_count) {
+        cursor->next_scale_index = 0U;
+        cursor->next_depth_index++;
+    }
+    return TRUE;
+}
+
+void engine_pass_apply(solver_t* solver, const engine_pass_t* pass) {
+    if (!solver || !pass) {
+        return;
+    }
+    solver->startobj = pass->startobj;
+    solver->endobj = pass->endobj;
+    solver->funits_lower = pass->funits_lower;
+    solver->funits_upper = pass->funits_upper;
+}
 
 void engine_add_search_path(engine_t* engine, const char* path) {
     sl_append(engine->index_paths, path);
@@ -194,7 +274,13 @@ int engine_add_index(engine_t* engine, char* path) {
     free(base);
 
     t0 = timenow();
-    ind = index_load(path, engine->inparallel ? 0 : INDEX_ONLY_LOAD_METADATA, NULL);
+    /*
+     * Ordinary registration is always metadata-only. Legacy grouped mode
+     * still loads all selected filename-owned indexes together inside
+     * onefield; it no longer needs every configured payload resident before
+     * scale and sky selection.
+     */
+    ind = index_load(path, INDEX_ONLY_LOAD_METADATA, NULL);
     debug("index_load(\"%s\") took %g ms\n", path, 1000 * (timenow() - t0));
     if (!ind) {
         ERROR("Failed to load index from path %s", path);
@@ -207,39 +293,6 @@ int engine_add_index(engine_t* engine, char* path) {
     pl_append(engine->free_indexes, ind);
     return 0;
 }
-// SECTION INDEX-SHARD: engine-lifecycle
-static void add_index_to_onefield(engine_t* engine, onefield_t* bp,
-                               int i) {
-    index_t* index;
-    index = pl_get(engine->indexes, i);
-    /*
-     * In pthread mode, workers load/close indexes through the normal onefield
-     * ownership path.  Do not share loaded index_t across workers.
-     */
-    if (index_shard_pthread_enabled()) {
-      onefield_add_index(bp, index->indexname);
-      return;
-    }
-    if (engine->inparallel) {
-        // The "indexset" feature means that we can get here without having
-        // actually loaded the index yet.
-        if (!index->codekd) {
-            char* ifn = index->indexfn;
-            char* iname = index->indexname;
-            logverb("Loading index %s\n", ifn);
-            if (!index_load(ifn, 0, index)) {
-                ERROR("Failed to load index %s\n", index->indexname);
-                return;
-            }
-            free(iname);
-            free(ifn);
-        }
-        onefield_add_loaded_index(bp, index);
-    } else {
-        onefield_add_index(bp, index->indexname);
-    }
-}
-
 int engine_parse_config_file(engine_t* engine, const char* fn) {
     FILE* fconf;
     int rtn;
@@ -308,6 +361,24 @@ int engine_parse_config_file_stream(engine_t* engine, FILE* fconf) {
             engine->maxwidth = atof(nextword);
         } else if (is_word(line, "cpulimit ", &nextword)) {
             engine->cpulimit = atof(nextword);
+        } else if (is_word(line, "p_workers ", &nextword) ||
+                   is_word(line, "index_shard_workers ", &nextword)) {
+            int available_cpus = index_shard_config_available_cpus();
+            int requested_workers;
+
+            if (index_shard_config_parse_workers(nextword,
+                                                 available_cpus,
+                                                 &requested_workers)) {
+                ERROR("Invalid p_workers value \"%s\": "
+                      "expected \"auto\" or an integer from 1 through %i",
+                      nextword,
+                      available_cpus);
+                rtn = -1;
+                goto done;
+            }
+
+            engine->index_shard_workers_config = requested_workers;
+            engine->index_shard_workers_config_set = TRUE;
         } else if (is_word(line, "depths ", &nextword)) {
             if (parse_depth_string(engine->default_depths, nextword)) {
                 rtn = -1;
@@ -465,7 +536,14 @@ static job_t* job_new() {
     }
     job->scales = dl_new(8);
     job->depths = il_new(8);
+    job->index_shard_workers_override = INDEX_SHARD_WORKERS_UNSET;
     return job;
+}
+
+static anbool engine_index_residency_eligible(
+    const index_t* index) {
+    return index && index->indexfn &&
+        !index->codekd && !index->quads && !index->starkd;
 }
 
 void job_free(job_t* job) {
@@ -483,15 +561,719 @@ static double job_imageh(job_t* job) {
     return job->bp.solver.field_maxy;
 }
 
+static int engine_index_cohort_measure(
+    const engine_t* engine,
+    size_t* cohort_bytes,
+    size_t* cohort_files) {
+    struct stat* sources;
+    size_t source_count = 0U;
+    size_t bytes = 0U;
+    int index_count;
+    int i;
+
+    if (!engine || !engine->indexes ||
+        !cohort_bytes || !cohort_files) {
+        return -1;
+    }
+    index_count = pl_size(engine->indexes);
+    sources = calloc(
+        index_count ? (size_t)index_count : 1U,
+        sizeof(*sources));
+    if (!sources) {
+        return -1;
+    }
+    for (i = 0; i < index_count; i++) {
+        const index_t* index = pl_get(engine->indexes, i);
+        struct stat source;
+        size_t j;
+        anbool duplicate = FALSE;
+
+        if (!engine_index_residency_eligible(index) ||
+            stat(index->indexfn, &source) ||
+            !S_ISREG(source.st_mode) ||
+            source.st_size < 0 ||
+            (uintmax_t)source.st_size > (uintmax_t)SIZE_MAX) {
+            free(sources);
+            return -1;
+        }
+        for (j = 0U; j < source_count; j++) {
+            if (sources[j].st_dev == source.st_dev &&
+                sources[j].st_ino == source.st_ino) {
+                duplicate = TRUE;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        if ((size_t)source.st_size > SIZE_MAX - bytes) {
+            free(sources);
+            return -1;
+        }
+        sources[source_count++] = source;
+        bytes += (size_t)source.st_size;
+    }
+    free(sources);
+    *cohort_bytes = bytes;
+    *cohort_files = source_count;
+    return 0;
+}
+
+static int engine_available_memory(size_t* available_bytes) {
+#if defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE)
+    long pages;
+    long page_size;
+
+    if (!available_bytes) {
+        return -1;
+    }
+    pages = sysconf(_SC_AVPHYS_PAGES);
+    page_size = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_size <= 0 ||
+        (uintmax_t)pages >
+            (uintmax_t)SIZE_MAX / (uintmax_t)page_size) {
+        return -1;
+    }
+    *available_bytes = (size_t)pages * (size_t)page_size;
+    return 0;
+#else
+    (void)available_bytes;
+    return -1;
+#endif
+}
+
+static int engine_read_memory_limit(
+    const char* path,
+    size_t* value) {
+    char buffer[64];
+    char* end;
+    char* token;
+    FILE* file;
+    uintmax_t parsed;
+
+    if (!path || !value) {
+        errno = EINVAL;
+        return -1;
+    }
+    file = fopen(path, "r");
+    if (!file) {
+        return -1;
+    }
+    if (!fgets(buffer, sizeof(buffer), file)) {
+        int read_error = errno;
+
+        fclose(file);
+        errno = read_error ? read_error : EIO;
+        return -1;
+    }
+    fclose(file);
+    token = buffer;
+    while (*token == ' ' || *token == '\t' ||
+           *token == '\r' || *token == '\n') {
+        token++;
+    }
+    end = token + strlen(token);
+    while (end > token &&
+           (end[-1] == ' ' || end[-1] == '\t' ||
+            end[-1] == '\r' || end[-1] == '\n')) {
+        end--;
+    }
+    *end = '\0';
+    if (!strcmp(token, "max")) {
+        return 1;
+    }
+    if (*token < '0' || *token > '9') {
+        errno = EINVAL;
+        return -1;
+    }
+    errno = 0;
+    parsed = strtoumax(token, &end, 10);
+    if (errno || end == token || *end ||
+        parsed > SIZE_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    *value = (size_t)parsed;
+    return 0;
+}
+
+#ifdef __linux__
+#define ENGINE_CGROUP_PATH_SIZE 4096U
+#define ENGINE_CGROUP_LINE_SIZE (ENGINE_CGROUP_PATH_SIZE * 4U)
+
+static anbool engine_cgroup_list_contains(
+    const char* list,
+    const char* item) {
+    size_t item_length;
+
+    if (!list || !item) {
+        return FALSE;
+    }
+    item_length = strlen(item);
+    while (*list) {
+        const char* end = strchr(list, ',');
+        size_t length = end
+            ? (size_t)(end - list) : strlen(list);
+
+        if (length == item_length &&
+            !strncmp(list, item, length)) {
+            return TRUE;
+        }
+        if (!end) {
+            break;
+        }
+        list = end + 1;
+    }
+    return FALSE;
+}
+
+static int engine_cgroup_decode_path(
+    const char* source,
+    char* destination,
+    size_t destination_size) {
+    size_t source_length;
+    size_t input = 0U;
+    size_t output = 0U;
+
+    if (!source || !destination || !destination_size) {
+        return -1;
+    }
+    source_length = strlen(source);
+    while (input < source_length) {
+        unsigned int value;
+
+        if (source[input] == '\\' &&
+            input + 3U < source_length &&
+            source[input + 1U] >= '0' &&
+            source[input + 1U] <= '7' &&
+            source[input + 2U] >= '0' &&
+            source[input + 2U] <= '7' &&
+            source[input + 3U] >= '0' &&
+            source[input + 3U] <= '7') {
+            value = (unsigned int)(source[input + 1U] - '0') * 64U +
+                (unsigned int)(source[input + 2U] - '0') * 8U +
+                (unsigned int)(source[input + 3U] - '0');
+            input += 4U;
+        } else {
+            value = (unsigned char)source[input++];
+        }
+        if (!value || output + 1U >= destination_size) {
+            return -1;
+        }
+        destination[output++] = (char)value;
+    }
+    if (!output || destination[0] != '/') {
+        return -1;
+    }
+    destination[output] = '\0';
+    return 0;
+}
+
+static int engine_cgroup_membership(
+    char* hierarchy_path,
+    size_t hierarchy_size,
+    anbool* unified) {
+    char line[ENGINE_CGROUP_PATH_SIZE + 256U];
+    char unified_path[ENGINE_CGROUP_PATH_SIZE] = {0};
+    FILE* file;
+
+    if (!hierarchy_path || !hierarchy_size || !unified) {
+        return -1;
+    }
+    hierarchy_path[0] = '\0';
+    file = fopen("/proc/self/cgroup", "r");
+    if (!file) {
+        return -1;
+    }
+    while (fgets(line, sizeof(line), file)) {
+        char* first = strchr(line, ':');
+        char* second = first ? strchr(first + 1, ':') : NULL;
+        char* newline = strchr(line, '\n');
+        char* selected = NULL;
+
+        if (!newline && !feof(file)) {
+            fclose(file);
+            return -1;
+        }
+        if (newline) {
+            *newline = '\0';
+        }
+        if (!first || !second || second[1] != '/') {
+            continue;
+        }
+        *first = '\0';
+        *second = '\0';
+        if (!first[1] && !strcmp(line, "0")) {
+            selected = unified_path;
+        } else if (engine_cgroup_list_contains(
+                       first + 1, "memory")) {
+            selected = hierarchy_path;
+        }
+        if (selected) {
+            size_t length = strlen(second + 1);
+
+            if (!length || length >= ENGINE_CGROUP_PATH_SIZE) {
+                fclose(file);
+                return -1;
+            }
+            memcpy(selected, second + 1, length + 1U);
+        }
+    }
+    fclose(file);
+    if (hierarchy_path[0]) {
+        *unified = FALSE;
+        return 1;
+    }
+    if (unified_path[0]) {
+        size_t length = strlen(unified_path);
+
+        if (length >= hierarchy_size) {
+            return -1;
+        }
+        memcpy(hierarchy_path, unified_path, length + 1U);
+        *unified = TRUE;
+        return 1;
+    }
+    return 0;
+}
+
+static anbool engine_cgroup_path_contains(
+    const char* root,
+    const char* path) {
+    size_t length;
+
+    if (!root || !path || root[0] != '/' || path[0] != '/') {
+        return FALSE;
+    }
+    if (!strcmp(root, "/")) {
+        return TRUE;
+    }
+    length = strlen(root);
+    return !strncmp(root, path, length) &&
+        (path[length] == '\0' || path[length] == '/');
+}
+
+static int engine_cgroup_mount(
+    const char* hierarchy_path,
+    anbool unified,
+    char* mount_point,
+    char* leaf_path) {
+    char line[ENGINE_CGROUP_LINE_SIZE];
+    size_t best_root_length = 0U;
+    FILE* file;
+
+    file = fopen("/proc/self/mountinfo", "r");
+    if (!file) {
+        return -1;
+    }
+    mount_point[0] = '\0';
+    leaf_path[0] = '\0';
+    while (fgets(line, sizeof(line), file)) {
+        char encoded_root[ENGINE_CGROUP_PATH_SIZE];
+        char encoded_mount[ENGINE_CGROUP_PATH_SIZE];
+        char root[ENGINE_CGROUP_PATH_SIZE];
+        char mount[ENGINE_CGROUP_PATH_SIZE];
+        char filesystem[32];
+        char super_options[ENGINE_CGROUP_PATH_SIZE];
+        char candidate[ENGINE_CGROUP_PATH_SIZE];
+        char* separator;
+        const char* relative;
+        size_t root_length;
+        int prefix_length = 0;
+        int candidate_length;
+
+        if (!strchr(line, '\n') && !feof(file)) {
+            continue;
+        }
+        if (sscanf(line, "%*s %*s %*s %4095s %4095s %n",
+                   encoded_root, encoded_mount, &prefix_length) != 2) {
+            continue;
+        }
+        separator = strstr(line + prefix_length, " - ");
+        if (!separator ||
+            sscanf(separator + 3, "%31s %*s %4095s",
+                   filesystem, super_options) != 2) {
+            continue;
+        }
+        if ((unified && strcmp(filesystem, "cgroup2")) ||
+            (!unified &&
+             (strcmp(filesystem, "cgroup") ||
+              !engine_cgroup_list_contains(
+                  super_options, "memory"))) ||
+            engine_cgroup_decode_path(
+                encoded_root, root, sizeof(root)) ||
+            engine_cgroup_decode_path(
+                encoded_mount, mount, sizeof(mount)) ||
+            strcmp(root, "/") ||
+            !engine_cgroup_path_contains(root, hierarchy_path)) {
+            continue;
+        }
+        root_length = strlen(root);
+        relative = !strcmp(root, "/")
+            ? hierarchy_path : hierarchy_path + root_length;
+        if (!relative[0] || !strcmp(relative, "/")) {
+            candidate_length = snprintf(
+                candidate, sizeof(candidate), "%s", mount);
+        } else if (!strcmp(mount, "/")) {
+            candidate_length = snprintf(
+                candidate, sizeof(candidate), "%s", relative);
+        } else {
+            candidate_length = snprintf(
+                candidate, sizeof(candidate), "%s%s", mount, relative);
+        }
+        if (candidate_length < 0 ||
+            (size_t)candidate_length >= sizeof(candidate) ||
+            root_length < best_root_length) {
+            continue;
+        }
+        memcpy(mount_point, mount, strlen(mount) + 1U);
+        memcpy(leaf_path, candidate, strlen(candidate) + 1U);
+        best_root_length = root_length;
+    }
+    fclose(file);
+    return mount_point[0] && leaf_path[0] ? 0 : -1;
+}
+
+static int engine_cgroup_apply_limits(
+    const char* mount_point,
+    const char* leaf_path,
+    anbool unified,
+    size_t* capacity_bytes,
+    size_t* available_bytes) {
+    char current[ENGINE_CGROUP_PATH_SIZE];
+    const char* limit_name = unified
+        ? "memory.max" : "memory.limit_in_bytes";
+    const char* usage_name = unified
+        ? "memory.current" : "memory.usage_in_bytes";
+    size_t mount_length = strlen(mount_point);
+    int found = 0;
+
+    if (strlen(leaf_path) >= sizeof(current) ||
+        !engine_cgroup_path_contains(mount_point, leaf_path)) {
+        return -1;
+    }
+    memcpy(current, leaf_path, strlen(leaf_path) + 1U);
+    while (1) {
+        char limit_path[ENGINE_CGROUP_PATH_SIZE];
+        char usage_path[ENGINE_CGROUP_PATH_SIZE];
+        size_t limit;
+        size_t usage;
+        int limit_status;
+        int usage_status;
+        int limit_length = snprintf(
+            limit_path, sizeof(limit_path),
+            "%s/%s", current, limit_name);
+        int usage_length = snprintf(
+            usage_path, sizeof(usage_path),
+            "%s/%s", current, usage_name);
+
+        if (limit_length <= 0 || usage_length <= 0 ||
+            (size_t)limit_length >= sizeof(limit_path) ||
+            (size_t)usage_length >= sizeof(usage_path)) {
+            return -1;
+        }
+        errno = 0;
+        limit_status =
+            engine_read_memory_limit(limit_path, &limit);
+        if (limit_status < 0) {
+            if (errno != ENOENT) {
+                return -1;
+            }
+        } else {
+            found = 1;
+            if (!limit_status) {
+                errno = 0;
+                usage_status = engine_read_memory_limit(
+                    usage_path, &usage);
+                if (usage_status) {
+                    return -1;
+                }
+                *capacity_bytes =
+                    MIN(*capacity_bytes, limit);
+                *available_bytes = MIN(*available_bytes,
+                    usage < limit ? limit - usage : 0U);
+            }
+        }
+        if (!strcmp(current, mount_point)) {
+            break;
+        }
+        {
+            char* slash = strrchr(current, '/');
+
+            if (!slash) {
+                return -1;
+            }
+            if (!strcmp(mount_point, "/") && slash == current) {
+                current[1] = '\0';
+                continue;
+            }
+            if ((size_t)(slash - current) < mount_length) {
+                return -1;
+            }
+            *slash = '\0';
+        }
+    }
+    return found ? 1 : -1;
+}
+#endif
+
+static int engine_limit_memory_by_cgroup(
+    size_t* capacity_bytes,
+    size_t* available_bytes) {
+    if (!capacity_bytes || !available_bytes) {
+        return -1;
+    }
+#ifdef __linux__
+    {
+        char hierarchy_path[ENGINE_CGROUP_PATH_SIZE];
+        char mount_point[ENGINE_CGROUP_PATH_SIZE];
+        char leaf_path[ENGINE_CGROUP_PATH_SIZE];
+        anbool unified;
+        int status;
+
+        status = engine_cgroup_membership(
+            hierarchy_path,
+            sizeof(hierarchy_path),
+            &unified);
+        if (status <= 0) {
+            return status;
+        }
+        if (engine_cgroup_mount(
+                hierarchy_path,
+                unified,
+                mount_point,
+                leaf_path)) {
+            return -1;
+        }
+        status = engine_cgroup_apply_limits(
+            mount_point,
+            leaf_path,
+            unified,
+            capacity_bytes,
+            available_bytes);
+        return status < 0 ? -1 : 0;
+    }
+#else
+    return 0;
+#endif
+}
+
+static void engine_limit_memory_by_address_space(
+    size_t page_size,
+    size_t* capacity_bytes,
+    size_t* available_bytes) {
+    struct rlimit address_limit;
+    uintmax_t pages = 0U;
+    size_t current_bytes = 0U;
+    size_t limit_bytes;
+    FILE* file;
+
+    if (!page_size || !capacity_bytes || !available_bytes ||
+        getrlimit(RLIMIT_AS, &address_limit) ||
+        address_limit.rlim_cur == RLIM_INFINITY ||
+        (uintmax_t)address_limit.rlim_cur > SIZE_MAX) {
+        return;
+    }
+    limit_bytes = (size_t)address_limit.rlim_cur;
+    file = fopen("/proc/self/statm", "r");
+    if (file) {
+        if (fscanf(file, "%ju", &pages) == 1 &&
+            pages <= SIZE_MAX / page_size) {
+            current_bytes = (size_t)pages * page_size;
+        }
+        fclose(file);
+    }
+    *capacity_bytes = MIN(*capacity_bytes, limit_bytes);
+    *available_bytes = MIN(
+        *available_bytes,
+        current_bytes < limit_bytes
+            ? limit_bytes - current_bytes : 0U);
+}
+
+static anbool engine_job_local_residency_enabled(void) {
+    return FALSE;
+}
+
+static index_residency_t* engine_index_residency_begin(
+    engine_t* engine,
+    const onefield_t* bp) {
+    index_residency_t* service = NULL;
+    index_residency_stats_t residency_stats;
+    size_t cohort_bytes;
+    size_t cohort_files;
+    size_t available_bytes;
+    size_t physical_bytes;
+    size_t physical_headroom;
+    size_t physical_full_limit;
+    size_t available_headroom;
+    size_t available_full_limit;
+    size_t worker_headroom;
+    unsigned int lanes;
+    long physical_pages;
+    long page_size;
+    int i;
+
+    if (!engine || !bp || bp->index_shard_workers <= 1) {
+        return NULL;
+    }
+
+    /*
+     * The current service copies the complete cohort inside the solve wall
+     * clock, blocks without solver-limit polling, and marks reclaimable memfd
+     * pages as permanently resident. Keep exact demand delivery authoritative
+     * until residency has a persistent pre-job lifecycle and recoverable page
+     * state.
+     */
+    if (!engine_job_local_residency_enabled()) {
+        logverb("[index-residency] mode=exact-demand "
+                "reason=job-local-residency-quarantined\n");
+        return NULL;
+    }
+
+    if (engine_index_cohort_measure(
+            engine, &cohort_bytes, &cohort_files) ||
+        !cohort_files || !cohort_bytes ||
+        engine_available_memory(&available_bytes)) {
+        return NULL;
+    }
+#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+    physical_pages = sysconf(_SC_PHYS_PAGES);
+    page_size = sysconf(_SC_PAGESIZE);
+    if (physical_pages <= 0 || page_size <= 0 ||
+        (uintmax_t)physical_pages >
+            (uintmax_t)SIZE_MAX / (uintmax_t)page_size) {
+        return NULL;
+    }
+    physical_bytes =
+        (size_t)physical_pages * (size_t)page_size;
+#else
+    (void)physical_pages;
+    (void)page_size;
+    return NULL;
+#endif
+
+    /*
+     * Whole-file residency is useful only when every eligible source can
+     * remain resident for the job. Partial whole-file LRU would copy and
+     * discard broad data for sparse queries, recreating I/O amplification.
+     * Capacity, current availability, cgroups and address-space limits are
+     * all advisory admission guards; refusal keeps exact delivery unchanged.
+     */
+    if (engine_limit_memory_by_cgroup(
+            &physical_bytes, &available_bytes)) {
+        logverb("[index-residency] mode=exact-demand "
+                "reason=cgroup-admission-unavailable\n");
+        return NULL;
+    }
+    engine_limit_memory_by_address_space(
+        (size_t)page_size,
+        &physical_bytes,
+        &available_bytes);
+    physical_headroom = physical_bytes / 4U;
+    physical_full_limit = physical_bytes - physical_headroom;
+    worker_headroom = 512U * 1024U * 1024U;
+    if ((size_t)bp->index_shard_workers <=
+        (SIZE_MAX - worker_headroom) /
+            (128U * 1024U * 1024U)) {
+        worker_headroom +=
+            (size_t)bp->index_shard_workers *
+            (128U * 1024U * 1024U);
+    }
+    available_headroom = MAX(
+        available_bytes / 5U,
+        worker_headroom);
+    available_full_limit =
+        available_headroom < available_bytes
+            ? available_bytes - available_headroom : 0U;
+    if (cohort_bytes > physical_full_limit ||
+        cohort_bytes > available_full_limit) {
+        logverb(
+            "[index-residency] mode=exact-demand "
+            "reason=cohort-does-not-fit files=%zu "
+            "cohort_bytes=%zu capacity_bytes=%zu "
+            "available_bytes=%zu\n",
+            cohort_files,
+            cohort_bytes,
+            physical_bytes,
+            available_bytes);
+        return NULL;
+    }
+
+    lanes = bp->index_shard_workers >= 4 ? 2U : 1U;
+    if (index_residency_start(
+            cohort_bytes, lanes, &service)) {
+        return NULL;
+    }
+    for (i = 0; i < pl_size(engine->indexes); i++) {
+        const index_t* index = pl_get(engine->indexes, i);
+        index_residency_result_t prepare_status;
+
+        if (!engine_index_residency_eligible(index)) {
+            continue;
+        }
+        prepare_status = index_residency_prepare(
+            service,
+            index->indexfn,
+            INDEX_RESIDENCY_PRIORITY_LOOKAHEAD);
+        if (prepare_status != INDEX_RESIDENCY_ACCEPTED) {
+            (void)index_residency_stop(service);
+            logverb(
+                "[index-residency] mode=exact-demand "
+                "reason=prepare-fallback\n");
+            return NULL;
+        }
+    }
+    if (index_residency_drain(service) ||
+        index_residency_get_stats(
+            service, &residency_stats) ||
+        residency_stats.ready_entries != cohort_files ||
+        residency_stats.ready_bytes != cohort_bytes ||
+        residency_stats.resident_bytes != cohort_bytes ||
+        residency_stats.loading_entries ||
+        residency_stats.loading_bytes ||
+        residency_stats.failed_entries) {
+        (void)index_residency_stop(service);
+        logverb(
+            "[index-residency] mode=exact-demand "
+            "reason=full-cohort-not-ready\n");
+        return NULL;
+    }
+    if (index_bind_residency_service(service)) {
+        (void)index_residency_stop(service);
+        logverb(
+            "[index-residency] mode=exact-demand "
+            "reason=concurrent-binding\n");
+        return NULL;
+    }
+    logverb(
+        "[index-residency] mode=full-cohort files=%zu "
+        "cohort_bytes=%zu budget_bytes=%zu capacity_bytes=%zu "
+        "available_bytes=%zu lanes=%u\n",
+        cohort_files,
+        cohort_bytes,
+        cohort_bytes,
+        physical_bytes,
+        available_bytes,
+        lanes);
+    return service;
+}
+
 int engine_run_job(engine_t* engine, job_t* job) {
     onefield_t* bp = &(job->bp);
     solver_t* sp = &(bp->solver);
 
-    int i;
+    int rtn = 0;
     double app_min_default;
     double app_max_default;
-    anbool solved = FALSE;
+    double engine_wall_start = monotonic_seconds();
+    double pool_start_seconds = 0.0;
+    double pool_stop_seconds = 0.0;
     anbool index_shard_pool_started = FALSE;
+    anbool legacy_grouped =
+        engine->inparallel && !job->index_shard_workers_controlled;
+    index_residency_t* residency = NULL;
+    engine_pass_cursor_t pass_cursor;
+    engine_pass_t pass;
 
     if (onefield_is_run_obsolete(bp, sp)) {
         goto finish;
@@ -499,21 +1281,10 @@ int engine_run_job(engine_t* engine, job_t* job) {
     // SECTION INDEX-SHARD: engine-lifecycle
     bp->time_total_start = monotonic_seconds();
     bp->cpu_total_start = get_cpu_usage();
-
-    if (index_shard_pthread_enabled()) {
-      if (index_shard_pool_start(bp, sp)) {
-        ERROR("Failed to start index-shard pthread pool");
-        return -1;
-      }
-
-      index_shard_pool_started = TRUE;
-    }
+    bp->indexes_inparallel = legacy_grouped;
 
     app_min_default = deg2arcsec(engine->minwidth) / job_imagew(job);
     app_max_default = deg2arcsec(engine->maxwidth) / job_imagew(job);
-
-    if (engine->inparallel && !index_shard_pthread_enabled())
-      bp->indexes_inparallel = TRUE;
 
     if (job->use_radec_center) {
         logmsg("Only searching for solutions within %g degrees of RA,Dec (%g,%g)\n",
@@ -521,41 +1292,70 @@ int engine_run_job(engine_t* engine, job_t* job) {
         solver_set_radec(sp, job->ra_center, job->dec_center, job->search_radius);
     }
 
-    for (i=0; i<il_size(job->depths)/2; i++) {
-        int startobj = il_get(job->depths, i*2);
-        int endobj = il_get(job->depths, i*2+1);
-        int j;
+    if (onefield_job_field_cache_begin(bp)) {
+        ERROR("Failed to initialize job field cache");
+        rtn = -1;
+        goto finish;
+    }
 
-        if (startobj || endobj) {
-            // make depth ranges be inclusive.
-            endobj++;
-            // up to this point they are 1-indexed, but with default value
-            // zero; onefield uses 0-indexed.
-            if (startobj)
-                startobj--;
-            if (endobj)
-                endobj--;
+    residency = engine_index_residency_begin(engine, bp);
+
+    if (index_shard_pthread_enabled(bp) && !legacy_grouped) {
+        double pool_wall_start = monotonic_seconds();
+
+        if (index_shard_pool_start(bp, sp)) {
+            ERROR("Failed to start parallel solver pool");
+            rtn = -1;
+            goto finish;
         }
 
-        for (j=0; j<dl_size(job->scales) / 2; j++) {
+        pool_start_seconds =
+            monotonic_seconds() - pool_wall_start;
+        index_shard_pool_started = TRUE;
+    }
+
+    engine_pass_cursor_init(&pass_cursor);
+    while (engine_pass_cursor_next(
+               job,
+               app_min_default,
+               app_max_default,
+               &pass_cursor,
+               &pass)) {
             double fmin, fmax;
             double app_max, app_min;
             int k;
             il* indexlist;
+            il* selectedlist;
+            anbool selected_loaded_index = FALSE;
+            anbool pass_limit_reached = FALSE;
+
+            /*
+             * Index selection and materialization can be expensive and fault
+             * mapped metadata.  A job budget is terminal across the whole
+             * pass sequence; never start another pass after it expires.
+             */
+            if (onefield_check_total_limits(bp)) {
+                break;
+            }
 
             // arcsec per pixel range
-            app_min = dl_get(job->scales, j * 2);
-            app_max = dl_get(job->scales, j * 2 + 1);
-            if (app_min == 0.0)
-                app_min = app_min_default;
-            if (app_max == 0.0)
-                app_max = app_max_default;
-            sp->funits_lower = app_min;
-            sp->funits_upper = app_max;
-
-            sp->startobj = startobj;
-            if (endobj)
-                sp->endobj = endobj;
+            app_min = pass.funits_lower;
+            app_max = pass.funits_upper;
+            engine_pass_apply(sp, &pass);
+            bp->engine_pass_ordinal = pass.ordinal;
+            bp->engine_depth_index = pass.depth_index;
+            bp->engine_scale_index = pass.scale_index;
+            logverb("[engine-pass] state=begin ordinal=%zu "
+                    "depth_index=%zu scale_index=%zu "
+                    "startobj=%i endobj=%i "
+                    "funits_lower=%.17g funits_upper=%.17g\n",
+                    pass.ordinal,
+                    pass.depth_index,
+                    pass.scale_index,
+                    pass.startobj,
+                    pass.endobj,
+                    pass.funits_lower,
+                    pass.funits_upper);
 
             // minimum quad size to try (in pixels)
             sp->quadsize_min = bp->quad_size_fraction_lo *
@@ -590,41 +1390,111 @@ int engine_run_job(engine_t* engine, job_t* job) {
                 il_append_list(indexlist, list);
             }
 
+            selectedlist = il_new(il_size(indexlist));
             for (k=0; k<il_size(indexlist); k++) {
                 int ii = il_get(indexlist, k);
                 index_t* index = pl_get(engine->indexes, ii);
                 anbool inrange = TRUE;
-                if (job->use_radec_center)
+                if (job->use_radec_center) {
                     inrange = index_is_within_range(index, job->ra_center, job->dec_center, job->search_radius);
+                }
                 if (!inrange) {
                     logverb("Not using index %s because it's not within %g degrees of (RA,Dec) = (%g,%g)\n",
                             index->indexname, job->search_radius, job->ra_center, job->dec_center);
                     continue;
                 }
-                add_index_to_onefield(engine, bp, ii);
+                il_append(selectedlist, ii);
+                if (index->starkd && index->quads && index->codekd) {
+                    selected_loaded_index = TRUE;
+                }
             }
 
             il_free(indexlist);
+            if (onefield_check_total_limits(bp)) {
+                il_free(selectedlist);
+                logverb("[engine-pass] state=end ordinal=%zu "
+                        "reason=limit-before-materialization\n",
+                        pass.ordinal);
+                break;
+            }
+            /*
+             * onefield keeps filename and loaded handles in separate lists.
+             * If a pass contains a borrowed multiindex component, materialize
+             * every ordinary member into the loaded list so their original
+             * interleaved order is preserved exactly.
+             */
+            for (k = 0; k < il_size(selectedlist); k++) {
+                int ii = il_get(selectedlist, k);
+                index_t* index = pl_get(engine->indexes, ii);
+
+                if (!selected_loaded_index) {
+                    onefield_add_index(bp, index->indexfn);
+                } else if (index->starkd &&
+                           index->quads &&
+                           index->codekd) {
+                    onefield_add_loaded_index(bp, index);
+                } else {
+                    index_t* owned_index =
+                        index_load(index->indexfn, 0, NULL);
+
+                    if (!owned_index) {
+                        ERROR("Failed to load selected index %s",
+                              index->indexfn);
+                        il_free(selectedlist);
+                        rtn = -1;
+                        goto finish;
+                    }
+                    onefield_add_owned_index(bp, owned_index);
+                }
+
+                if (onefield_check_total_limits(bp)) {
+                    pass_limit_reached = TRUE;
+                    break;
+                }
+            }
+            il_free(selectedlist);
+            if (pass_limit_reached) {
+                onefield_clear_indexes(bp);
+                solver_clear_indexes(sp);
+                logverb("[engine-pass] state=end ordinal=%zu "
+                        "reason=limit-during-materialization\n",
+                        pass.ordinal);
+                break;
+            }
 
             logverb("Running solver:\n");
             onefield_log_run_parameters(bp);
 
             onefield_run(bp);
 
+            if (bp->solver_failed) {
+                rtn = -1;
+                goto finish;
+            }
+
             // we only want to try using the verify_wcses the first time.
             onefield_clear_verify_wcses(bp);
             onefield_clear_indexes(bp);
             onefield_clear_solutions(bp);
-            onefield_clear_indexes(bp);
             solver_clear_indexes(sp);
 
-            if (onefield_is_run_obsolete(bp, sp)) {
-                solved = TRUE;
+            logverb("[engine-pass] state=end ordinal=%zu "
+                    "solved=%i cancelled=%i "
+                    "hit_total_cpu_limit=%i "
+                    "hit_total_wall_limit=%i failed=%i\n",
+                    pass.ordinal,
+                    bp->single_field_solved ? 1 : 0,
+                    bp->cancelled ? 1 : 0,
+                    bp->hit_total_cpulimit ? 1 : 0,
+                    bp->hit_total_timelimit ? 1 : 0,
+                    bp->solver_failed ? 1 : 0);
+
+            if (onefield_check_total_limits(bp)) {
                 break;
             }
-        }
-        if (solved)
-            break;
+            if (onefield_is_run_obsolete(bp, sp)) {
+                break;
+            }
     }
 
     logverb("cx<=dx constraints: %i\n", sp->num_cxdx_skipped);
@@ -634,11 +1504,59 @@ int engine_run_job(engine_t* engine, job_t* job) {
 
  finish:
    // SECTION INDEX-SHARD: engine-lifecycle
-   if (index_shard_pool_started)
+   if (index_shard_pool_started) {
+     double pool_wall_start = monotonic_seconds();
+
      index_shard_pool_stop(bp);
+     pool_stop_seconds =
+         monotonic_seconds() - pool_wall_start;
+   }
+   if (residency) {
+     (void)index_residency_quiesce(residency);
+   }
+   onefield_job_field_cache_end(bp);
+   if (residency) {
+     index_unbind_residency_service(residency);
+   }
+
+   logverb("[engine-profile] pool_start=%.6f pool_stop=%.6f "
+           "engine_total=%.6f solver_failed=%i\n",
+           pool_start_seconds,
+           pool_stop_seconds,
+           monotonic_seconds() - engine_wall_start,
+           bp->solver_failed ? 1 : 0);
+
    solver_cleanup(sp);
    onefield_cleanup(bp);
-   return 0;
+   if (residency) {
+     index_residency_stats_t stats;
+
+     if (!index_residency_get_stats(residency, &stats)) {
+       logverb(
+           "[index-residency] copied_files=%llu copied_bytes=%llu "
+           "hits=%llu deduplicated=%llu waits=%llu wait_ms=%.3f "
+           "source_leases=%llu source_requeues=%llu "
+           "cancellations=%llu "
+           "peak_bytes=%zu ready_bytes=%zu live_handles=%zu "
+           "failures=%llu source_changes=%llu\n",
+           (unsigned long long)stats.files_copied,
+           (unsigned long long)stats.bytes_copied,
+           (unsigned long long)stats.cache_hits,
+           (unsigned long long)stats.loading_deduplications,
+           (unsigned long long)stats.wait_count,
+           (double)stats.wait_nanoseconds / 1000000.0,
+           (unsigned long long)stats.source_leases,
+           (unsigned long long)stats.source_requeues,
+           (unsigned long long)stats.cancelled_entries,
+           stats.peak_resident_bytes,
+           stats.ready_bytes,
+           stats.live_handles,
+           (unsigned long long)stats.copy_failures,
+           (unsigned long long)stats.source_changes);
+     }
+     (void)index_residency_stop(residency);
+   }
+   return rtn;
 }
 
 static void parse_sip_coeffs(const qfits_header* hdr, const char* prefix, sip_t* wcs) {
@@ -752,6 +1670,18 @@ static anbool parse_job_from_qfits_header(const qfits_header* hdr, job_t* job) {
 
     bp->timelimit = qfits_header_getdouble(hdr, "ANTLIM", 0.0);
     bp->cpulimit = qfits_header_getdouble(hdr, "ANCLIM", 0.0);
+    if (qfits_header_getstr(hdr, "ANSHWRK")) {
+        int requested_workers =
+            qfits_header_getint(hdr, "ANSHWRK", INT_MIN);
+
+        if (requested_workers == INT_MIN) {
+            logerr("Invalid ANSHWRK worker value in augmented job header.\n");
+            goto bailout;
+        }
+
+        job->index_shard_workers_override = requested_workers;
+        job->index_shard_workers_override_set = TRUE;
+    }
     bp->logratio_tosolve = log(qfits_header_getdouble(hdr, "ANODDSSL", default_odds_tosolve));
     logverb("Set odds ratio to solve to %g (log = %g)\n", exp(bp->logratio_tosolve), bp->logratio_tosolve);
 
@@ -1011,6 +1941,7 @@ engine_t* engine_new() {
     engine->minwidth = 0.1;
     engine->maxwidth = 180.0;
     engine->cpulimit = 600.0;
+    engine->index_shard_workers_config = INDEX_SHARD_WORKERS_AUTO;
     return engine;
 }
 
@@ -1044,6 +1975,94 @@ void engine_free(engine_t* engine) {
     free(engine);
 }
 
+static int engine_resolve_index_shard_workers(engine_t *engine,
+                                              job_t *job) {
+    const char *environment_value;
+    const char *source;
+    int available_cpus;
+    int requested_workers;
+    int resolved_workers;
+    char requested_text[32];
+
+    if (!engine || !job) {
+        ERROR("Cannot resolve parallel workers without engine and job state");
+        return -1;
+    }
+
+    available_cpus = index_shard_config_available_cpus();
+    requested_workers = engine->index_shard_workers_config;
+    source = engine->index_shard_workers_config_set
+        ? "config"
+        : "built-in";
+
+    if (job->index_shard_workers_override_set) {
+        requested_workers = job->index_shard_workers_override;
+        if (index_shard_config_validate_workers(requested_workers,
+                                                available_cpus)) {
+            ERROR("Invalid ANSHWRK worker override %i: "
+                  "expected automatic selection or an integer from "
+                  "1 through %i",
+                  requested_workers,
+                  available_cpus);
+            return -1;
+        }
+        source = "solve-field";
+    } else {
+        /*
+         * Retain the legacy environment override for existing measurement
+         * harnesses. New production commands should use the per-job
+         * solve-field option, whose AXY header has higher precedence.
+         */
+        environment_value = getenv("ASTROMETRY_P_WORKERS");
+        if (!environment_value || !environment_value[0]) {
+            environment_value = getenv("ASTROMETRY_INDEX_SHARD_WORKERS");
+        }
+        if (environment_value && environment_value[0]) {
+            if (index_shard_config_parse_workers(environment_value,
+                                                 available_cpus,
+                                                 &requested_workers)) {
+                ERROR("Invalid parallel worker environment value \"%s\": "
+                      "expected \"auto\" or an integer from 1 through %i",
+                      environment_value,
+                      available_cpus);
+                return -1;
+            }
+            source = "environment";
+        }
+    }
+
+    resolved_workers =
+        index_shard_config_resolve_workers(requested_workers,
+                                           available_cpus);
+    if (resolved_workers < 1) {
+        ERROR("Failed to resolve parallel worker count");
+        return -1;
+    }
+
+    job->bp.index_shard_workers = resolved_workers;
+    job->index_shard_workers_controlled =
+        strcmp(source, "built-in") != 0;
+
+    if (requested_workers == INDEX_SHARD_WORKERS_AUTO) {
+        snprintf(requested_text, sizeof(requested_text), "auto");
+    } else {
+        snprintf(requested_text,
+                 sizeof(requested_text),
+                 "%i",
+                 requested_workers);
+    }
+
+    logverb("[parallel] worker-config source=%s requested=%s "
+            "available=%i effective=%i mode=%s\n",
+            source,
+            requested_text,
+            available_cpus,
+            resolved_workers,
+            resolved_workers > 1 ? "pthread" : "serial");
+
+    return 0;
+}
+
 job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
     qfits_header* hdr;
     job_t* job;
@@ -1064,6 +2083,13 @@ job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
     qfits_header_destroy(hdr);
 
     bp = &(job->bp);
+
+    if (engine_resolve_index_shard_workers(engine, job)) {
+        solver_cleanup(&bp->solver);
+        onefield_cleanup(bp);
+        job_free(job);
+        return NULL;
+    }
 
     onefield_set_field_file(bp, jobfn);
 
@@ -1125,7 +2151,7 @@ job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
                 job_cpulimit, cfg_cpulimit);
       }
 
-      if (index_shard_pthread_enabled()) {
+      if (index_shard_pthread_enabled(bp)) {
         /*
          * pthread path:
          * total_cpulimit is the process-wide budget checked by
@@ -1139,31 +2165,30 @@ job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
          * keep bp->cpulimit as the ordinary effective run limit.
          */
         bp->cpulimit = effective_cpulimit;
-
-        /*
-         * Preserve the original total-limit behavior outside the old
-         * indexes-inparallel engine path.
-         */
-        if (!engine->inparallel)
-          bp->total_cpulimit = effective_cpulimit;
+        bp->total_cpulimit = effective_cpulimit;
       }
 
       bp->total_timelimit = bp->timelimit;
     }
 
-    logmsg("[index-shard] engine limits after setup: "
-           "cpulimit=%f total_cpulimit=%f timelimit=%g total_timelimit=%g\n",
-           bp->cpulimit, bp->total_cpulimit, bp->timelimit,
-           bp->total_timelimit);
+    logverb("[index-shard] engine limits after setup: "
+            "cpulimit=%f total_cpulimit=%f timelimit=%g total_timelimit=%g\n",
+            bp->cpulimit, bp->total_cpulimit, bp->timelimit,
+            bp->total_timelimit);
 
     // If the job didn't specify depths, set defaults.
     if (il_size(job->depths) == 0) {
-        if (engine->inparallel) {
-            // no limit.
-            il_append(job->depths, 0);
-            il_append(job->depths, 0);
-        } else
+        if (il_size(engine->default_depths) != 0) {
             il_append_list(job->depths, engine->default_depths);
+        } else {
+            /*
+             * An empty site default means the original unbounded depth
+             * interval. Keep this scientific search space independent of
+             * worker count and of the legacy "inparallel" token.
+             */
+            il_append(job->depths, 0);
+            il_append(job->depths, 0);
+        }
     }
 
     if (engine->cancelfn)
@@ -1246,4 +2271,3 @@ int job_set_output_base_dir(job_t* job, const char* dir) {
     }
     return 0;
 }
-

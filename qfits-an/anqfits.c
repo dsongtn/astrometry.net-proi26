@@ -709,22 +709,25 @@ static int parse_header_block(const char* buf, qfits_header* hdr, int* found_it)
     char line_buf[FITS_LINESZ+1];
     // Browse through current block
     int i;
-    const char* line = buf;
     for (i=0; i<FITS_NCARDS; i++) {
+        const char* card = buf + ((size_t)i * FITS_LINESZ);
         char *key, *val, *comment;
-        debug("Looking at line %i:\n  %.80s\n", i, line);
+
+        memcpy(line_buf, card, FITS_LINESZ);
+        line_buf[FITS_LINESZ] = '\0';
+
+        debug("Looking at line %i:\n  %.80s\n", i, line_buf);
         // Skip blank lines.
-        if (!strcmp(line, blankline))
+        if (!memcmp(line_buf, blankline, FITS_LINESZ)) {
             continue;
-        key = qfits_getkey_r(line, getkey_buf);
+        }
+        key = qfits_getkey_r(line_buf, getkey_buf);
         if (!key) {
-            fprintf(stderr, "Skipping un-parseable header line: \"%.80s\"\n", line);
+            fprintf(stderr, "Skipping un-parseable header line: \"%.80s\"\n", line_buf);
         } else {
-	    val = qfits_getvalue_r(line, getval_buf);
-	    comment = qfits_getcomment_r(line, getcom_buf);
+	    val = qfits_getvalue_r(line_buf, getval_buf);
+	    comment = qfits_getcomment_r(line_buf, getcom_buf);
 	    debug("Got key/value/comment \"%s\" / \"%s\" / \"%s\"\n", key, val, comment);
-	    memcpy(line_buf, line, FITS_LINESZ);
-	    line_buf[FITS_LINESZ] = '\0';
 	    qfits_header_append(hdr, key, val, comment, line_buf);
 	    if (!strcmp(key, "END")) {
 		debug("Found END!\n");
@@ -732,7 +735,6 @@ static int parse_header_block(const char* buf, qfits_header* hdr, int* found_it)
 		break;
 	    }
 	}
-        line += 80;
     }
     return 0;
 }

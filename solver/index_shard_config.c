@@ -1,119 +1,129 @@
 #include <errno.h>
 #include <limits.h>
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#include "astrometry/log.h"
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 #include "index_shard_config.h"
 
-static pthread_once_t index_shard_config_once = PTHREAD_ONCE_INIT;
-static index_shard_config_t index_shard_process_config;
+int index_shard_config_available_cpus(void) {
+  long online_cpus = -1;
 
-static long index_shard_config_default_workers(void) {
-  long workers;
+#ifdef __linux__
+  {
+    cpu_set_t affinity;
 
-#ifdef _SC_NPROCESSORS_ONLN
-  workers = sysconf(_SC_NPROCESSORS_ONLN);
-#else
-  workers = 2;
-#endif
+    CPU_ZERO(&affinity);
+    if (sched_getaffinity(0, sizeof(affinity), &affinity) == 0) {
+      int affinity_cpus = CPU_COUNT(&affinity);
 
-  if (workers <= 0) {
-    workers = 2;
-  }
-
-  if (workers > INT_MAX) {
-    workers = INT_MAX;
-  }
-
-  return workers;
-}
-
-static void index_shard_config_initialize(void) {
-  const char *worker_value;
-  long workers = 0;
-
-  memset(&index_shard_process_config,
-         0,
-         sizeof(index_shard_process_config));
-
-  /*
-   * Production UX exposes exactly one control: the total worker budget.
-   * Every algorithmic policy below is resolved internally and is therefore
-   * identical across command lines, scripts and benchmark environments.
-   */
-  worker_value = getenv("ASTROMETRY_INDEX_SHARD_WORKERS");
-
-  if (worker_value && worker_value[0]) {
-    char *end = NULL;
-
-    errno = 0;
-    workers = strtol(worker_value, &end, 10);
-
-    if (errno ||
-        end == worker_value ||
-        *end != '\0' ||
-        workers <= 0) {
-      logmsg("[index-shard] invalid "
-             "ASTROMETRY_INDEX_SHARD_WORKERS=%s; using automatic default\n",
-             worker_value);
-      workers = 0;
+      if (affinity_cpus > 0) {
+        return affinity_cpus;
+      }
     }
   }
+#endif
 
-  if (workers <= 0) {
-    workers = index_shard_config_default_workers();
+#ifdef _SC_NPROCESSORS_ONLN
+  online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+
+  if (online_cpus < 1) {
+    return 1;
   }
 
-  if (workers > INT_MAX) {
-    workers = INT_MAX;
+  if (online_cpus > INT_MAX) {
+    return INT_MAX;
   }
 
-  index_shard_process_config.worker_count = (int)workers;
+  return (int)online_cpus;
+}
 
-  /* One worker uses the original serial execution path automatically. */
-  index_shard_process_config.pthread_enabled = workers > 1;
+int index_shard_config_validate_workers(int requested_workers,
+                                        int available_cpus) {
+  if (available_cpus < 1) {
+    return -1;
+  }
 
-  /* Preserve the currently validated production policies. */
-  index_shard_process_config.discovery_frontier_enabled = FALSE;
-  index_shard_process_config.hypothesis_parallel_enabled = TRUE;
-  index_shard_process_config.inner_lending_enabled = TRUE;
+  if (requested_workers == INDEX_SHARD_WORKERS_AUTO) {
+    return 0;
+  }
+
+  if (requested_workers < 1 || requested_workers > available_cpus) {
+    return -1;
+  }
+
+  return 0;
+}
+
+int index_shard_config_parse_workers(const char *value,
+                                     int available_cpus,
+                                     int *requested_workers) {
+  char *end = NULL;
+  long parsed;
+
+  if (!value || !requested_workers || available_cpus < 1) {
+    return -1;
+  }
+
+  if (!strcmp(value, "auto")) {
+    *requested_workers = INDEX_SHARD_WORKERS_AUTO;
+    return 0;
+  }
 
   /*
-   * One-shot CodeKD callers retain the scalar run-to-completion fast path.
-   * The continuation API remains internally available with a zero budget.
+   * Reject signs, leading zeroes, whitespace, and partially parsed values.
+   * This keeps 0 and every negative spelling unambiguously invalid.
    */
-  index_shard_process_config.kd_continuation_enabled = TRUE;
-  index_shard_process_config.kd_continuation_node_budget = 0;
-
-  /* Product sampling remains disabled in the production policy. */
-  index_shard_process_config.kd_product_interval = 0;
-}
-
-const index_shard_config_t *index_shard_config_get(void) {
-  pthread_once(&index_shard_config_once,
-               index_shard_config_initialize);
-
-  return &index_shard_process_config;
-}
-
-int index_shard_config_effective_workers(size_t nindexes) {
-  const index_shard_config_t *config;
-  int workers;
-
-  config = index_shard_config_get();
-  workers = config->worker_count;
-
-  if (nindexes && (size_t)workers > nindexes) {
-    workers = (int)nindexes;
+  if (value[0] < '1' || value[0] > '9') {
+    return -1;
   }
+
+  errno = 0;
+  parsed = strtol(value, &end, 10);
+
+  if (errno == ERANGE ||
+      end == value ||
+      *end != '\0' ||
+      parsed > INT_MAX) {
+    return -1;
+  }
+
+  if (index_shard_config_validate_workers((int)parsed, available_cpus)) {
+    return -1;
+  }
+
+  *requested_workers = (int)parsed;
+  return 0;
+}
+
+int index_shard_config_resolve_workers(int requested_workers,
+                                       int available_cpus) {
+  if (index_shard_config_validate_workers(requested_workers,
+                                          available_cpus)) {
+    return -1;
+  }
+
+  if (requested_workers == INDEX_SHARD_WORKERS_AUTO) {
+    return available_cpus;
+  }
+
+  return requested_workers;
+}
+
+int index_shard_config_effective_workers(int configured_workers,
+                                         size_t nindexes) {
+  int workers = configured_workers;
 
   if (workers < 1) {
     workers = 1;
   }
+
+  (void)nindexes;
 
   return workers;
 }

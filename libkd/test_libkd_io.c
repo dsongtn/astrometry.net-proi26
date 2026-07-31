@@ -207,6 +207,122 @@ void test_read_write_single_tree_named(CuTest* ct) {
     kdtree_free(kd);
 }
 
+static anbool test_chunk_name_is(
+    const char* tablename,
+    const char* component) {
+    size_t component_length;
+
+    if (!tablename || !component) {
+        return FALSE;
+    }
+
+    component_length = strlen(component);
+    return !strncmp(tablename, component, component_length) &&
+        (tablename[component_length] == '\0' ||
+         tablename[component_length] == '_');
+}
+
+void test_production_mmap_component_classification(CuTest* ct) {
+    kdtree_t* kd;
+    kdtree_t* mapped_kd;
+    kdtree_fits_t* io;
+    fitsbin_t* fb;
+    double* data;
+    char fn[1024];
+    int fd;
+    int i;
+    int payload_chunks = 0;
+    int topology_chunks = 0;
+    int saw_data = 0;
+    int saw_split = 0;
+
+    data = random_points_d(1000, 3);
+    kd = build_tree(
+        ct,
+        data,
+        1000,
+        3,
+        5,
+        KDTT_DSS,
+        KD_BUILD_SPLIT |
+            KD_BUILD_SPLITDIM |
+            KD_BUILD_BBOX |
+            KD_BUILD_LINEAR_LR);
+    kd->name = strdup("production");
+    CuAssertPtrNotNull(ct, kd->name);
+
+    sprintf(fn, "/tmp/test_libkd_io_mmap_components.XXXXXX");
+    fd = mkstemp(fn);
+    if (fd == -1) {
+        free(data);
+        kdtree_free(kd);
+        CuFail(ct, "mkstemp");
+        return;
+    }
+    close(fd);
+
+    CuAssertIntEquals(ct, 0, kdtree_fits_write(kd, fn, NULL));
+
+    /*
+     * Use a controlled RANDOM mapping policy. The reader still assigns
+     * distinct region classes: sparse DATA/PERM payload stays RANDOM while
+     * repeatedly traversed topology stays NORMAL.
+     */
+    fitsbin_mmap_set_thread_advice(FITSBIN_MMAP_ADVICE_RANDOM);
+    io = kdtree_fits_open(fn);
+    CuAssertPtrNotNull(ct, io);
+    mapped_kd = kdtree_fits_read_tree(io, "production", NULL);
+    fitsbin_mmap_clear_thread_advice();
+    CuAssertPtrNotNull(ct, mapped_kd);
+
+    fb = kdtree_fits_get_fitsbin(io);
+    for (i = 0; i < fitsbin_n_chunks(fb); i++) {
+        fitsbin_chunk_t* chunk = fitsbin_get_chunk(fb, i);
+
+        CuAssertPtrNotNull(ct, chunk);
+        CuAssertPtrNotNull(ct, chunk->tablename);
+
+        if (test_chunk_name_is(chunk->tablename, KD_STR_DATA) ||
+            test_chunk_name_is(chunk->tablename, KD_STR_PERM)) {
+            payload_chunks++;
+            if (test_chunk_name_is(chunk->tablename, KD_STR_DATA)) {
+                saw_data = 1;
+            }
+            CuAssertIntEquals(
+                ct,
+                FITSBIN_MMAP_REGION_PAYLOAD,
+                chunk->mmap_region);
+            CuAssertIntEquals(
+                ct,
+                FITSBIN_MMAP_ADVICE_RANDOM,
+                fitsbin_get_chunk_mmap_advice(fb, chunk));
+        } else {
+            topology_chunks++;
+            if (test_chunk_name_is(chunk->tablename, KD_STR_SPLIT)) {
+                saw_split = 1;
+            }
+            CuAssertIntEquals(
+                ct,
+                FITSBIN_MMAP_REGION_TOPOLOGY,
+                chunk->mmap_region);
+            CuAssertIntEquals(
+                ct,
+                FITSBIN_MMAP_ADVICE_NORMAL,
+                fitsbin_get_chunk_mmap_advice(fb, chunk));
+        }
+    }
+
+    CuAssert(ct, "production data payload chunk", saw_data);
+    CuAssert(ct, "production split topology chunk", saw_split);
+    CuAssert(ct, "production payload chunks", payload_chunks >= 1);
+    CuAssert(ct, "production topology chunks", topology_chunks >= 1);
+
+    kdtree_fits_close(mapped_kd);
+    unlink(fn);
+    free(data);
+    kdtree_free(kd);
+}
+
 void test_read_write_two_trees(CuTest* ct) {
     kdtree_t* kd;
     kdtree_t* kdB;
@@ -284,4 +400,3 @@ void test_read_write_two_trees(CuTest* ct) {
     free(dataB);
     kdtree_free(kdB);
 }
-

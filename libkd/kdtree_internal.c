@@ -8,7 +8,6 @@
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
-#include <time.h>
 
 
 #include "os-features.h"
@@ -18,7 +17,6 @@
 #include "kdtree_prefetch_internal.h"
 #include "kdtree_continuation_internal.h"
 #include "kdtree_mem.h"
-#include "kdtree_phase_a_internal.h"
 #include "keywords.h"
 #include "errors.h"
 #include "mathutil.h"
@@ -27,9 +25,15 @@
 #define KDTREE_MAX_DIM 100
 #define KDTREE_PRODUCT_FRONTIER_TARGET 4
 #define KDTREE_PRODUCT_FRONTIER_MAX 32
-#define KDTREE_PRODUCT_MIN_POINTS 512
-#define KDTREE_PRODUCT_MIN_TREE_POINTS 4096
 #define KDTREE_PRODUCT_FRONTIER_STORAGE 64
+
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+#define KDTREE_THREAD_LOCAL _Thread_local
+#elif defined(__GNUC__)
+#define KDTREE_THREAD_LOCAL __thread
+#else
+#error "A thread-local storage implementation is required"
+#endif
 
 #ifndef KDTREE_PRODUCT_STACK_MAX
 #define KDTREE_PRODUCT_STACK_MAX 4096
@@ -255,18 +259,8 @@ typedef u32 bigint;
 
 #undef CAN_OVERFLOW
 
-//LINK - Product structure
-typedef struct kdtree_product_metrics {
-  uint64_t nodes_visited;
-  uint64_t leaves_visited;
-  uint64_t points_tested;
-  uint64_t matches_found;
-} kdtree_product_metrics_t;
-
 typedef struct kdtree_product_frontier_node {
   int nodeid;
-  int order;
-  int npoints;
 } kdtree_product_frontier_node_t;
 
 typedef struct kdtree_product_task {
@@ -277,16 +271,7 @@ typedef struct kdtree_product_task {
   int nodeid;
   kdtree_qres_t *res;
   int failed;
-  kdtree_product_metrics_t metrics;
 } kdtree_product_task_t;
-
-
-typedef int (*kdtree_task_submit_fn)(void *executor,
-                                     void (*fn)(void *),
-                                     void *userdata);
-
-typedef int (*kdtree_task_wait_fn)(void *executor);
-
 
 void MANGLE(kdtree_update_funcs)(kdtree_t* kd);
 
@@ -2179,21 +2164,23 @@ static void copy_data_double(const kdtree_t* kd, int start, int N,
 #endif
 }
 
-static dtype* kdqsort_arr;
-static int kdqsort_D;
+static KDTREE_THREAD_LOCAL dtype* kdqsort_arr;
+static KDTREE_THREAD_LOCAL int kdqsort_D;
 
 static int kdqsort_compare(const void* v1, const void* v2)
 {
     int i1, i2;
     dtype val1, val2;
+
     i1 = *((int*)v1);
     i2 = *((int*)v2);
     val1 = kdqsort_arr[(size_t)i1 * (size_t)kdqsort_D];
     val2 = kdqsort_arr[(size_t)i2 * (size_t)kdqsort_D];
-    if (val1 < val2)
+    if (val1 < val2) {
         return -1;
-    else if (val1 > val2)
+    } else if (val1 > val2) {
         return 1;
+    }
     return 0;
 }
 
@@ -2212,15 +2199,16 @@ static int kdtree_qsort(dtype *arr, unsigned int *parr, int l, int r, int D, int
     }
     for (i = 0; i < N; i++)
         permute[i] = i;
+
     kdqsort_arr = arr + (size_t)l * (size_t)D + (size_t)d;
     kdqsort_D = D;
-
     qsort(permute, N, sizeof(int), kdqsort_compare);
 
     // permute the data one dimension at a time...
     tmparr = MALLOC((size_t)N * sizeof(dtype));
     if (!tmparr) {
         SYSERROR("Failed to allocate temp permutation array");
+        FREE(permute);
         return -1;
     }
     for (j = 0; j < D; j++) {
@@ -2235,6 +2223,7 @@ static int kdtree_qsort(dtype *arr, unsigned int *parr, int l, int r, int D, int
     tmpparr = MALLOC((size_t)N * sizeof(int));
     if (!tmpparr) {
         SYSERROR("Failed to allocate temp permutation array");
+        FREE(permute);
         return -1;
     }
     for (i = 0; i < N; i++) {
@@ -3709,39 +3698,6 @@ static inline anbool MANGLE(kdtree_product_valid_leaf_node)
 
   return TRUE;
 }
-// ANCHOR: kdtree phase timespec diff
-static uint64_t MANGLE(kdtree_phase_a_timespec_diff_ns)
-     (const struct timespec *start,
-      const struct timespec *end) {
-    uint64_t sec;
-    uint64_t nsec;
-
-    if (!start || !end) {
-        return UINT64_C(0);
-    }
-
-    if (end->tv_sec < start->tv_sec) {
-        return UINT64_C(0);
-    }
-
-    sec = (uint64_t)(end->tv_sec - start->tv_sec);
-
-    if (end->tv_nsec >= start->tv_nsec) {
-        nsec = (uint64_t)(end->tv_nsec - start->tv_nsec);
-    } else {
-        if (sec == 0) {
-            return UINT64_C(0);
-        }
-
-        sec--;
-        nsec = UINT64_C(1000000000) +
-            (uint64_t)end->tv_nsec -
-            (uint64_t)start->tv_nsec;
-    }
-
-    return sec * UINT64_C(1000000000) + nsec;
-}
-
 static inline anbool MANGLE(kdtree_product_valid_data_range)
      (const kdtree_t *kd,
       int L,
@@ -3794,8 +3750,7 @@ static kdtree_qres_t* MANGLE(kdtree_rangesearch_node_options)
       const void *vquery,
       double maxd2,
       int options,
-      int root_node,
-    kdtree_product_metrics_t *metrics) {
+      int root_node) {
   int nodestack[KDTREE_PRODUCT_STACK_MAX];
   int stackpos;
   int D;
@@ -3868,9 +3823,6 @@ static kdtree_qres_t* MANGLE(kdtree_rangesearch_node_options)
       ttype split = 0;
 
       nodeid = nodestack[stackpos--];
-      if (metrics) {
-            metrics->nodes_visited++;
-        }
       if (!MANGLE(kdtree_product_valid_node)(kd, nodeid)) {
         fprintf(stderr,
                 "[kd-product] invalid popped node root=%i node=%i "
@@ -3881,10 +3833,6 @@ static kdtree_qres_t* MANGLE(kdtree_rangesearch_node_options)
       }
 
      if (KD_IS_LEAF(kd, nodeid)) {
-        if (metrics) {
-          metrics->leaves_visited++;
-        }
-
         if (!MANGLE(kdtree_product_valid_leaf_node)(kd, nodeid)) {
           fprintf(stderr,
                   "[kd-product] invalid leaf node root=%i node=%i "
@@ -3905,10 +3853,6 @@ static kdtree_qres_t* MANGLE(kdtree_rangesearch_node_options)
         L = kdtree_leaf_left(kd, nodeid);
         R = kdtree_leaf_right(kd, nodeid);
 
-        /*
-         * Validate the range before using R - L + 1 for metrics.  This
-         * avoids an unsigned wrap if a corrupt leaf ever produces R < L.
-         */
         if (!MANGLE(kdtree_product_valid_data_range)(kd, L, R)) {
           fprintf(stderr,
                   "[kd-product] invalid leaf range root=%i node=%i "
@@ -3923,10 +3867,6 @@ static kdtree_qres_t* MANGLE(kdtree_rangesearch_node_options)
 
           kdtree_free_query(res);
           return NULL;
-        }
-
-        if (metrics) {
-          metrics->points_tested += (uint64_t)(R - L + 1);
         }
 
 #if defined(KDTREE_CODEKD_DSS_U16_FAST_PATH)
@@ -3956,10 +3896,6 @@ static kdtree_qres_t* MANGLE(kdtree_rangesearch_node_options)
                  maxd2,
                  &dsqd)) {
               continue;
-            }
-
-            if (metrics) {
-              metrics->matches_found++;
             }
 
             if (!add_result(kd,
@@ -4000,10 +3936,6 @@ static kdtree_qres_t* MANGLE(kdtree_rangesearch_node_options)
 
           if (bailedout) {
             continue;
-          }
-
-          if (metrics) {
-            metrics->matches_found++;
           }
 
           if (!add_result(kd,
@@ -4193,8 +4125,6 @@ static int MANGLE(kdtree_product_build_frontier)
           return nfrontier;
 
         frontier[nfrontier].nodeid = nodeid;
-        frontier[nfrontier].order = nfrontier;
-        frontier[nfrontier].npoints = 0;
         nfrontier++;
         continue;
       }
@@ -4290,7 +4220,7 @@ static anbool MANGLE(kdtree_prefetch_size_mul)
     return TRUE;
 }
 
-static void MANGLE(kdtree_prefetch_emit_hint)
+static int MANGLE(kdtree_prefetch_emit_hint)
      (const kdtree_t *kd,
       const void *address,
       size_t length,
@@ -4298,6 +4228,7 @@ static void MANGLE(kdtree_prefetch_emit_hint)
       unsigned int priority,
       const kdtree_prefetch_sink_t *sink) {
     kdtree_prefetch_hint_t hint;
+    int status;
 
     if (!kd ||
         !kd->io ||
@@ -4305,7 +4236,7 @@ static void MANGLE(kdtree_prefetch_emit_hint)
         !length ||
         !sink ||
         !sink->emit) {
-        return;
+        return KDTREE_PREFETCH_EMIT_ERROR;
     }
 
     memset(&hint, 0, sizeof(hint));
@@ -4316,26 +4247,169 @@ static void MANGLE(kdtree_prefetch_emit_hint)
     hint.kind = kind;
     hint.priority = priority;
 
-    /*
-     * Prefetch is strictly advisory. Rejection or failure must never change
-     * solver correctness or range-search semantics.
-     */
-    (void)sink->emit(sink->userdata, &hint);
+    status = sink->emit(sink->userdata, &hint);
+    if (status < 0) {
+        return KDTREE_PREFETCH_EMIT_ERROR;
+    }
+    if (status > 0) {
+        return KDTREE_PREFETCH_EMIT_REFUSED;
+    }
+    return KDTREE_PREFETCH_EMIT_CONTINUE;
+}
+
+static int MANGLE(kdtree_prefetch_emit_leaf_metadata)
+     (const kdtree_t *kd,
+      int nodeid,
+      const kdtree_prefetch_sink_t *sink) {
+    int first_lr;
+    int leafid;
+    int lr_count;
+    size_t lr_bytes;
+
+    if (!kd || !kd->lr || kd->has_linear_lr ||
+        !MANGLE(kdtree_product_valid_leaf_node)(kd, nodeid)) {
+        return KDTREE_PREFETCH_EMIT_CONTINUE;
+    }
+
+    leafid = nodeid - kd->ninterior;
+    first_lr = leafid > 0 ? leafid - 1 : leafid;
+    lr_count = leafid > 0 ? 2 : 1;
+    if (first_lr < 0 || first_lr >= kd->nbottom ||
+        lr_count <= 0 || lr_count > kd->nbottom - first_lr ||
+        !MANGLE(kdtree_prefetch_size_mul)
+            ((size_t)lr_count, sizeof(*kd->lr), &lr_bytes)) {
+        return KDTREE_PREFETCH_EMIT_CONTINUE;
+    }
+
+    return MANGLE(kdtree_prefetch_emit_hint)
+        (kd,
+         kd->lr + first_lr,
+         lr_bytes,
+         KDTREE_PREFETCH_ARRAY_LR,
+         KDTREE_PREFETCH_PRIORITY_METADATA,
+         sink);
+}
+
+static int MANGLE(kdtree_prefetch_emit_payload)
+     (const kdtree_t *kd,
+      int D,
+      int L,
+      int R,
+      const kdtree_prefetch_sink_t *sink) {
+    size_t count;
+    size_t coordinates;
+    size_t data_bytes;
+    size_t perm_bytes;
+
+    if (!MANGLE(kdtree_product_valid_data_range)(kd, L, R) ||
+        D <= 0) {
+        return KDTREE_PREFETCH_EMIT_ERROR;
+    }
+
+    count = (size_t)(R - L + 1);
+    if (kd->data.any) {
+        if (!MANGLE(kdtree_prefetch_size_mul)
+                (count, (size_t)D, &coordinates) ||
+            !MANGLE(kdtree_prefetch_size_mul)
+                (coordinates, sizeof(dtype), &data_bytes)) {
+            return KDTREE_PREFETCH_EMIT_ERROR;
+        }
+        int emit_status = MANGLE(kdtree_prefetch_emit_hint)
+            (kd,
+             KD_DATA(kd, D, L),
+             data_bytes,
+             KDTREE_PREFETCH_ARRAY_DATA,
+             KDTREE_PREFETCH_PRIORITY_LEAF,
+             sink);
+        if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+            return emit_status;
+        }
+    }
+
+    if (kd->perm) {
+        if (!MANGLE(kdtree_prefetch_size_mul)
+                (count, sizeof(*kd->perm), &perm_bytes)) {
+            return KDTREE_PREFETCH_EMIT_ERROR;
+        }
+        int emit_status = MANGLE(kdtree_prefetch_emit_hint)
+            (kd,
+             kd->perm + L,
+             perm_bytes,
+             KDTREE_PREFETCH_ARRAY_PERM,
+             KDTREE_PREFETCH_PRIORITY_LEAF,
+             sink);
+        if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+            return emit_status;
+        }
+    }
+    return KDTREE_PREFETCH_EMIT_CONTINUE;
+}
+
+static int MANGLE(kdtree_prefetch_emit_split_metadata)
+     (const kdtree_t *kd,
+      int nodeid,
+      const kdtree_prefetch_sink_t *sink) {
+    int emit_status;
+
+    if (!kd || !kd->split.any || nodeid < 0 ||
+        nodeid >= kd->ninterior) {
+        return KDTREE_PREFETCH_EMIT_CONTINUE;
+    }
+
+    emit_status = MANGLE(kdtree_prefetch_emit_hint)
+        (kd,
+         KD_SPLIT(kd, nodeid),
+         sizeof(ttype),
+         KDTREE_PREFETCH_ARRAY_SPLIT,
+         KDTREE_PREFETCH_PRIORITY_METADATA,
+         sink);
+    if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+        return emit_status;
+    }
+    if (kd->splitdim) {
+        emit_status = MANGLE(kdtree_prefetch_emit_hint)
+            (kd,
+             kd->splitdim + nodeid,
+             sizeof(*kd->splitdim),
+             KDTREE_PREFETCH_ARRAY_SPLITDIM,
+             KDTREE_PREFETCH_PRIORITY_METADATA,
+             sink);
+    }
+    return emit_status;
+}
+
+static int MANGLE(kdtree_prefetch_emit_bbox_metadata)
+     (const kdtree_t *kd,
+      int D,
+      int nodeid,
+      const kdtree_prefetch_sink_t *sink) {
+    size_t coordinates;
+    size_t bbox_bytes;
+
+    if (!kd || !kd->bb.any || D <= 0 || nodeid < 0 ||
+        nodeid >= kd->ninterior ||
+        !MANGLE(kdtree_prefetch_size_mul)
+            ((size_t)D, 2U, &coordinates) ||
+        !MANGLE(kdtree_prefetch_size_mul)
+            (coordinates, sizeof(ttype), &bbox_bytes)) {
+        return KDTREE_PREFETCH_EMIT_CONTINUE;
+    }
+
+    return MANGLE(kdtree_prefetch_emit_hint)
+        (kd,
+         LOW_HR(kd, D, nodeid),
+         bbox_bytes,
+         KDTREE_PREFETCH_ARRAY_BBOX,
+         KDTREE_PREFETCH_PRIORITY_METADATA,
+         sink);
 }
 
 /*
- * Predict a shallow CodeKD frontier and emit only the exact backing arrays
- * that the normal split traversal is expected to access.
- *
- * This function deliberately does not:
- *
- *   - call madvise()
- *   - perform page alignment
- *   - deduplicate requests
- *   - merge ranges
- *   - manage a byte/page budget
- *
- * Those are responsibilities of the pool-shared coordinator.
+ * Traverse only KD topology and emit the DATA and PERM intervals that the
+ * scalar range search will inspect. Query pruning and child order mirror the
+ * established solver path. No result is allocated and payload is never
+ * dereferenced here. Page alignment, merging, and delivery remain the
+ * caller's responsibility.
  */
 int MANGLE(kdtree_rangesearch_prefetch_prepare)
      (const kdtree_t *kd,
@@ -4343,131 +4417,331 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
       double maxd2,
       int options,
       const kdtree_prefetch_sink_t *sink) {
-    kdtree_product_frontier_node_t
-        frontier[KDTREE_PRODUCT_FRONTIER_STORAGE];
+    int nodestack[KDTREE_PRODUCT_STACK_MAX];
+    ttype tquery[KDTREE_MAX_DIM];
+    int stackpos = 0;
+    int D;
+    anbool do_wholenode_check;
+    anbool do_precheck = FALSE;
+    anbool do_l1precheck = FALSE;
+    anbool use_bboxes = FALSE;
+    anbool use_splits = FALSE;
+    anbool use_tquery = FALSE;
+    anbool use_tsplit = FALSE;
+    anbool use_tmath = FALSE;
+    anbool use_bigtmath = FALSE;
+    double maxdist;
+    double dtl1 = 0.0;
+    double dtl2 = 0.0;
+    double dtlinf = 0.0;
+    ttype tl1 = 0;
+    ttype tl2 = 0;
+    ttype tlinf = 0;
+    bigttype bigtl2 = 0;
+    const etype *query = vquery;
 
-    int nfrontier;
-    int i;
-
-    if (!kd || !vquery || !sink) {
-        return -1;
+    if (!kd || !query || !sink ||
+        !sink->emit || !sink->enabled) {
+        return KDTREE_PREFETCH_PREPARE_ERROR;
     }
-
     if (!kd->io ||
-        !sink->emit ||
-        !sink->enabled) {
-        return 0;
+        !sink->enabled(sink->userdata, kd->io)) {
+        return KDTREE_PREFETCH_PREPARE_NOT_APPLICABLE;
     }
 
-    /*
-     * Reject before predictive traversal so the prefetch-OFF path does not
-     * pay frontier construction cost.
-     */
-    if (!sink->enabled(sink->userdata, kd->io)) {
-        return 0;
+#if defined(KD_DIM)
+    assert(kd->ndim == KD_DIM);
+    D = KD_DIM;
+#else
+    D = kd->ndim;
+#endif
+    if (D <= 0 || D > KDTREE_MAX_DIM) {
+        return KDTREE_PREFETCH_PREPARE_ERROR;
     }
 
-    /*
-     * CodeKD currently uses the split traversal path. Do not predict arrays
-     * that the actual search mode does not consume.
-     */
-    if (!(options & KD_OPTIONS_USE_SPLIT) ||
-        !kd->split.any) {
-        return 0;
+    do_wholenode_check = !(options & KD_OPTIONS_SMALL_RADIUS);
+    if ((options & KD_OPTIONS_SPLIT_PRECHECK) &&
+        kd->bb.any && kd->splitdim) {
+        do_precheck = TRUE;
+    }
+    if ((options & KD_OPTIONS_L1_PRECHECK) && kd->bb.any) {
+        do_l1precheck = TRUE;
     }
 
-    memset(frontier, 0, sizeof(frontier));
-
-    /*
-     * Reuse the validated Product-KD shallow-frontier builder. This preserves
-     * the actual query geometry and child-selection rules instead of creating
-     * a second traversal predictor.
-     */
-    nfrontier = MANGLE(kdtree_product_build_frontier)
-        (kd,
-         vquery,
-         maxd2,
-         options,
-         frontier,
-         KDTREE_PRODUCT_FRONTIER_STORAGE);
-
-    if (nfrontier <= 0) {
-        return 0;
+    if (!kd->split.any) {
+        if (!kd->bb.any) {
+            return KDTREE_PREFETCH_PREPARE_NOT_APPLICABLE;
+        }
+        use_bboxes = TRUE;
+    } else if (kd->bb.any &&
+               !(options & KD_OPTIONS_USE_SPLIT)) {
+        use_bboxes = TRUE;
+    } else {
+        use_splits = TRUE;
     }
 
-    for (i = 0; i < nfrontier; i++) {
-        int nodeid = frontier[i].nodeid;
+    maxdist = sqrt(maxd2);
+    if (TTYPE_INTEGER &&
+        (kd->split.any || do_precheck || do_l1precheck)) {
+        use_tquery = ttype_query(kd, query, tquery);
+    }
+    if (TTYPE_INTEGER && use_tquery) {
+        dtl1 = DIST_ET(kd, maxdist * sqrt(D),);
+        dtl2 = DIST2_ET(kd, maxd2, );
+        dtlinf = DIST_ET(kd, maxdist, );
+        tl1 = ceil(dtl1);
+        tlinf = ceil(dtlinf);
+        bigtl2 = ceil(dtl2);
+        tl2 = bigtl2;
+    }
+    use_tsplit = use_tquery && (dtlinf < TTYPE_MAX);
+    if (do_l1precheck && dtl1 > TTYPE_MAX) {
+        do_l1precheck = FALSE;
+    }
+    if (TTYPE_INTEGER && use_tquery && kd->bb.any) {
+        if (dtl2 < TTYPE_MAX) {
+            use_tmath = TRUE;
+        } else if (dtl2 < BIGTTYPE_MAX) {
+            use_bigtmath = TRUE;
+        }
+        if (use_bigtmath &&
+            (options & KD_OPTIONS_NO_BIG_INT_MATH)) {
+            use_bigtmath = FALSE;
+        }
+    }
+
+    nodestack[0] = 0;
+    while (stackpos >= 0) {
+        int nodeid = nodestack[stackpos--];
+        int dim = -1;
+        int L;
+        int R;
+        ttype split = 0;
+        int emit_status;
 
         if (!MANGLE(kdtree_product_valid_node)(kd, nodeid)) {
+            return KDTREE_PREFETCH_PREPARE_ERROR;
+        }
+
+        if (KD_IS_LEAF(kd, nodeid)) {
+            emit_status = MANGLE(kdtree_prefetch_emit_leaf_metadata)
+                (kd, nodeid, sink);
+            if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+                return emit_status < 0
+                    ? KDTREE_PREFETCH_PREPARE_ERROR
+                    : KDTREE_PREFETCH_PREPARE_REFUSED;
+            }
+            L = kdtree_left(kd, nodeid);
+            R = kdtree_right(kd, nodeid);
+            emit_status = MANGLE(kdtree_prefetch_emit_payload)
+                (kd, D, L, R, sink);
+            if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+                return emit_status < 0
+                    ? KDTREE_PREFETCH_PREPARE_ERROR
+                    : KDTREE_PREFETCH_PREPARE_REFUSED;
+            }
             continue;
         }
 
-        if (nodeid < kd->ninterior) {
-            MANGLE(kdtree_prefetch_emit_hint)
-                (kd,
-                 KD_SPLIT(kd, nodeid),
-                 sizeof(ttype),
-                 KDTREE_PREFETCH_ARRAY_SPLIT,
-                 KDTREE_PREFETCH_PRIORITY_METADATA,
-                 sink);
+        if (kd->splitdim) {
+            dim = kd->splitdim[nodeid];
+        }
 
-            if (kd->splitdim) {
-                MANGLE(kdtree_prefetch_emit_hint)
-                    (kd,
-                     kd->splitdim + nodeid,
-                     sizeof(*kd->splitdim),
-                     KDTREE_PREFETCH_ARRAY_SPLITDIM,
-                     KDTREE_PREFETCH_PRIORITY_METADATA,
-                     sink);
+        if (use_bboxes) {
+            ttype *tlo = NULL;
+            ttype *thi = NULL;
+            anbool wholenode = FALSE;
+
+            emit_status = MANGLE(kdtree_prefetch_emit_bbox_metadata)
+                (kd, D, nodeid, sink);
+            if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+                return emit_status < 0
+                    ? KDTREE_PREFETCH_PREPARE_ERROR
+                    : KDTREE_PREFETCH_PREPARE_REFUSED;
+            }
+            if (!bboxes(kd, nodeid, &tlo, &thi, D) ||
+                !tlo || !thi) {
+                return KDTREE_PREFETCH_PREPARE_ERROR;
             }
 
+            if (do_precheck && nodeid) {
+                anbool isleftchild = KD_IS_LEFT_CHILD(nodeid);
+                int pdim;
+                anbool cut;
+
+                if (kd->splitdim) {
+                    pdim = kd->splitdim[KD_PARENT(nodeid)];
+                } else {
+                    pdim = kd->split.TTYPE[KD_PARENT(nodeid)];
+                    pdim &= kd->dimmask;
+                }
+                if (TTYPE_INTEGER && use_tquery) {
+                    if (isleftchild) {
+                        cut = ((tquery[pdim] > thi[pdim]) &&
+                               (tquery[pdim] - thi[pdim] > tlinf));
+                    } else {
+                        cut = ((tlo[pdim] > tquery[pdim]) &&
+                               (tlo[pdim] - tquery[pdim] > tlinf));
+                    }
+                } else {
+                    etype bb;
+
+                    if (isleftchild) {
+                        bb = POINT_TE(kd, pdim, thi[pdim]);
+                        cut = (query[pdim] - bb > maxdist);
+                    } else {
+                        bb = POINT_TE(kd, pdim, tlo[pdim]);
+                        cut = (bb - query[pdim] > maxdist);
+                    }
+                }
+                if (cut) {
+                    continue;
+                }
+            }
+
+            if (TTYPE_INTEGER && do_l1precheck && use_tquery &&
+                bb_point_l1mindist_exceeds_ttype(
+                    tlo, thi, tquery, D, tl1, tlinf)) {
+                continue;
+            }
+
+            if (TTYPE_INTEGER && use_tmath) {
+                if (bb_point_mindist2_exceeds_ttype(
+                        tlo, thi, tquery, D, tl2)) {
+                    continue;
+                }
+                wholenode = do_wholenode_check &&
+                    !bb_point_maxdist2_exceeds_ttype(
+                        tlo, thi, tquery, D, tl2);
+            } else if (TTYPE_INTEGER && use_bigtmath) {
+                if (bb_point_mindist2_exceeds_bigttype(
+                        tlo, thi, tquery, D, bigtl2)) {
+                    continue;
+                }
+                wholenode = do_wholenode_check &&
+                    !bb_point_maxdist2_exceeds_bigttype(
+                        tlo, thi, tquery, D, bigtl2);
+            } else {
+                etype bblo[KDTREE_MAX_DIM];
+                etype bbhi[KDTREE_MAX_DIM];
+                int d;
+
+                for (d = 0; d < D; d++) {
+                    bblo[d] = POINT_TE(kd, d, tlo[d]);
+                    bbhi[d] = POINT_TE(kd, d, thi[d]);
+                }
+                if (bb_point_mindist2_exceeds(
+                        bblo, bbhi, query, D, maxd2)) {
+                    continue;
+                }
+                wholenode = do_wholenode_check &&
+                    !bb_point_maxdist2_exceeds(
+                        bblo, bbhi, query, D, maxd2);
+            }
+
+            if (wholenode) {
+                L = kdtree_left(kd, nodeid);
+                R = kdtree_right(kd, nodeid);
+                emit_status = MANGLE(kdtree_prefetch_emit_payload)
+                    (kd, D, L, R, sink);
+                if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+                    return emit_status < 0
+                        ? KDTREE_PREFETCH_PREPARE_ERROR
+                        : KDTREE_PREFETCH_PREPARE_REFUSED;
+                }
+                continue;
+            }
+
+            if (MANGLE(kdtree_product_push_node)
+                    (kd, nodestack, &stackpos,
+                     KD_CHILD_LEFT(nodeid)) ||
+                MANGLE(kdtree_product_push_node)
+                    (kd, nodestack, &stackpos,
+                     KD_CHILD_RIGHT(nodeid))) {
+                return KDTREE_PREFETCH_PREPARE_ERROR;
+            }
             continue;
         }
 
-        if (MANGLE(kdtree_product_valid_leaf_node)(kd, nodeid)) {
-            int leafid = nodeid - kd->ninterior;
+        if (!use_splits) {
+            return KDTREE_PREFETCH_PREPARE_ERROR;
+        }
+        emit_status = MANGLE(kdtree_prefetch_emit_split_metadata)
+            (kd, nodeid, sink);
+        if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
+            return emit_status < 0
+                ? KDTREE_PREFETCH_PREPARE_ERROR
+                : KDTREE_PREFETCH_PREPARE_REFUSED;
+        }
+        split = *KD_SPLIT(kd, nodeid);
+        if (!kd->splitdim && TTYPE_INTEGER) {
+            bigint tmpsplit = split;
 
-            /*
-             * kdtree_leaf_left/right() read:
-             *
-             *   left:  lr[leafid - 1], except leaf zero
-             *   right: lr[leafid]
-             *
-             * Emit only this small traversal-metadata range. Leaf payload
-             * data and permutation pages are intentionally excluded from
-             * Gate 13.1.
-             */
-            if (kd->lr && !kd->has_linear_lr) {
-                int first_lr =
-                    leafid > 0 ? leafid - 1 : leafid;
+            dim = tmpsplit & kd->dimmask;
+            split = tmpsplit & kd->splitmask;
+        }
+        if (dim < 0 || dim >= D) {
+            return KDTREE_PREFETCH_PREPARE_ERROR;
+        }
 
-                int lr_count =
-                    leafid > 0 ? 2 : 1;
+        if (TTYPE_INTEGER && use_tsplit) {
+            if (tquery[dim] < split) {
+                if (MANGLE(kdtree_product_push_node)
+                        (kd, nodestack, &stackpos,
+                         KD_CHILD_LEFT(nodeid))) {
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
+                }
+                if (split - tquery[dim] <= tlinf &&
+                    MANGLE(kdtree_product_push_node)
+                        (kd, nodestack, &stackpos,
+                         KD_CHILD_RIGHT(nodeid))) {
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
+                }
+            } else {
+                if (MANGLE(kdtree_product_push_node)
+                        (kd, nodestack, &stackpos,
+                         KD_CHILD_RIGHT(nodeid))) {
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
+                }
+                if (tquery[dim] - split <= tlinf &&
+                    MANGLE(kdtree_product_push_node)
+                        (kd, nodestack, &stackpos,
+                         KD_CHILD_LEFT(nodeid))) {
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
+                }
+            }
+        } else {
+            dtype rsplit = POINT_TE(kd, dim, split);
 
-                if (first_lr >= 0 &&
-                    first_lr < kd->nbottom &&
-                    lr_count > 0 &&
-                    lr_count <= kd->nbottom - first_lr) {
-                    size_t lr_bytes;
-
-                    if (MANGLE(kdtree_prefetch_size_mul)
-                        ((size_t)lr_count,
-                         sizeof(*kd->lr),
-                         &lr_bytes)) {
-                        MANGLE(kdtree_prefetch_emit_hint)
-                            (kd,
-                             kd->lr + first_lr,
-                             lr_bytes,
-                             KDTREE_PREFETCH_ARRAY_LR,
-                             KDTREE_PREFETCH_PRIORITY_METADATA,
-                             sink);
-                    }
+            if (query[dim] < rsplit) {
+                if (MANGLE(kdtree_product_push_node)
+                        (kd, nodestack, &stackpos,
+                         KD_CHILD_LEFT(nodeid))) {
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
+                }
+                if (rsplit - query[dim] <= maxdist &&
+                    MANGLE(kdtree_product_push_node)
+                        (kd, nodestack, &stackpos,
+                         KD_CHILD_RIGHT(nodeid))) {
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
+                }
+            } else {
+                if (MANGLE(kdtree_product_push_node)
+                        (kd, nodestack, &stackpos,
+                         KD_CHILD_RIGHT(nodeid))) {
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
+                }
+                if (query[dim] - rsplit <= maxdist &&
+                    MANGLE(kdtree_product_push_node)
+                        (kd, nodestack, &stackpos,
+                         KD_CHILD_LEFT(nodeid))) {
+                    return KDTREE_PREFETCH_PREPARE_ERROR;
                 }
             }
         }
     }
 
-    return 0;
+    return KDTREE_PREFETCH_PREPARE_COMPLETE;
 }
 static void MANGLE(kdtree_product_task_run)(void *userdata) {
   kdtree_product_task_t *task = userdata;
@@ -4483,16 +4757,13 @@ static void MANGLE(kdtree_product_task_run)(void *userdata) {
     return;
   }
 
-   memset(&task->metrics, 0, sizeof(task->metrics));
-
-    task->res = MANGLE(kdtree_rangesearch_node_options)
-        (task->kd,
-        NULL,
-        task->query,
-        task->maxd2,
-        task->options,
-        task->nodeid,
-        &task->metrics);
+  task->res = MANGLE(kdtree_rangesearch_node_options)
+      (task->kd,
+       NULL,
+       task->query,
+       task->maxd2,
+       task->options,
+       task->nodeid);
 
   if (!task->res)
     task->failed = 1;
@@ -4537,11 +4808,6 @@ static int MANGLE(kdtree_product_append_result)
     return -1;
 
   for (i = 0; i < src->nres; i++) {
-    const dtype *pt = NULL;
-
-    if (do_points && src->results.any)
-      pt = NULL;
-
     if (dst->nres == dst->capacity) {
       if (!resize_results(dst, dst->capacity * 2, D, do_dists, do_points))
         return -1;
@@ -4563,36 +4829,6 @@ static int MANGLE(kdtree_product_append_result)
   }
 
   return 0;
-}
-
-static void MANGLE(kdtree_phase_a_finish_sample)
-     (kdtree_phase_a_query_sample_t *sample,
-      const struct timespec *wall_start,
-      const struct timespec *cpu_start) {
-  struct timespec wall_end;
-  struct timespec cpu_end;
-
-  if (!sample || !wall_start || !cpu_start) {
-    return;
-  }
-
-  if (clock_gettime(CLOCK_MONOTONIC, &wall_end)) {
-    return;
-  }
-
-  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end)) {
-    return;
-  }
-
-  sample->wall_ns =
-      MANGLE(kdtree_phase_a_timespec_diff_ns)
-          (wall_start, &wall_end);
-
-  sample->cpu_ns =
-      MANGLE(kdtree_phase_a_timespec_diff_ns)
-          (cpu_start, &cpu_end);
-
-  kdtree_phase_a_record(sample);
 }
 
 kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
@@ -4621,27 +4857,11 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
 
   const etype *query = vquery;
 
-  struct timespec phase_a_wall_start;
-  struct timespec phase_a_cpu_start;
-  kdtree_phase_a_query_sample_t phase_a_sample;
-
   if (!kd || !query) {
     return NULL;
   }
 
   do_points = (options & KD_OPTIONS_RETURN_POINTS) != 0;
-
-  memset(&phase_a_sample, 0, sizeof(phase_a_sample));
-  memset(&phase_a_wall_start, 0, sizeof(phase_a_wall_start));
-  memset(&phase_a_cpu_start, 0, sizeof(phase_a_cpu_start));
-
-  if (clock_gettime(CLOCK_MONOTONIC, &phase_a_wall_start)) {
-    memset(&phase_a_wall_start, 0, sizeof(phase_a_wall_start));
-  }
-
-  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &phase_a_cpu_start)) {
-    memset(&phase_a_cpu_start, 0, sizeof(phase_a_cpu_start));
-  }
 
   /*
    * Without a complete executor, use the original scalar range search.
@@ -4650,18 +4870,11 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
     !executor->submit ||
     !executor->wait ||
     !executor->capacity) {
-    phase_a_sample.fallback_used = 1;
-
     fallback_res = KDFUNC(kdtree_rangesearch_options_reuse)
         (kd, res, vquery, maxd2, options);
 
-    MANGLE(kdtree_phase_a_finish_sample)
-        (&phase_a_sample,
-         &phase_a_wall_start,
-         &phase_a_cpu_start);
-
     return fallback_res;
-}
+  }
 
 #if defined(KD_DIM)
   D = KD_DIM;
@@ -4677,15 +4890,8 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
       !(options & KD_OPTIONS_SMALL_RADIUS) ||
       !(options & KD_OPTIONS_USE_SPLIT) ||
       (options & KD_OPTIONS_SORT_DISTS)) {
-    phase_a_sample.fallback_used = 1;
-
     fallback_res = KDFUNC(kdtree_rangesearch_options_reuse)
         (kd, res, vquery, maxd2, options);
-
-    MANGLE(kdtree_phase_a_finish_sample)
-        (&phase_a_sample,
-         &phase_a_wall_start,
-         &phase_a_cpu_start);
 
     return fallback_res;
   }
@@ -4700,15 +4906,8 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
     if (executor->capacity(executor->userdata, &capacity) ||
         !capacity.suggested_subtasks ||
         !capacity.aux_room) {
-        phase_a_sample.fallback_used = 1;
-
         fallback_res = KDFUNC(kdtree_rangesearch_options_reuse)
             (kd, res, vquery, maxd2, options);
-
-        MANGLE(kdtree_phase_a_finish_sample)
-            (&phase_a_sample,
-            &phase_a_wall_start,
-            &phase_a_cpu_start);
 
         return fallback_res;
     }
@@ -4728,15 +4927,8 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
         MANGLE(kdtree_product_release_work)
             (&tasks, nfrontier, &frontier);
 
-        phase_a_sample.fallback_used = 1;
-
         fallback_res = KDFUNC(kdtree_rangesearch_options_reuse)
             (kd, res, vquery, maxd2, options);
-
-        MANGLE(kdtree_phase_a_finish_sample)
-            (&phase_a_sample,
-            &phase_a_wall_start,
-            &phase_a_cpu_start);
 
         return fallback_res;
     }
@@ -4749,23 +4941,12 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
        frontier,
        KDTREE_PRODUCT_FRONTIER_MAX);
 
-  if (nfrontier > 0) {
-    phase_a_sample.frontier_size = (uint64_t)nfrontier;
-  }
-
   if (nfrontier < 2) {
-    phase_a_sample.fallback_used = 1;
-
     MANGLE(kdtree_product_release_work)
         (&tasks, nfrontier, &frontier);
 
     fallback_res = KDFUNC(kdtree_rangesearch_options_reuse)
          (kd, res, vquery, maxd2, options);
-
-    MANGLE(kdtree_phase_a_finish_sample)
-        (&phase_a_sample,
-         &phase_a_wall_start,
-         &phase_a_cpu_start);
 
     return fallback_res;
   }
@@ -4775,24 +4956,15 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
    */
   for (i = 0; i < nfrontier; i++) {
      if (!MANGLE(kdtree_product_valid_node)(kd, frontier[i].nodeid)) {
-      phase_a_sample.fallback_used = 1;
-
       MANGLE(kdtree_product_release_work)
           (&tasks, nfrontier, &frontier);
 
       fallback_res = KDFUNC(kdtree_rangesearch_options_reuse)
          (kd, res, vquery, maxd2, options);
 
-      MANGLE(kdtree_phase_a_finish_sample)
-        (&phase_a_sample,
-         &phase_a_wall_start,
-         &phase_a_cpu_start);
-
       return fallback_res;
     }
   }
-
-  phase_a_sample.product_used = 1;
 
   /*
    * Prepare the destination result container before product execution.
@@ -4820,11 +4992,6 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
       MANGLE(kdtree_product_release_work)
           (&tasks, nfrontier, &frontier);
 
-      MANGLE(kdtree_phase_a_finish_sample)
-          (&phase_a_sample,
-           &phase_a_wall_start,
-           &phase_a_cpu_start);
-
       return NULL;
     }
 
@@ -4846,8 +5013,6 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
     tasks[i].nodeid = frontier[i].nodeid;
     tasks[i].res = NULL;
     tasks[i].failed = 0;
-
-    memset(&tasks[i].metrics, 0, sizeof(tasks[i].metrics));
   }
 
   /*
@@ -4862,7 +5027,6 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
         if (!async_submission_open ||
             async_submitted >= async_budget) {
             MANGLE(kdtree_product_task_run)(&tasks[i]);
-            phase_a_sample.tasks_inline++;
             continue;
         }
 
@@ -4870,68 +5034,27 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
                             MANGLE(kdtree_product_task_run),
                             &tasks[i])) {
             MANGLE(kdtree_product_task_run)(&tasks[i]);
-            phase_a_sample.tasks_inline++;
             async_submission_open = FALSE;
             continue;
         }
 
         async_submitted++;
-        phase_a_sample.tasks_submitted++;
     }
 
     MANGLE(kdtree_product_task_run)(&tasks[0]);
-    phase_a_sample.tasks_inline++;
 
     /*
     * Waiting is unnecessary when capacity or admission kept all work local.
     */
     if (async_submitted &&
         executor->wait(executor->userdata)) {
-    phase_a_sample.fallback_used = 1;
-
-    for (i = 0; i < nfrontier; i++) {
-      phase_a_sample.nodes_visited +=
-          tasks[i].metrics.nodes_visited;
-
-      phase_a_sample.leaves_visited +=
-          tasks[i].metrics.leaves_visited;
-
-      phase_a_sample.points_tested +=
-          tasks[i].metrics.points_tested;
-
-      phase_a_sample.matches_found +=
-          tasks[i].metrics.matches_found;
-    }
-
      MANGLE(kdtree_product_release_work)
         (&tasks, nfrontier, &frontier);
 
     fallback_res = KDFUNC(kdtree_rangesearch_options_reuse)
         (kd, res, vquery, maxd2, options);
 
-    MANGLE(kdtree_phase_a_finish_sample)
-        (&phase_a_sample,
-         &phase_a_wall_start,
-         &phase_a_cpu_start);
-
     return fallback_res;
-  }
-
-  /*
-   * Successful wait: collect stable per-subtree metrics exactly once.
-   */
-  for (i = 0; i < nfrontier; i++) {
-    phase_a_sample.nodes_visited +=
-        tasks[i].metrics.nodes_visited;
-
-    phase_a_sample.leaves_visited +=
-        tasks[i].metrics.leaves_visited;
-
-    phase_a_sample.points_tested +=
-        tasks[i].metrics.points_tested;
-
-    phase_a_sample.matches_found +=
-        tasks[i].metrics.matches_found;
   }
 
   /*
@@ -4939,18 +5062,11 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
    */
   for (i = 0; i < nfrontier; i++) {
     if (tasks[i].failed || !tasks[i].res) {
-      phase_a_sample.fallback_used = 1;
-
       MANGLE(kdtree_product_release_work)
           (&tasks, nfrontier, &frontier);
 
       fallback_res = KDFUNC(kdtree_rangesearch_options_reuse)
           (kd, res, vquery, maxd2, options);
-
-      MANGLE(kdtree_phase_a_finish_sample)
-          (&phase_a_sample,
-           &phase_a_wall_start,
-           &phase_a_cpu_start);
 
       return fallback_res;
     }
@@ -4962,19 +5078,11 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
          D,
          do_dists,
          do_points)) {
-
-      phase_a_sample.fallback_used = 1;
-
       MANGLE(kdtree_product_release_work)
           (&tasks, nfrontier, &frontier);
 
       fallback_res = KDFUNC(kdtree_rangesearch_options_reuse)
           (kd, res, vquery, maxd2, options);
-
-      MANGLE(kdtree_phase_a_finish_sample)
-          (&phase_a_sample,
-           &phase_a_wall_start,
-           &phase_a_cpu_start);
 
       return fallback_res;
     }
@@ -4987,12 +5095,5 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options_reuse_product)
     }
   }
 
-  MANGLE(kdtree_phase_a_finish_sample)
-      (&phase_a_sample,
-       &phase_a_wall_start,
-       &phase_a_cpu_start);
-
   return res;
 }
-
-

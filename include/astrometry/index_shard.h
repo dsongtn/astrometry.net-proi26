@@ -6,12 +6,10 @@
 #include "astrometry/solver.h"
 
 /*
- * Solver-facing index-shard lifecycle.
- *
- * This interface deliberately excludes worker, queue, reducer, auxiliary-task,
- * and Product-KD implementation details.
+ * Solver-facing lifecycle for the fixed parallel worker pool.
+ * Queue, reducer, and inner-task details remain private.
  */
-anbool index_shard_pthread_enabled(void);
+anbool index_shard_pthread_enabled(const onefield_t *bp);
 
 int index_shard_pool_start(onefield_t *bp, solver_t *sp);
 void index_shard_pool_stop(onefield_t *bp);

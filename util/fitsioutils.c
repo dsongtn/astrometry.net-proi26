@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <assert.h>
 #include <math.h>
+#include <pthread.h>
 
 #include "qfits_convert.h"
 #include "qfits_error.h"
@@ -387,7 +388,7 @@ void fits_header_addf_longstring(qfits_header* hdr, const char* key,
     va_list lst;
     int i;
     int commentlen;
-    
+
     va_start(lst, format);
     nb = vasprintf(&str, format, lst);
     va_end(lst);
@@ -466,7 +467,7 @@ void fits_header_addf_longstring(qfits_header* hdr, const char* key,
                 linebuf++;
             }
             *linebuf = '\0';
-            
+
             qfits_header_add(hdr, key, line, comment, NULL);
             comment = "";
             commentlen = 0;
@@ -728,7 +729,7 @@ static int add_long_line(qfits_header* hdr, const char* keyword, const char* ind
     return 0;
 }
 
-static int 
+static int
 ATTRIB_FORMAT(printf,4,5)
     add_long_line_b(qfits_header* hdr, const char* keyword,
                     const char* indent, const char* format, ...) {
@@ -740,7 +741,7 @@ ATTRIB_FORMAT(printf,4,5)
     return rtn;
 }
 
-int 
+int
 fits_add_long_comment(qfits_header* dst, const char* format, ...) {
     va_list lst;
     int rtn;
@@ -750,7 +751,7 @@ fits_add_long_comment(qfits_header* dst, const char* format, ...) {
     return rtn;
 }
 
-int 
+int
 fits_append_long_comment(qfits_header* dst, const char* format, ...) {
     va_list lst;
     int rtn;
@@ -760,7 +761,7 @@ fits_append_long_comment(qfits_header* dst, const char* format, ...) {
     return rtn;
 }
 
-int 
+int
 fits_add_long_history(qfits_header* dst, const char* format, ...) {
     va_list lst;
     int rtn;
@@ -831,7 +832,7 @@ int fits_append_all_headers(const qfits_header* src, qfits_header* dest, char* t
 int fits_pad_file_with(FILE* fid, char pad) {
     off_t offset;
     int npad;
-	
+
     // pad with zeros up to a multiple of 2880 bytes.
     offset = ftello(fid);
     npad = (offset % (off_t)FITS_BLOCK_SIZE);
@@ -1047,15 +1048,26 @@ int fits_blocks_needed(int size) {
 }
 
 static char fits_endian_string[16];
-static int  fits_endian_string_inited = 0;
+static pthread_once_t fits_endian_string_once = PTHREAD_ONCE_INIT;
 
-static void fits_init_endian_string() {
-    if (!fits_endian_string_inited) {
-        uint32_t endian = ENDIAN_DETECTOR;
-        unsigned char* cptr = (unsigned char*)&endian;
-        fits_endian_string_inited = 1;
-        sprintf(fits_endian_string, "%02x:%02x:%02x:%02x", (uint)cptr[0], (uint)cptr[1], (uint)cptr[2], (uint)cptr[3]);
-    }
+static void fits_init_endian_string_once(void) {
+    uint32_t endian = ENDIAN_DETECTOR;
+    unsigned char* cptr = (unsigned char*)&endian;
+
+    sprintf(fits_endian_string,
+            "%02x:%02x:%02x:%02x",
+            (uint)cptr[0],
+            (uint)cptr[1],
+            (uint)cptr[2],
+            (uint)cptr[3]);
+}
+
+static void fits_init_endian_string(void) {
+    int result = pthread_once(&fits_endian_string_once,
+                              fits_init_endian_string_once);
+
+    (void)result;
+    assert(!result);
 }
 
 void fits_fill_endian_string(char* str) {

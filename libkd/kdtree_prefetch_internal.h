@@ -48,6 +48,19 @@ typedef struct kdtree_prefetch_hint {
 #define KDTREE_PREFETCH_ARRAY_MASK(kind) \
     (1U << (unsigned int)(kind))
 
+typedef enum kdtree_prefetch_emit_status {
+    KDTREE_PREFETCH_EMIT_ERROR = -1,
+    KDTREE_PREFETCH_EMIT_CONTINUE = 0,
+    KDTREE_PREFETCH_EMIT_REFUSED = 1
+} kdtree_prefetch_emit_status_t;
+
+typedef enum kdtree_prefetch_prepare_status {
+    KDTREE_PREFETCH_PREPARE_ERROR = -1,
+    KDTREE_PREFETCH_PREPARE_NOT_APPLICABLE = 0,
+    KDTREE_PREFETCH_PREPARE_COMPLETE = 1,
+    KDTREE_PREFETCH_PREPARE_REFUSED = 2
+} kdtree_prefetch_prepare_status_t;
+
 typedef struct kdtree_prefetch_sink {
     void *userdata;
 
@@ -60,13 +73,16 @@ typedef struct kdtree_prefetch_sink {
 } kdtree_prefetch_sink_t;
 
 /*
- * Perform a bounded shallow traversal and emit array-specific hints for the
- * predicted frontier. No query result is produced and no direct I/O advice is
- * issued by libkd.
+ * Mirror the scalar topology traversal and emit complete covering DATA/PERM
+ * hints plus traversal-local metadata hints. No query result is produced,
+ * payload is not dereferenced, and libkd issues no I/O advice.
  *
  * Return:
- *   0  normal completion or prefetch not applicable
- *  -1  invalid arguments
+ *  KDTREE_PREFETCH_PREPARE_COMPLETE when every emitted hint was accepted.
+ *  KDTREE_PREFETCH_PREPARE_NOT_APPLICABLE when preparation is disabled.
+ *  KDTREE_PREFETCH_PREPARE_REFUSED when the sink refuses a hint before full
+ *  traversal completion; previously accepted hints are an incomplete prefix.
+ *  KDTREE_PREFETCH_PREPARE_ERROR for invalid input or traversal failure.
  */
 int kdtree_rangesearch_prefetch_prepare(
     const kdtree_t *kd,

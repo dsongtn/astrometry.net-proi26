@@ -3,39 +3,46 @@
 
 #include <stddef.h>
 
-#include "astrometry/an-bool.h"
-
-typedef struct index_shard_config {
-  anbool pthread_enabled;
-  anbool discovery_frontier_enabled;
-  anbool hypothesis_parallel_enabled;
-  anbool inner_lending_enabled;
-
-  int worker_count;
-
-  /*
-   * The continuation API remains available for exact stepped traversal.
-   * Production one-shot queries use the scalar fast path represented by a
-   * zero node budget until coarse hypothesis tasks activate resumability.
-   */
-  anbool kd_continuation_enabled;
-  size_t kd_continuation_node_budget;
-
-  unsigned long kd_product_interval;
-} index_shard_config_t;
+/*
+ * Public text uses "auto".  Zero is only the internal representation carried
+ * through the AXY job header; zero and negative numeric user input are invalid.
+ */
+#define INDEX_SHARD_WORKERS_AUTO 0
+#define INDEX_SHARD_WORKERS_UNSET (-1)
 
 /*
- * Return the immutable process configuration.
- *
- * ASTROMETRY_INDEX_SHARD_WORKERS is the only environment input. Platform
- * defaults and all internal policies are resolved exactly once.
+ * Return the number of logical CPUs currently available to this process.
+ * Linux process affinity is preferred; portable online-CPU detection is the
+ * fallback.  The function always returns at least one.
  */
-const index_shard_config_t *index_shard_config_get(void);
+int index_shard_config_available_cpus(void);
 
 /*
- * Return the configured worker count capped by the number of candidate
- * indexes in the current pass.
+ * Parse exactly "auto" or a decimal integer in [1, available_cpus].
+ * On success, requested_workers is AUTO or a positive explicit count.
  */
-int index_shard_config_effective_workers(size_t nindexes);
+int index_shard_config_parse_workers(const char *value,
+                                     int available_cpus,
+                                     int *requested_workers);
+
+/*
+ * Validate an internally represented request.  AUTO is valid; UNSET and all
+ * other non-positive values are invalid.
+ */
+int index_shard_config_validate_workers(int requested_workers,
+                                        int available_cpus);
+
+/*
+ * Resolve AUTO to the affinity-visible CPU count.
+ */
+int index_shard_config_resolve_workers(int requested_workers,
+                                       int available_cpus);
+
+/*
+ * Return the configured fixed-pool width. nindexes is retained for source
+ * compatibility with the preceding implementation.
+ */
+int index_shard_config_effective_workers(int configured_workers,
+                                         size_t nindexes);
 
 #endif

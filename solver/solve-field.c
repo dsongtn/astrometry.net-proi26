@@ -39,6 +39,7 @@
 #include "wcs-rd2xy.h"
 #include "new-wcs.h"
 #include "scamp.h"
+#include "tic.h"
 
 static an_option_t options[] = {
     {'h', "help",		   no_argument, NULL,
@@ -1030,6 +1031,10 @@ int main(int argc, char** args) {
         solve_field_args_t thesf;
         solve_field_args_t* sf = &thesf;
         anbool want_pnm = FALSE;
+        double profile_source_seconds = 0.0;
+        double profile_engine_seconds = 0.0;
+        double profile_output_seconds = 0.0;
+        double profile_total_start;
 
         // reset augment-xylist args.
         memcpy(axy, allaxy, sizeof(augment_xylist_t));
@@ -1057,6 +1062,7 @@ int main(int argc, char** args) {
                    f - optind, argc - optind, infile);
         }
         inputnum++;
+        profile_total_start = monotonic_seconds();
 
         cmdline = sl_new(16);
 
@@ -1317,13 +1323,27 @@ int main(int argc, char** args) {
 
         axy->keep_fitsimg = (newfits || scamp);
 
-        if (augment_xylist(axy, me)) {
-            ERROR("augment-xylist failed");
-            exit(-1);
+        {
+            double phase_wall_start = monotonic_seconds();
+
+            if (augment_xylist(axy, me)) {
+                ERROR("augment-xylist failed");
+                exit(-1);
+            }
+
+            profile_source_seconds =
+                monotonic_seconds() - phase_wall_start;
         }
 
-        if (just_augment)
+        if (just_augment) {
+            logverb("[solve-field-profile] source=%.6f engine=0.000000 "
+                    "output=0.000000 total=%.6f just_augment=1 "
+                    "input=\"%s\"\n",
+                    profile_source_seconds,
+                    monotonic_seconds() - profile_total_start,
+                    infile);
             goto nextfile;
+        }
 
         if (makeplots) {
             // Check that the plotting executables were built...
@@ -1354,9 +1374,26 @@ int main(int argc, char** args) {
             axy->wcs_last_mod = 0;
 
         if (!engine_batch) {
+            double phase_wall_start = monotonic_seconds();
+
             run_engine(engineargs);
+            profile_engine_seconds =
+                monotonic_seconds() - phase_wall_start;
+
+            phase_wall_start = monotonic_seconds();
             after_solved(axy, sf, makeplots, me, verbose,
                          axy->tempdir, tempdirs, tempfiles, plotxy, plotscale, bgfn);
+            profile_output_seconds =
+                monotonic_seconds() - phase_wall_start;
+
+            logverb("[solve-field-profile] source=%.6f engine=%.6f "
+                    "output=%.6f total=%.6f just_augment=0 "
+                    "input=\"%s\"\n",
+                    profile_source_seconds,
+                    profile_engine_seconds,
+                    profile_output_seconds,
+                    monotonic_seconds() - profile_total_start,
+                    infile);
         } else {
             bl_append(batchaxy, axy);
             bl_append(batchsf,  sf );
@@ -1422,4 +1459,3 @@ int main(int argc, char** args) {
 
     return 0;
 }
-

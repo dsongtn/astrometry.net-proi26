@@ -43,6 +43,7 @@
 #include "log.h"
 #include "anqfits.h"
 #include "mathutil.h"
+#include "index_shard_config.h"
 
 static void delete_existing_an_headers(qfits_header* hdr);
 
@@ -163,6 +164,8 @@ static an_option_t options[] = {
      "give up solving after the specified aggregate CPU time"},
     {'\x98', "wall-limit",    required_argument, "seconds",
      "give up the solving stage after this elapsed time, independent of worker count"},
+    {'\x99', "p-workers", required_argument, "auto|count",
+     "parallel solver workers; auto uses available CPUs, 1 is serial"},
     {'r', "resort",         no_argument, NULL,
      "sort the star brightnesses by background-subtracted flux; the default is to sort using a"
      "compromise between background-subtracted and non-background-subtracted flux"},
@@ -246,7 +249,7 @@ static an_option_t options[] = {
     {'F', "fields",         required_argument, NULL, NULL},
     {'w', "width",                 required_argument, "pixels",
      "specify the field width"},
-    {'e', "height",                required_argument, "pixels", 
+    {'e', "height",                required_argument, "pixels",
      "specify the field height"},
     {'X', "x-column",       required_argument, "column-name",
      "the FITS column containing the X coordinate of the sources"},
@@ -325,6 +328,25 @@ int augment_xylist_parse_option(char argchar, char* optarg,
             ERROR("wall limit must be a finite, non-negative number of seconds: \"%s\"",
                   optarg ? optarg : "(null)");
             return -1;
+        }
+        break;
+    case '\x99':
+        {
+            int available_cpus = index_shard_config_available_cpus();
+            int requested_workers;
+
+            if (index_shard_config_parse_workers(optarg,
+                                                 available_cpus,
+                                                 &requested_workers)) {
+                ERROR("Invalid --p-workers value \"%s\": "
+                      "expected \"auto\" or an integer from 1 through %i",
+                      optarg ? optarg : "(null)",
+                      available_cpus);
+                return -1;
+            }
+
+            axy->index_shard_workers = requested_workers;
+            axy->index_shard_workers_set = TRUE;
         }
         break;
     case ';':
@@ -464,7 +486,7 @@ int augment_xylist_parse_option(char argchar, char* optarg,
         break;
     case 'V':
         sl_append(axy->verifywcs, optarg);
-        il_append(axy->verifywcs_ext, 
+        il_append(axy->verifywcs_ext,
                   (verify_extension >= 0 ? verify_extension : axy->extension));
         break;
     case 'I':
@@ -846,7 +868,7 @@ int augment_xylist(augment_xylist_t* axy,
         } else {
             fitsimgfn = create_temp_file("fits", axy->tempdir);
             sl_append_nocopy(tempfiles, fitsimgfn);
-            
+
             if (pnmtype == 'P') {
                 logverb("Converting PPM image to FITS...\n");
 
@@ -1220,6 +1242,10 @@ int augment_xylist(augment_xylist_t* axy,
         fits_header_add_double(hdr, "ANTLIM", axy->wall_limit,
                                "Elapsed solving-stage limit (seconds)");
     }
+    if (axy->index_shard_workers_set) {
+        fits_header_add_int(hdr, "ANSHWRK", axy->index_shard_workers,
+                            "Parallel workers; 0 means automatic");
+    }
 
     if (axy->xcol)
         qfits_header_add(hdr, "ANXCOL", axy->xcol, "Name of column containing X coords", NULL);
@@ -1501,6 +1527,7 @@ static void delete_existing_an_headers(qfits_header* hdr) {
     qfits_header_del(hdr, "ANRUN");
     qfits_header_del(hdr, "ANCLIM");
     qfits_header_del(hdr, "ANTLIM");
+    qfits_header_del(hdr, "ANSHWRK");
     qfits_header_del(hdr, "ANXCOL");
     qfits_header_del(hdr, "ANYCOL");
     qfits_header_del(hdr, "ANTAGALL");
@@ -1638,4 +1665,3 @@ static int parse_fields_string(il* fields, const char* str) {
     }
     return 0;
 }
-

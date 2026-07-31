@@ -6,6 +6,8 @@
 #ifndef SOLVER_H
 #define SOLVER_H
 
+#include <stddef.h>
+
 #include <time.h>
 
 #include "astrometry/starutil.h"
@@ -37,6 +39,112 @@ enum {
 #define DEFAULT_BAIL_THRESHOLD 1e-100
 
 struct verify_field_t;
+struct solver_field_geometry;
+typedef struct solver_field_geometry solver_field_geometry_t;
+
+/*
+ * Aggregate profiling for one solver_run() invocation.
+ *
+ * Count fields remain stable for benchmark compatibility. Hot-path wall
+ * timers are enabled only at LOG_ALL (two -v flags) so primary latency
+ * measurements can run without a clock call around every CodeKD query.
+ */
+typedef struct solver_profile {
+    anbool detailed;
+    anbool execution_failed;
+
+    double solver_run_wall_seconds;
+    double codekd_wall_seconds;
+    double resolve_wall_seconds;
+    double verify_wall_seconds;
+    double verification_score_wall_seconds;
+
+    unsigned long long codekd_calls;
+    unsigned long long codekd_hits;
+    unsigned long long resolve_calls;
+    unsigned long long verify_calls;
+    unsigned long long hypothesis_batches;
+    unsigned long long hypothesis_batches_completed;
+    unsigned long long hypothesis_batches_stopped;
+    unsigned long long hypothesis_batches_failed;
+    unsigned long long hypotheses_generated;
+    unsigned long long hypotheses_executed;
+    unsigned long long hypotheses_reduced;
+    unsigned long long task_ranges_planned;
+    unsigned long long task_ranges_executed;
+    unsigned long long task_ranges_submitted;
+    unsigned long long task_ranges_inline;
+    unsigned long long parallel_batches;
+    unsigned long long parallel_batches_observed;
+    unsigned long long parallel_hypotheses;
+    unsigned long long allocation_failures;
+    unsigned long long search_failures;
+    unsigned long long ab_helper_tasks;
+    unsigned long long ab_helper_combinations;
+    unsigned long long page_plan_descriptors_total;
+    unsigned long long page_plan_descriptors_complete;
+    unsigned long long page_plan_descriptor_splits;
+    unsigned long long page_plan_raw_ranges;
+    unsigned long long page_plan_unique_pages;
+    unsigned long long page_plan_ranges_after_dedup;
+    unsigned long long page_plan_logical_bytes;
+    unsigned long long page_plan_aligned_bytes;
+    unsigned long long page_plan_overread_bytes;
+    unsigned long long page_plan_not_applicable;
+    unsigned long long page_plan_allocation_refused;
+    unsigned long long page_plan_source_mismatch;
+    unsigned long long page_plan_invalid_range;
+    unsigned long long page_plan_byte_budget_refused;
+    unsigned long long page_plan_range_capacity_refused;
+    unsigned long long page_plan_service_refused;
+    unsigned long long page_plan_service_errors;
+    unsigned long long page_plan_cancelled;
+    unsigned long long candidate_delivery_candidates;
+    unsigned long long candidate_quad_submitted;
+    unsigned long long candidate_quad_ready;
+    unsigned long long candidate_quad_fallback;
+    unsigned long long candidate_star_submitted;
+    unsigned long long candidate_star_ready;
+    unsigned long long candidate_star_fallback;
+    unsigned long long candidate_delivery_windows;
+    unsigned long long candidate_quad_ready_rows;
+    unsigned long long candidate_star_ready_rows;
+    unsigned long long candidate_retired_rows;
+    unsigned long long candidate_native_rows;
+    unsigned long long verification_page_queries;
+    unsigned long long verification_page_queries_planned;
+    unsigned long long verification_page_prefixes;
+    unsigned long long verification_page_submitted;
+    unsigned long long verification_page_ready;
+    unsigned long long verification_page_fallback;
+    unsigned long long verification_page_ready_rows;
+    unsigned long long verification_page_ranges;
+    unsigned long long verification_page_logical_bytes;
+    unsigned long long verification_page_aligned_bytes;
+    unsigned long long candidate_math_prepared;
+    unsigned long long candidate_math_reused;
+    unsigned long long verification_score_batches_prepared;
+    unsigned long long verification_score_contexts_prepared;
+    unsigned long long verification_score_batches_executed;
+    unsigned long long verification_score_contexts_completed;
+    unsigned long long verification_score_work_units_completed;
+    unsigned long long verification_score_fallback_batches;
+    unsigned long long verification_score_stopped_batches;
+    unsigned long long staged_owner_claims;
+    unsigned long long staged_foreign_claims;
+    unsigned long long staged_io_submitted;
+    unsigned long long staged_io_completed;
+    unsigned long long hypothesis_order_hash;
+    unsigned long long kd_result_order_hash;
+    unsigned long long candidate_order_hash;
+
+    size_t max_batch_hypotheses;
+    size_t max_task_ranges;
+    size_t max_parallel_ranges;
+    size_t max_staged_io_submitted;
+    size_t max_staged_compute_ready;
+} solver_profile_t;
+
 struct solver_t {
 
     // FIELDS REQUIRED FROM THE CALLER BEFORE CALLING SOLVER_RUN
@@ -211,13 +319,28 @@ struct solver_t {
     // Cached data about this field, for verify_hit().
     verify_field_t* vf;
 
-        /*
+    /*
+     * Optional immutable AB-pair geometry prepared once for an index-shard
+     * pass. Worker solvers borrow this object; the pass-owner solver releases
+     * it with the rest of the field state.
+     */
+    solver_field_geometry_t* field_geometry;
+    anbool field_geometry_owned;
+
+    /*
      * Persists across consecutive index-shard passes for one field.
      * Reset whenever solver_set_field() installs a new field.
      */
     fitsbin_mmap_advice_state_t index_mmap_policy;
+
+    /* Output from the most recent solver_run() invocation. */
+    solver_profile_t profile;
 };
 typedef struct solver_t solver_t;
+
+/* Add one completed invocation profile into an aggregate profile. */
+void solver_profile_accumulate(solver_profile_t* total,
+                               const solver_profile_t* profile);
 
 solver_t* solver_new();
 
@@ -386,7 +509,8 @@ index_t* solver_get_index(const solver_t* solver, int i);
 
 void solver_verify_sip_wcs(solver_t* solver, sip_t* sip); //, MatchObj* mo);
 
-void solver_run(solver_t* solver);
+/* Returns zero for a complete search and nonzero for an execution failure. */
+int solver_run(solver_t* solver);
 
 #define SOLVER_TWEAK2_AVAILABLE 1
 void solver_tweak2(solver_t* solver, MatchObj* mo, int order, sip_t* verifysip);
@@ -396,6 +520,22 @@ void solver_cleanup(solver_t* solver);
 // Call this before solver_inject_match(), solver_verify_sip_wcs() or solver_run().
 // (or it will get called automatically)
 void solver_preprocess_field(solver_t* sp);
+
+/*
+ * Prepare a bounded immutable AB-pair geometry cache for the current field
+ * view and exclusive upper frontier. Returns TRUE when a cache is available.
+ * Allocation or budget refusal is an optimization fallback, not a solver
+ * failure.
+ */
+anbool solver_prepare_field_geometry(solver_t* sp);
+
+/*
+ * Release retained geometry when the current field view or upper frontier no
+ * longer matches it. Borrowers only detach their pointer; the owning solver
+ * performs the actual release.
+ */
+void solver_release_incompatible_field_geometry(solver_t* sp);
+
 // Call this after solver_inject_match() or solver_run().
 // (or it will get called when you solver_free())
 void solver_free_field(solver_t* sp);

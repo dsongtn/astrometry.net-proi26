@@ -35,6 +35,7 @@ typedef struct {
 
 quadfile_t* quadfile_open(const char* fname);
 quadfile_t* quadfile_open_fits(anqfits_t* fits);
+quadfile_t* quadfile_open_fits_metadata(anqfits_t* fits);
 
 char* quadfile_get_filename(const quadfile_t* qf);
 
@@ -57,10 +58,38 @@ int quadfile_check(const quadfile_t* qf);
 int quadfile_get_stars(const quadfile_t* qf, unsigned int quadid,
                        unsigned int* stars);
 
-// Schedules the mapped rows for a bounded group of upcoming quad lookups.
+// Compatibility advisory wrapper. Returns zero unless validation or delivery
+// fails. The subsequent mapped lookup remains authoritative.
 int quadfile_prefetch_stars(const quadfile_t* qf,
                             const unsigned int* quadids,
                             int nquads);
+
+// Strict internal preparation contract: positive means every requested row is
+// ready, zero means inapplicable, and -1 means complete preparation failed.
+int quadfile_prepare_stars(const quadfile_t* qf,
+                           const unsigned int* quadids,
+                           int nquads);
+
+/*
+ * Submit a complete bounded set of Quad rows to the payload loader. The
+ * returned ticket must be waited or cancelled before the quadfile is closed.
+ * Refusal returns zero and leaves the original mapped lookup authoritative.
+ */
+int quadfile_prefetch_stars_submit(
+    const quadfile_t* qf,
+    const unsigned int* quadids,
+    int nquads,
+    fitsbin_payload_io_ticket_t** ticket);
+
+/*
+ * Advise the mapped pages containing the selected Quad rows. This does not
+ * read the rows and never uses the compatibility payload descriptor. It
+ * returns the number of advised spans, zero when inapplicable, or -1 on
+ * invalid input or advice failure.
+ */
+int quadfile_advise_rows(const quadfile_t* qf,
+                         const unsigned int* quadids,
+                         int nquads);
 
 int quadfile_write_quad(quadfile_t* qf, unsigned int* stars);
 

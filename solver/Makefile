@@ -59,8 +59,6 @@ CFLAGS += $(ANFILES_INC)
 CFLAGS += -I$(ANUTILS_DIR)
 # wcs-resample.h
 CFLAGS += -I.
-# private Product-KD/executor interfaces
-CFLAGS += -I$(BASEDIR)/libkd
 CFLAGS += $(CFITS_INC)
 
 SHAREDLIBFLAGS := $(SHAREDLIBFLAGS_DEF)
@@ -134,10 +132,186 @@ ENGINE_OBJS += $(BUILD_INDEX_OBJS)
 
 #augment-xylist.o
 
+AB_STREAM_TEST_LIB := libastrometry-ab-stream-test.a
+AB_PHASE_TEST_HEADERS := index_shard_internal.h index_shard_config.h \
+	../include/astrometry/index_shard.h \
+	../include/astrometry/onefield.h \
+	../include/astrometry/solver.h \
+	../include/astrometry/fitsbin.h
+CORE_STATE_HEADERS := engine_internal.h index_shard_internal.h \
+	index_shard_config.h ../include/astrometry/index_shard.h \
+	../include/astrometry/onefield.h ../include/astrometry/solver.h \
+	../include/astrometry/fitsbin.h ../include/astrometry/starkd.h
+AB_PHASE_BASE_OBJS := $(filter-out \
+	solver.o onefield.o index_shard.o index_shard_config.o,$(ENGINE_OBJS))
+AB_STREAM_TEST_OBJS := $(AB_PHASE_BASE_OBJS) \
+	solver_ab_stream_test.o onefield_ab_stream_test.o \
+	index_shard_ab_stream_test.o index_shard_config.o
+AB_STREAM_ASAN_LIB := libastrometry-ab-stream-asan.a
+AB_STREAM_ASAN_OBJS := $(AB_PHASE_BASE_OBJS) \
+	solver_ab_stream_asan.o onefield_ab_stream_asan.o \
+	index_shard_ab_stream_asan.o index_shard_config_ab_stream_asan.o \
+	starkd_ab_stream_asan.o fitsbin_ab_stream_asan.o
+AB_STREAM_SANITIZER_FLAGS := -O1 -fno-omit-frame-pointer \
+	-fsanitize=address,undefined
+AB_STREAM_TSAN_LIB := libastrometry-ab-stream-tsan.a
+AB_STREAM_TSAN_OBJS := $(AB_PHASE_BASE_OBJS) \
+	solver_ab_stream_tsan.o onefield_ab_stream_tsan.o \
+	index_shard_ab_stream_tsan.o index_shard_config_ab_stream_tsan.o \
+	starkd_ab_stream_tsan.o fitsbin_ab_stream_tsan.o
+AB_STREAM_TSAN_FLAGS := -O1 -fno-omit-frame-pointer -fsanitize=thread
+AB_ALLOCFAIL_TEST_LIB := libastrometry-ab-allocfail-test.a
+AB_ALLOCFAIL_TEST_OBJS := $(AB_PHASE_BASE_OBJS) \
+	solver_ab_allocfail_test.o onefield_ab_stream_test.o \
+	index_shard_ab_stream_test.o index_shard_config.o
+AB_ALLOCFAIL_ASAN_LIB := libastrometry-ab-allocfail-asan.a
+AB_ALLOCFAIL_ASAN_OBJS := $(AB_PHASE_BASE_OBJS) \
+	solver_ab_allocfail_asan.o onefield_ab_stream_asan.o \
+	index_shard_ab_stream_asan.o index_shard_config_ab_stream_asan.o \
+	starkd_ab_stream_asan.o fitsbin_ab_stream_asan.o
+AB_ALLOCFAIL_TSAN_LIB := libastrometry-ab-allocfail-tsan.a
+AB_ALLOCFAIL_TSAN_OBJS := $(AB_PHASE_BASE_OBJS) \
+	solver_ab_allocfail_tsan.o onefield_ab_stream_tsan.o \
+	index_shard_ab_stream_tsan.o index_shard_config_ab_stream_tsan.o \
+	starkd_ab_stream_tsan.o fitsbin_ab_stream_tsan.o
+AB_NO_GEOMETRY_LIB := libastrometry-ab-no-geometry.a
+AB_NO_GEOMETRY_OBJS := \
+	$(filter-out solver.o index_shard.o,$(ENGINE_OBJS)) \
+	solver_ab_no_geometry.o index_shard_ab_no_geometry.o
+
 $(ENGINE_LIB): $(ENGINE_OBJS)
 	-rm -f $@
 	$(AR) rc $@ $(ENGINE_OBJS)
 	$(RANLIB) $@
+
+$(AB_STREAM_TEST_LIB): $(AB_STREAM_TEST_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(AB_STREAM_TEST_OBJS)
+	$(RANLIB) $@
+
+$(AB_STREAM_ASAN_LIB): $(AB_STREAM_ASAN_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(AB_STREAM_ASAN_OBJS)
+	$(RANLIB) $@
+
+$(AB_STREAM_TSAN_LIB): $(AB_STREAM_TSAN_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(AB_STREAM_TSAN_OBJS)
+	$(RANLIB) $@
+
+$(AB_ALLOCFAIL_TEST_LIB): $(AB_ALLOCFAIL_TEST_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(AB_ALLOCFAIL_TEST_OBJS)
+	$(RANLIB) $@
+
+$(AB_ALLOCFAIL_ASAN_LIB): $(AB_ALLOCFAIL_ASAN_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(AB_ALLOCFAIL_ASAN_OBJS)
+	$(RANLIB) $@
+
+$(AB_ALLOCFAIL_TSAN_LIB): $(AB_ALLOCFAIL_TSAN_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(AB_ALLOCFAIL_TSAN_OBJS)
+	$(RANLIB) $@
+
+$(AB_NO_GEOMETRY_LIB): $(AB_NO_GEOMETRY_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(AB_NO_GEOMETRY_OBJS)
+	$(RANLIB) $@
+
+solver_ab_stream_test.o: solver.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-DSOLVER_AB_CANDIDATE_LIMIT_BYTES=512U \
+		-o $@ -c $<
+
+onefield_ab_stream_test.o: onefield.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -o $@ -c $<
+
+index_shard_ab_stream_test.o: index_shard.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-o $@ -c $<
+
+solver_ab_stream_asan.o: solver.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_SANITIZER_FLAGS) \
+		-DSOLVER_AB_CANDIDATE_LIMIT_BYTES=512U \
+		-o $@ -c $<
+
+onefield_ab_stream_asan.o: onefield.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_SANITIZER_FLAGS) -o $@ -c $<
+
+index_shard_ab_stream_asan.o: index_shard.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_SANITIZER_FLAGS) \
+		-o $@ -c $<
+
+index_shard_config_ab_stream_asan.o: index_shard_config.c \
+		$(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_SANITIZER_FLAGS) -o $@ -c $<
+
+starkd_ab_stream_asan.o: ../util/starkd.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_SANITIZER_FLAGS) -o $@ -c $<
+
+fitsbin_ab_stream_asan.o: ../util/fitsbin.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_SANITIZER_FLAGS) -o $@ -c $<
+
+solver_ab_stream_tsan.o: solver.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_TSAN_FLAGS) \
+		-DSOLVER_AB_CANDIDATE_LIMIT_BYTES=512U \
+		-o $@ -c $<
+
+onefield_ab_stream_tsan.o: onefield.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_TSAN_FLAGS) -o $@ -c $<
+
+index_shard_ab_stream_tsan.o: index_shard.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_TSAN_FLAGS) \
+		-o $@ -c $<
+
+index_shard_config_ab_stream_tsan.o: index_shard_config.c \
+		$(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_TSAN_FLAGS) -o $@ -c $<
+
+starkd_ab_stream_tsan.o: ../util/starkd.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_TSAN_FLAGS) -o $@ -c $<
+
+fitsbin_ab_stream_tsan.o: ../util/fitsbin.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_TSAN_FLAGS) -o $@ -c $<
+
+solver_ab_allocfail_test.o: solver.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-DSOLVER_AB_CANDIDATE_LIMIT_BYTES=512U \
+		-o $@ -c $<
+
+solver_ab_allocfail_asan.o: solver.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_SANITIZER_FLAGS) \
+		-DSOLVER_AB_CANDIDATE_LIMIT_BYTES=512U \
+		-o $@ -c $<
+
+solver_ab_allocfail_tsan.o: solver.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_TSAN_FLAGS) \
+		-DSOLVER_AB_CANDIDATE_LIMIT_BYTES=512U \
+		-o $@ -c $<
+
+solver_ab_no_geometry.o: solver.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-DSOLVER_FIELD_GEOMETRY_BUDGET_BYTES=1ULL \
+		-o $@ -c $<
+
+index_shard_ab_no_geometry.o: index_shard.c $(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-o $@ -c $<
 
 $(ENGINE_SO): $(ENGINE_OBJS) $(SLIB)
 	$(CC) $(LDFLAGS) $(SHAREDLIBFLAGS) -o $@ $^ $(LDLIBS)
@@ -242,9 +416,81 @@ install-cfitsutils: $(CFITS_UTILS)
 
 test-solver: test-solver.o solver_test.o $(SLIB)
 test-solver-2: test-solver-2.o solver_test_2.o $(SLIB)
+test-engine-passes: test-engine-passes.o $(SLIB)
+test-index-shard-config: test-index-shard-config.o index_shard_config.o
+test-index-shard-staged: test-index-shard-staged.o \
+		index_shard_staged_test.o $(SLIB)
+test-ab-block-integration: test-ab-block-integration.o $(SLIB)
+test-ab-stream-integration: test-ab-block-integration.o \
+		$(AB_STREAM_TEST_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+test-ab-stream-asan: test_ab_integration_asan.o \
+		$(AB_STREAM_ASAN_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) $(AB_STREAM_SANITIZER_FLAGS) \
+		-Wl,-Map,$@.map \
+		-o $@ $^ $(LDLIBS)
+test-ab-stream-tsan: test_ab_integration_tsan.o \
+		$(AB_STREAM_TSAN_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) $(AB_STREAM_TSAN_FLAGS) \
+		-Wl,-Map,$@.map \
+		-o $@ $^ $(LDLIBS)
+test-ab-allocfail-integration: test-ab-block-integration.o \
+		$(AB_ALLOCFAIL_TEST_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+test-ab-allocfail-asan: test_ab_integration_asan.o \
+		$(AB_ALLOCFAIL_ASAN_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) $(AB_STREAM_SANITIZER_FLAGS) \
+		-Wl,-Map,$@.map \
+		-o $@ $^ $(LDLIBS)
+test-ab-allocfail-tsan: test_ab_integration_tsan.o \
+		$(AB_ALLOCFAIL_TSAN_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) $(AB_STREAM_TSAN_FLAGS) \
+		-Wl,-Map,$@.map \
+		-o $@ $^ $(LDLIBS)
+test-ab-no-geometry-integration: test-ab-block-integration.o \
+		$(AB_NO_GEOMETRY_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-NODEP_OBJS += solver_test.o solver_test_2.o
-ALL_OBJ += test-solver.o test-solver-2.o
+test_ab_integration_asan.o: test-ab-block-integration.c \
+		$(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_SANITIZER_FLAGS) -o $@ -c $<
+
+test_ab_integration_tsan.o: test-ab-block-integration.c \
+		$(AB_PHASE_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		$(AB_STREAM_TSAN_FLAGS) -o $@ -c $<
+
+NODEP_OBJS += solver_test.o solver_test_2.o \
+	solver_ab_stream_test.o onefield_ab_stream_test.o \
+	index_shard_ab_stream_test.o solver_ab_stream_asan.o \
+	onefield_ab_stream_asan.o index_shard_ab_stream_asan.o \
+	index_shard_config_ab_stream_asan.o \
+	starkd_ab_stream_asan.o fitsbin_ab_stream_asan.o \
+	solver_ab_stream_tsan.o onefield_ab_stream_tsan.o \
+	index_shard_ab_stream_tsan.o index_shard_config_ab_stream_tsan.o \
+	starkd_ab_stream_tsan.o \
+	fitsbin_ab_stream_tsan.o solver_ab_no_geometry.o \
+	index_shard_ab_no_geometry.o \
+	solver_ab_allocfail_test.o solver_ab_allocfail_asan.o \
+	solver_ab_allocfail_tsan.o \
+	test_ab_integration_asan.o test_ab_integration_tsan.o \
+	index_shard_staged_test.o
+ALL_OBJ += test-solver.o test-solver-2.o test-engine-passes.o \
+	test-index-shard-config.o test-index-shard-staged.o \
+	test-ab-block-integration.o
+ALL_EXECS += test-index-shard-config test-ab-block-integration \
+	test-index-shard-staged test-engine-passes \
+	test-ab-stream-integration test-ab-stream-asan test-ab-stream-tsan \
+	test-ab-allocfail-integration test-ab-allocfail-asan \
+	test-ab-allocfail-tsan \
+	test-ab-no-geometry-integration
+GENERATED_FILES += $(AB_STREAM_TEST_LIB) $(AB_STREAM_ASAN_LIB) \
+	$(AB_STREAM_TSAN_LIB) $(AB_ALLOCFAIL_TEST_LIB) \
+	$(AB_ALLOCFAIL_ASAN_LIB) $(AB_ALLOCFAIL_TSAN_LIB) \
+	$(AB_NO_GEOMETRY_LIB) test-ab-stream-asan.map \
+	test-ab-stream-tsan.map test-ab-allocfail-asan.map \
+	test-ab-allocfail-tsan.map
 
 CFLAGS_DEBUG = $(subst -DNDEBUG,,$(CFLAGS))
 
@@ -252,12 +498,18 @@ test-solver.o: test-solver.c
 	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -o $@ -c $<
 test-solver-2.o: test-solver-2.c
 	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -o $@ -c $<
+test-engine-passes.o: test-engine-passes.c engine_internal.h
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -o $@ -c $<
+index_shard_staged_test.o: index_shard.c $(CORE_STATE_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-DTESTING_INDEX_SHARD_STAGED=1 -o $@ -c $<
 
 solver_test.o: solver.c
 	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -DTESTING=1 -DTESTING_TRYALLCODES=1 -o $@ -c $<
 solver_test_2.o: solver.c
 	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -DTESTING=1 -DTESTING_TRYPERMUTATIONS=1 -o $@ -c $<
 
+engine.o onefield.o index_shard.o solver.o: $(CORE_STATE_HEADERS)
 
 #######################################
 
@@ -278,7 +530,9 @@ ALL_TEST_LIBS := $(SLIB)
 # Add the dependencies here...
 #test_multiindex2: test_multiindex2.o $(SLIB)
 
-tests: $(ALL_TEST_FILES)
+tests: $(ALL_TEST_FILES) test-index-shard-config \
+	test-index-shard-staged \
+	test-engine-passes test-ab-block-integration
 .PHONY: tests
 
 include $(COMMON)/makefile.tests
@@ -306,7 +560,7 @@ control-program-2: control-program.o $(SLIB)
 		engine.o codetree.o codefile.o onefield.o solverutils.o quad-utils.o image2xy-files.o solvedfile.o solver.o tweak2.o verify.o \
 		$(addprefix ../qfits-an/,anqfits.o qfits_tools.o qfits_table.o qfits_float.o qfits_error.o qfits_time.o qfits_card.o qfits_header.o qfits_rw.o qfits_memory.o qfits_convert.o qfits_byteswap.o) \
 		$(addprefix ../libkd/,kdtree.o kdtree_dim.o kdtree_fits_io.o kdint_ddd.o kdint_dds.o kdint_ddu.o kdint_dss.o kdint_duu.o kdint_fff.o kdint_lll.o) \
-		$(addprefix ../util/,index.o indexset.o multiindex.o codekd.o quadfile.o matchfile.o matchobj.o rdlist.o starkd.o starxy.o scamp-catalog.o healpix.o fitsbin.o fitsfile.o fitstable.o image2xy.o dsmooth.o dallpeaks.o dcen3x3.o dfind.o dobjects.o dmedsmooth.o dpeaks.o dsigma.o simplexy.o resample.o ctmf.o dselip.o permutedsort.o sip.o sip_qfits.o sip-utils.o fit-wcs.o gslutils.o starutil.o xylist.o fitsioutils.o datalog.o fileutils.o ioutils.o mathutil.o bl.o bl-sort.o tic.o log.o errors.o an-endian.o) \
+		$(addprefix ../util/,index.o index_residency.o indexset.o multiindex.o codekd.o quadfile.o matchfile.o matchobj.o rdlist.o starkd.o starxy.o scamp-catalog.o healpix.o fitsbin.o fitsfile.o fitstable.o image2xy.o dsmooth.o dallpeaks.o dcen3x3.o dfind.o dobjects.o dmedsmooth.o dpeaks.o dsigma.o simplexy.o resample.o ctmf.o dselip.o permutedsort.o sip.o sip_qfits.o sip-utils.o fit-wcs.o gslutils.o starutil.o xylist.o fitsioutils.o datalog.o fileutils.o ioutils.o mathutil.o bl.o bl-sort.o tic.o log.o errors.o an-endian.o) \
 		$(CFITS_LIB) $(LDLIBS)
 
 whynot: whynot.o $(PLOTSTUFF) $(CAIRO_SLIB) $(SLIB)

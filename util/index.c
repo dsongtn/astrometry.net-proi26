@@ -14,9 +14,153 @@
 #include "qfits_rw.h"
 #include "starutil.h"
 
+#include <pthread.h>
+
+static index_residency_t* active_index_residency = NULL;
+static size_t active_index_residency_readers = 0U;
+static pthread_mutex_t active_index_residency_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t active_index_residency_cond =
+    PTHREAD_COND_INITIALIZER;
+
+int index_bind_residency_service(index_residency_t* service) {
+    int status = 0;
+
+    if (!service) {
+        return -1;
+    }
+    pthread_mutex_lock(&active_index_residency_mutex);
+    if (active_index_residency) {
+        status = -1;
+    } else {
+        active_index_residency = service;
+    }
+    pthread_mutex_unlock(&active_index_residency_mutex);
+    return status;
+}
+
+void index_unbind_residency_service(index_residency_t* service) {
+    pthread_mutex_lock(&active_index_residency_mutex);
+    if (active_index_residency == service) {
+        active_index_residency = NULL;
+    }
+    while (active_index_residency_readers) {
+        pthread_cond_wait(
+            &active_index_residency_cond,
+            &active_index_residency_mutex);
+    }
+    pthread_mutex_unlock(&active_index_residency_mutex);
+}
+
+anbool index_residency_service_active(void) {
+    anbool active;
+
+    pthread_mutex_lock(&active_index_residency_mutex);
+    active = active_index_residency != NULL;
+    pthread_mutex_unlock(&active_index_residency_mutex);
+    return active;
+}
+
+static index_residency_t* index_borrow_residency_service(void) {
+    index_residency_t* service;
+
+    pthread_mutex_lock(&active_index_residency_mutex);
+    service = active_index_residency;
+    if (service) {
+        active_index_residency_readers++;
+    }
+    pthread_mutex_unlock(&active_index_residency_mutex);
+    return service;
+}
+
+static void index_return_residency_service(
+    index_residency_t* service) {
+    if (!service) {
+        return;
+    }
+    pthread_mutex_lock(&active_index_residency_mutex);
+    if (active_index_residency_readers) {
+        active_index_residency_readers--;
+    }
+    if (!active_index_residency_readers) {
+        pthread_cond_broadcast(
+            &active_index_residency_cond);
+    }
+    pthread_mutex_unlock(&active_index_residency_mutex);
+}
+
+static anbool index_try_resident_open(index_t* index) {
+    index_residency_t* service;
+    index_residency_handle_t* handle = NULL;
+    index_residency_result_t result;
+    const char* backing_path;
+    anqfits_t* resident_fits;
+
+    if (!index || !index->indexfn ||
+        index->residency || index->residency_source) {
+        return FALSE;
+    }
+    service = index_borrow_residency_service();
+    if (!service) {
+        return FALSE;
+    }
+    result = index_residency_acquire(
+        service,
+        index->indexfn,
+        &handle);
+    index_return_residency_service(service);
+    if (result == INDEX_RESIDENCY_SOURCE_LEASE &&
+        handle) {
+        index->residency_source = handle;
+        return FALSE;
+    }
+    if (result != INDEX_RESIDENCY_ACCEPTED || !handle) {
+        index_residency_release(handle);
+        return FALSE;
+    }
+    backing_path = index_residency_handle_path(handle);
+    resident_fits = backing_path ? anqfits_open(backing_path) : NULL;
+    if (!resident_fits) {
+        index_residency_release(handle);
+        return FALSE;
+    }
+    if (index->fits) {
+        anqfits_close(index->fits);
+    }
+    index->fits = resident_fits;
+    index->residency = handle;
+    return TRUE;
+}
+
+int index_get_source_file_stat(
+    const index_t* index,
+    struct stat* identity) {
+    const struct stat* resident_identity;
+
+    if (!index || !identity) {
+        return -1;
+    }
+    if (index->residency) {
+        resident_identity =
+            index_residency_handle_source_stat(index->residency);
+        if (!resident_identity) {
+            return -1;
+        }
+        *identity = *resident_identity;
+        return 0;
+    }
+    if (index->quads && index->quads->fb &&
+        !fitsbin_get_open_file_stat(
+            index->quads->fb,
+            identity)) {
+        return 0;
+    }
+    return index->indexfn ? stat(index->indexfn, identity) : -1;
+}
+
 anbool index_overlaps_scale_range(index_t* meta,
                                   double quadlo, double quadhi) {
-    anbool rtn = 
+    anbool rtn =
         !((quadlo > meta->index_scale_upper) ||
           (quadhi < meta->index_scale_lower));
     debug("index_overlaps_scale_range: index %s has quads [%g, %g] arcsec; image has quads [%g, %g] arcsec.  In range? %s\n",
@@ -254,6 +398,74 @@ static void set_meta(index_t* index) {
     index->meanx_less_than_half = qfits_header_getboolean(index->codekd->header, "CXDXLT1", FALSE);
 }
 
+static int index_reload_internal(index_t* index, anbool metadata_only) {
+    anbool full_resident = index && index->residency;
+
+    if (full_resident)
+        fitsbin_payload_set_thread_full_resident();
+    // Read .skdt file...
+    if (!index->starkd) {
+        if (metadata_only) {
+            index->starkd = startree_open_fits_metadata(index->fits);
+        } else {
+            index->starkd = startree_open_fits(index->fits);
+        }
+        if (!index->starkd) {
+            ERROR("Failed to read star kdtree from file %s", index->indexfn);
+            goto bailout;
+        }
+    }
+
+    // Read .quad file...
+    if (!index->quads) {
+        if (metadata_only) {
+            index->quads = quadfile_open_fits_metadata(index->fits);
+        } else {
+            index->quads = quadfile_open_fits(index->fits);
+        }
+        if (!index->quads) {
+            ERROR("Failed to read quads from %s", index->indexfn);
+            goto bailout;
+        }
+    }
+
+    // Read .ckdt file...
+    if (!index->codekd) {
+        if (metadata_only) {
+            index->codekd = codetree_open_fits_metadata(index->fits);
+        } else {
+            index->codekd = codetree_open_fits(index->fits);
+        }
+        if (!index->codekd) {
+            ERROR("Failed to read code kdtree from file %s", index->indexfn);
+            goto bailout;
+        }
+    }
+    if (full_resident)
+        fitsbin_payload_clear_thread_full_resident();
+    return 0;
+
+ bailout:
+    if (full_resident)
+        fitsbin_payload_clear_thread_full_resident();
+    return -1;
+}
+
+static int index_reopen_original_backing(index_t* index) {
+    if (!index || !index->residency || !index->indexfn) {
+        return -1;
+    }
+    index_unload(index);
+    if (index->fits) {
+        anqfits_close(index->fits);
+        index->fits = NULL;
+    }
+    index_residency_release(index->residency);
+    index->residency = NULL;
+    index->fits = anqfits_open(index->indexfn);
+    return index->fits ? 0 : -1;
+}
+
 int index_dimquads(index_t* indx) {
     return indx->dimquads;
 }
@@ -285,16 +497,27 @@ index_t* index_load(const char* indexname, int flags, index_t* dest) {
         ERROR("Did not find file for index named %s", dest->indexname);
         goto bailout;
     }
-    dest->fits = anqfits_open(dest->indexfn);
+    if (!(flags & INDEX_ONLY_LOAD_METADATA))
+        (void)index_try_resident_open(dest);
+    if (!dest->fits)
+        dest->fits = anqfits_open(dest->indexfn);
     if (!dest->fits) {
         ERROR("Failed to open FITS file %s", dest->indexfn);
         goto bailout;
     }
-    if (index_reload(dest))
-        goto bailout;
+    if (index_reload_internal(
+            dest, flags & INDEX_ONLY_LOAD_METADATA)) {
+        if (!dest->residency ||
+            index_reopen_original_backing(dest) ||
+            index_reload_internal(dest, FALSE)) {
+            goto bailout;
+        }
+    }
 
     free(dest->indexname);
-    dest->indexname = strdup(quadfile_get_filename(dest->quads));
+    dest->indexname = strdup(
+        dest->residency ? dest->indexfn :
+        quadfile_get_filename(dest->quads));
     set_meta(dest);
 
     logverb("Index scale: [%g, %g] arcmin, [%g, %g] arcsec\n",
@@ -322,36 +545,22 @@ index_t* index_load(const char* indexname, int flags, index_t* dest) {
 }
 
 int index_reload(index_t* index) {
-    // Read .skdt file...
-    if (!index->starkd) {
-        index->starkd = startree_open_fits(index->fits);
-        if (!index->starkd) {
-            ERROR("Failed to read star kdtree from file %s", index->indexfn);
-            goto bailout;
-        }
-    }
+    int status;
 
-    // Read .quad file...
-    if (!index->quads) {
-        index->quads = quadfile_open_fits(index->fits);
-        if (!index->quads) {
-            ERROR("Failed to read quads from %s", index->indexfn);
-            goto bailout;
-        }
+    if (!index) {
+        return -1;
     }
-
-    // Read .ckdt file...
-    if (!index->codekd) {
-        index->codekd = codetree_open_fits(index->fits);
-        if (!index->codekd) {
-            ERROR("Failed to read code kdtree from file %s", index->indexfn);
-            goto bailout;
-        }
+    if (!index->codekd && !index->quads && !index->starkd) {
+        (void)index_try_resident_open(index);
     }
-    return 0;
-
- bailout:
-    return -1;
+    status = index_reload_internal(index, FALSE);
+    if (!status || !index->residency) {
+        return status;
+    }
+    if (index_reopen_original_backing(index)) {
+        return -1;
+    }
+    return index_reload_internal(index, FALSE);
 }
 
 void index_unload(index_t* index) {
@@ -371,42 +580,131 @@ void index_unload(index_t* index) {
 
 int index_close_fds(index_t* ind) {
     kdtree_fits_t* io;
-    if (ind->quads->fb->fid) {
-        if (fclose(ind->quads->fb->fid)) {
-            SYSERROR("Failed to fclose() an astrometry_net_data quadfile");
-            return -1;
-        }
-        ind->quads->fb->fid = NULL;
+    int rc = 0;
+
+    if (!ind || !ind->quads || !ind->quads->fb ||
+        !ind->codekd || !ind->codekd->tree ||
+        !ind->codekd->tree->io ||
+        !ind->starkd || !ind->starkd->tree ||
+        !ind->starkd->tree->io) {
+        ERROR("Cannot close descriptors for an incomplete index");
+        return -1;
+    }
+    if (fitsbin_close_fd(ind->quads->fb)) {
+        ERROR("Failed to close an astrometry_net_data quadfile");
+        rc = -1;
     }
     io = ind->codekd->tree->io;
-    if (io->fid) {
-        if (fclose(io->fid)) {
-            SYSERROR("Failed to fclose() an astrometry_net_data code kdtree");
-            return -1;
-        }
-        io->fid = NULL;
+    if (fitsbin_close_fd(io)) {
+        ERROR("Failed to close an astrometry_net_data code kdtree");
+        rc = -1;
     }
     io = (kdtree_fits_t*)ind->starkd->tree->io;
-    if (io->fid) {
-        if (fclose(io->fid)) {
-            SYSERROR("Failed to fclose() an astrometry_net_data star kdtree");
-            return -1;
-        }
-        io->fid = NULL;
+    if (fitsbin_close_fd(io)) {
+        ERROR("Failed to close an astrometry_net_data star kdtree");
+        rc = -1;
     }
-    return 0;
+    return rc;
+}
+
+static int index_close_one_payload_fd(
+    fitsbin_t* fb,
+    const char* component,
+    const char* index_name) {
+    fitsbin_payload_io_stats_t stats;
+    int rc;
+
+    if (!fb) {
+        return 0;
+    }
+    fitsbin_take_payload_io_stats(fb, &stats);
+    if (stats.read_calls ||
+        stats.warm_calls ||
+        stats.cache_hits ||
+        stats.cache_misses ||
+        stats.failures) {
+        logverb(
+            "[index-payload-io] index=%s component=%s "
+            "direct_calls=%llu direct_batches=%llu "
+            "logical_bytes=%llu aligned_bytes=%llu page_coverage=%llu "
+            "direct_ms=%.3f "
+            "warm_calls=%llu warm_ranges=%llu warm_bytes=%llu "
+            "warm_ms=%.3f cache_hits=%llu cache_misses=%llu "
+            "cache_evictions=%llu cache_allocations=%llu "
+            "credit_wait_ms=%.3f failures=%llu\n",
+            index_name ? index_name : "(unnamed)",
+            component ? component : "(unknown)",
+            stats.read_calls,
+            stats.read_batches,
+            stats.read_logical_bytes,
+            stats.read_bytes,
+            stats.read_pages,
+            (double)stats.read_nanoseconds / 1000000.0,
+            stats.warm_calls,
+            stats.warm_ranges,
+            stats.warm_bytes,
+            (double)stats.warm_nanoseconds / 1000000.0,
+            stats.cache_hits,
+            stats.cache_misses,
+            stats.cache_evictions,
+            stats.cache_allocations,
+            (double)stats.wait_nanoseconds / 1000000.0,
+            stats.failures);
+    }
+    rc = fitsbin_close_payload_fd(fb);
+    if (rc) {
+        ERROR("Failed to close %s exact-payload descriptor",
+              component ? component : "index");
+    }
+    return rc;
+}
+
+int index_close_payload_fds(index_t* ind) {
+    int rc = 0;
+
+    if (!ind) {
+        return 0;
+    }
+    if (ind->quads &&
+        index_close_one_payload_fd(
+            ind->quads->fb,
+            "quad",
+            ind->indexname)) {
+        rc = -1;
+    }
+    if (ind->codekd && ind->codekd->tree &&
+        index_close_one_payload_fd(
+            (fitsbin_t*)ind->codekd->tree->io,
+            "codekd",
+            ind->indexname)) {
+        rc = -1;
+    }
+    if (ind->starkd && ind->starkd->tree &&
+        index_close_one_payload_fd(
+            (fitsbin_t*)ind->starkd->tree->io,
+            "starkd",
+            ind->indexname)) {
+        rc = -1;
+    }
+    return rc;
 }
 
 void index_close(index_t* index) {
     if (!index) return;
-    free(index->indexname);
-    free(index->indexfn);
-    free(index->cutband);
-    index->indexname = index->indexfn = NULL;
     index_unload(index);
     if (index->fits)
         anqfits_close(index->fits);
     index->fits = NULL;
+    if (index->residency)
+        index_residency_release(index->residency);
+    index->residency = NULL;
+    if (index->residency_source)
+        index_residency_release(index->residency_source);
+    index->residency_source = NULL;
+    free(index->indexname);
+    free(index->indexfn);
+    free(index->cutband);
+    index->indexname = index->indexfn = NULL;
 }
 
 void index_free(index_t* index) {

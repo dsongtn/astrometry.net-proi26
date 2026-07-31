@@ -25,10 +25,10 @@
  fitsgetext -i t12.index -o t12.ind -e 0 -e 1 -e 2 -e 3 -e 4 -e 5 -e 6
 
  make-wcs.py -r 5 -d 5 -s 3 -W 1000 -H 1000 t1.wcs
- query-starkd -o t10.rd -r 5 -d 5 -R 1.5 -t mag util/t10.skdt 
+ query-starkd -o t10.rd -r 5 -d 5 -R 1.5 -t mag util/t10.skdt
  wcs-rd2xy -w t1.wcs -i t10.rd -o t1.xy
  solve-field --just-augment --scale-low 1 t1.xy --continue --width 1000 --height 1000
- backend -c none -i 't1?.index' -v t1.axy 
+ backend -c none -i 't1?.index' -v t1.axy
 
  (in util/ directory:)
  ../solver/test_multiindex2
@@ -75,14 +75,22 @@ void test_solve_multiindex(CuTest* ct) {
 
     solver_set_field(s, field);
     solver_set_field_bounds(s, 0, 1000, 0, 1000);
+    s->startobj = 10;
+    s->endobj = 30;
 
     for (i=0; i<multiindex_n(mi); i++) {
         index_t* ind = multiindex_get(mi, i);
         solver_add_index(s, ind);
     }
 
+    solver_preprocess_field(s);
+    CuAssert(ct,
+             "failed to prepare shared field geometry",
+             solver_prepare_field_geometry(s));
     solver_run(s);
 
+    CuAssert(ct, "shared-geometry ranged solver did not solve",
+             solver_did_solve(s));
     if (solver_did_solve(s)) {
         mo = solver_get_best_match(s);
         matchobj_print(mo, LOG_MSG);
@@ -99,4 +107,3 @@ void test_solve_multiindex(CuTest* ct) {
     multiindex_free(mi);
     sl_free2(fns);
 }
-

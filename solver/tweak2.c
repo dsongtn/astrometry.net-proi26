@@ -224,6 +224,7 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
     int* theta = NULL;
     double* odds = NULL;
     int* refperm = NULL;
+    int* verify_testperm = NULL;
     double qc[2];
 
     memcpy(qc, quadcenter, 2*sizeof(double));
@@ -279,6 +280,7 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
             free(theta);
             free(odds);
             free(refperm);
+            free(verify_testperm);
 
             // Anneal
             gamma = pow(0.9, step);
@@ -362,7 +364,7 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
                                             W, H, distractors,
                                             logodds_bail, LARGE_VAL,
                                             &besti, &odds, &theta, NULL,
-                                            &testperm, &refperm);
+                                            &verify_testperm, &refperm);
 
             logverb("Logodds: %g\n", logodds);
             verify_count_hits(theta, besti, &nmatch, &nconf, &ndist);
@@ -370,7 +372,8 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
             verify_count_hits(theta, Nfield-1, &nmatch, &nconf, &ndist);
             logverb("%i matches, %i distractors, %i conflicts (all sources)\n", nmatch, ndist, nconf);
             if (log_get_level() >= LOG_VERB) {
-                matchobj_log_hit_miss(theta, testperm, besti+1, Nfield, LOG_VERB, "Hit/miss: ");
+                matchobj_log_hit_miss(theta, verify_testperm, besti+1,
+                                      Nfield, LOG_VERB, "Hit/miss: ");
             }
 
             /*
@@ -389,8 +392,10 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
                 sprintf(name, "o%is%02ipre", order, step);
                 TWEAK_DEBUG_PLOT(name, W, H, Nfield, fieldxy, fieldsigma2s,
                                  Nin, indexpix, besti, theta,
-                                 sipout->wcstan.crpix, testperm, qc);
+                                 sipout->wcstan.crpix, verify_testperm, qc);
             }
+            free(verify_testperm);
+            verify_testperm = NULL;
 
             Nmatch = 0;
             debug("Weights:");
@@ -427,6 +432,9 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
             if (Nmatch < 2) {
                 logverb("No matches -- aborting tweak attempt\n");
                 free(theta);
+                free(odds);
+                free(refperm);
+                free(verify_testperm);
                 sip_free(sipout);
                 free(matchxy);
                 free(matchxyz);
@@ -492,6 +500,7 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
         free(theta);
         free(odds);
         free(refperm);
+        free(verify_testperm);
         gamma = 1.0;
         // Project reference sources into pixel space; keep the ones inside image bounds.
         Nin = 0;
@@ -526,22 +535,25 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
                                         W, H, distractors,
                                         logodds_bail, LARGE_VAL,
                                         &besti, &odds, &theta, NULL,
-                                        &testperm, &refperm);
+                                        &verify_testperm, &refperm);
         logverb("Logodds: %g\n", logodds);
         verify_count_hits(theta, besti, &nmatch, &nconf, &ndist);
         logverb("%i matches, %i distractors, %i conflicts (at best log-odds); %i field sources, %i index sources\n", nmatch, ndist, nconf, Nfield, Nin);
         verify_count_hits(theta, Nfield-1, &nmatch, &nconf, &ndist);
         logverb("%i matches, %i distractors, %i conflicts (all sources)\n", nmatch, ndist, nconf);
         if (log_get_level() >= LOG_VERB) {
-            matchobj_log_hit_miss(theta, testperm, besti+1, Nfield, LOG_VERB,
+            matchobj_log_hit_miss(theta, verify_testperm, besti+1,
+                                  Nfield, LOG_VERB,
                                   "Hit/miss: ");
         }
 
         if (TWEAK_DEBUG_PLOTS) {
             TWEAK_DEBUG_PLOT("final", W, H, Nfield, fieldxy, fieldsigma2s,
                              Nin, indexpix, besti, theta,
-                             sipout->wcstan.crpix, testperm, qc);
+                             sipout->wcstan.crpix, verify_testperm, qc);
         }
+        free(verify_testperm);
+        verify_testperm = NULL;
     }
 
 
@@ -559,6 +571,7 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
     }
     free(theta);
     free(refperm);
+    free(verify_testperm);
 
     if (newodds)
         *newodds = odds;
@@ -583,4 +596,3 @@ sip_t* tweak2(const double* fieldxy, int Nfield,
 
     return sipout;
 }
-

@@ -37,7 +37,7 @@ struct augment_xylist_s {
     sip_t* predistort;
 
     double pixel_xscale;
-    
+
     // FITS columns copied from index to RDLS output
     sl* tagalong;
     anbool tagalong_all;
@@ -70,7 +70,7 @@ struct augment_xylist_s {
     anbool keep_fitsimg;
     char* fitsimgfn;
     int fitsimgext;
-    
+
     // FITS extension to read image from
     int extension;
 
@@ -97,6 +97,13 @@ struct augment_xylist_s {
 
     float cpulimit;
     double wall_limit;
+
+    /*
+     * Raw solve-field override: zero means textual "auto".
+     * The boolean distinguishes explicit auto from no override.
+     */
+    int index_shard_workers;
+    anbool index_shard_workers_set;
 
     anbool tweak;
     int tweakorder;
@@ -173,5 +180,4 @@ void augment_xylist_print_special_opts(an_option_t* opt, bl* opts,
                                        FILE* fid, void* extra);
 
 #endif
-
 

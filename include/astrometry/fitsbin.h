@@ -7,6 +7,7 @@
 #define FITSBIN_H
 
 #include <stdio.h>
+#include <sys/stat.h>
 
 #include "astrometry/anqfits.h"
 #include "astrometry/bl.h"
@@ -85,6 +86,17 @@ typedef enum fitsbin_mmap_advice {
     FITSBIN_MMAP_ADVICE_RANDOM = 1
 } fitsbin_mmap_advice_t;
 
+/*
+ * Region metadata distinguishes topology and payload for page planning and
+ * telemetry. Payload remains the default so zero-initialized third-party
+ * chunks preserve compatibility. Topology uses NORMAL; payload follows the
+ * file/pass policy.
+ */
+typedef enum fitsbin_mmap_region {
+    FITSBIN_MMAP_REGION_PAYLOAD = 0,
+    FITSBIN_MMAP_REGION_TOPOLOGY = 1
+} fitsbin_mmap_region_t;
+
 
 struct fitsbin_chunk_t {
     char* tablename;
@@ -122,6 +134,17 @@ struct fitsbin_chunk_t {
     char* map;
     // The mmap'ed size.
     size_t mapsize;
+
+    // Access-pattern class used when applying mmap advice.
+    fitsbin_mmap_region_t mmap_region;
+
+    /*
+     * Exact file interval occupied by the table payload.  Unlike map/mapsize,
+     * this excludes mmap alignment and FITS padding. V20 uses it to translate
+     * proven mapped addresses into bounded page intervals and test reads.
+     */
+    off_t data_file_offset;
+    size_t data_file_size;
 };
 typedef struct fitsbin_chunk_t fitsbin_chunk_t;
 
@@ -130,6 +153,7 @@ struct fitsbin_t {
     char* filename;
 
     anqfits_t* fits;
+    anbool owns_fits;
 
     bl* chunks;
 
@@ -162,9 +186,50 @@ struct fitsbin_t {
     // Cached system page size for bounded mmap prefetch requests.
     size_t mmap_page_size;
 
-    // Enables bounded, caller-directed prefetch within random mappings.
+    // Enables bounded, caller-directed population of mapped payload pages.
     anbool mmap_prefetch_enabled;
     anbool mmap_prefetch_failed;
+
+    /*
+     * Captured source policy. This marks a source whose payload is already
+     * fully resident; it does not change mapping or solver behavior itself.
+     */
+    anbool payload_fully_resident;
+
+    /*
+     * A separately opened buffered-I/O description for exact payload reads.
+     * It receives POSIX_FADV_RANDOM but never backs a compute mapping, so its
+     * file-description advice cannot change the mmap VMA policy.
+     */
+    int payload_fd;
+    anbool payload_fd_initialized;
+    anbool payload_fd_failed;
+
+    /* Lock-free, per-file payload-I/O telemetry. */
+    unsigned long long payload_read_calls;
+    unsigned long long payload_read_batches;
+    unsigned long long payload_read_logical_bytes;
+    unsigned long long payload_read_pages;
+    unsigned long long payload_read_bytes;
+    unsigned long long payload_read_nanoseconds;
+    unsigned long long payload_warm_calls;
+    unsigned long long payload_warm_ranges;
+    unsigned long long payload_warm_bytes;
+    unsigned long long payload_warm_nanoseconds;
+    unsigned long long payload_cache_hits;
+    unsigned long long payload_cache_misses;
+    unsigned long long payload_cache_evictions;
+    unsigned long long payload_cache_allocations;
+    unsigned long long payload_wait_nanoseconds;
+    unsigned long long payload_failures;
+
+    /*
+     * Immutable identity captured from the descriptor that backs read-time
+     * mappings. It remains valid after fitsbin_close_fd() so mapped data can
+     * be identified without reopening a pathname or touching a closed FILE*.
+     */
+    anbool open_file_stat_valid;
+    struct stat open_file_stat;
 };
 typedef struct fitsbin_t fitsbin_t;
 
@@ -199,19 +264,366 @@ int fitsbin_close_fd(fitsbin_t* fb);
 /**
  Configures the mmap policy for solver index data.
 
- The production default uses random mmap advice when supported and disables
- explicit prefetching. Developer overrides may temporarily select alternate
- policies for diagnostics and controlled performance comparisons.
+ A W2+ shard worker supplies RANDOM before mapping every index chunk. A caller
+ without shard-local policy retains the original serial NORMAL behavior.
+ Bounded exact page population is advisory and does not change either mapping
+ policy.
  */
 int fitsbin_configure_index_mmap(fitsbin_t* fb);
 
 /**
  Requests population of the mapped pages covering this data range.
 
- The request is a no-op unless random advice and mmap prefetching are both
- enabled for the fitsbin.
+ The request is a no-op unless bounded mmap population is enabled for the
+ fitsbin.
  */
 int fitsbin_prefetch_data(fitsbin_t* fb, const void* data, size_t size);
+
+typedef struct fitsbin_prefetch_range {
+    const void* data;
+    size_t size;
+} fitsbin_prefetch_range_t;
+
+typedef struct fitsbin_payload_io_ticket
+    fitsbin_payload_io_ticket_t;
+
+typedef anbool (*fitsbin_payload_io_cancel_check_fn)(void* opaque);
+
+/*
+ * Construct one complete mapped-range plan on an I/O lane in provider-owned
+ * storage. The callback is bounded and nonblocking: it must not enter or wait
+ * on the payload provider. Return one for a complete nonempty plan, zero for
+ * a complete logical operation requiring no mapped population, and minus one
+ * for failure. Cancellation is authoritative only through cancelled().
+ */
+typedef int (*fitsbin_payload_io_plan_fn)(
+    void* opaque,
+    fitsbin_payload_io_cancel_check_fn cancelled,
+    void* cancel_opaque,
+    fitsbin_prefetch_range_t* ranges,
+    size_t range_capacity,
+    size_t* range_count);
+
+/*
+ * Loader dequeue order is demand, current-index preparation, then
+ * speculation. Non-demand admission leaves one job and one quarter of the
+ * in-flight byte ceiling available for demand.
+ */
+typedef enum fitsbin_payload_io_priority {
+    FITSBIN_PAYLOAD_IO_PRIORITY_DEMAND = 0,
+    FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
+    FITSBIN_PAYLOAD_IO_PRIORITY_SPECULATIVE
+} fitsbin_payload_io_priority_t;
+
+typedef struct fitsbin_payload_io_stats {
+    unsigned long long read_calls;
+    unsigned long long read_batches;
+    unsigned long long read_logical_bytes;
+    unsigned long long read_pages;
+    unsigned long long read_bytes;
+    unsigned long long read_nanoseconds;
+    unsigned long long warm_calls;
+    unsigned long long warm_ranges;
+    unsigned long long warm_bytes;
+    unsigned long long warm_nanoseconds;
+    unsigned long long cache_hits;
+    unsigned long long cache_misses;
+    unsigned long long cache_evictions;
+    unsigned long long cache_allocations;
+    unsigned long long wait_nanoseconds;
+    unsigned long long failures;
+} fitsbin_payload_io_stats_t;
+
+/*
+ * Configure the process-wide I/O admission width. Production mapped-page
+ * population and focused buffered-read tests share this bounded mechanism.
+ */
+void fitsbin_payload_io_configure_workers(int worker_count);
+
+/*
+ * Start or stop the bounded payload loader. The service is advisory: callers
+ * retain their original synchronous path when startup or submission fails.
+ */
+int fitsbin_payload_io_service_start(int lane_count);
+void fitsbin_payload_io_service_stop(void);
+
+/* Return the live loader width, or zero while the service is unavailable. */
+int fitsbin_payload_io_service_width(void);
+
+/* Return nonzero when mapped-page population is compiled into the loader. */
+int fitsbin_payload_io_mapped_population_supported(void);
+
+/*
+ * One process-wide scheduler wakeup for terminal payload tickets. The
+ * immutable completion ID is unique for the lifetime of the process and lets
+ * a scheduler wake only the task that owns the completed ticket. The notifier
+ * runs after the payload mutex is released, must remain bounded, and must not
+ * perform payload I/O or wait for the payload service. It may briefly
+ * synchronize with scheduler state. Clearing waits for active notifier calls
+ * and must not be called by the notifier itself.
+ */
+typedef void (*fitsbin_payload_io_completion_notify_fn)(
+    void* opaque,
+    unsigned long long completion_id);
+
+int fitsbin_payload_io_set_completion_notifier(
+    fitsbin_payload_io_completion_notify_fn notify,
+    void* opaque);
+int fitsbin_payload_io_clear_completion_notifier(
+    fitsbin_payload_io_completion_notify_fn notify,
+    void* opaque);
+
+/*
+ * Cheap advisory predicate for optional work that may compete with payload
+ * demand. It is nonzero while all reader credits are occupied or any demand
+ * reader is waiting. A zero result grants no credit and may become stale
+ * immediately; speculative callers must remain optional and bounded.
+ */
+int fitsbin_payload_io_demand_busy(void);
+
+/*
+ * Optional worker callback used only while a buffered demand reader has no
+ * payload credit. It may execute one bounded, index-free helper package; a
+ * nonzero return requests one immediate credit/helper retry. The optional
+ * stop callback is sampled while a submitted ticket is pending; a nonzero
+ * result cooperatively cancels that ticket.
+ */
+typedef int (*fitsbin_payload_io_wait_helper_fn)(void* opaque);
+typedef int (*fitsbin_payload_io_stop_check_fn)(void* opaque);
+
+int fitsbin_payload_io_set_thread_wait_helper(
+    fitsbin_payload_io_wait_helper_fn helper,
+    fitsbin_payload_io_stop_check_fn stop_check,
+    void* opaque);
+void fitsbin_payload_io_clear_thread_wait_helper(void);
+
+/*
+ * Count payload-credit waiters with a worker-local callback and wake them
+ * after bounded helper work is published.
+ */
+size_t fitsbin_payload_io_wait_helper_count(void);
+void fitsbin_payload_io_notify_wait_helpers(void);
+
+/*
+ * Delimit a production helper window. Nested windows share one reserved
+ * reader slot so demand stays bounded while helper work is runnable.
+ */
+void fitsbin_payload_io_begin_helper_window(void);
+void fitsbin_payload_io_end_helper_window(void);
+
+typedef struct fitsbin_pread_range {
+    const void* data;
+    size_t size;
+    size_t logical_size;
+    void* destination;
+} fitsbin_pread_range_t;
+
+#define FITSBIN_PREAD_RANGE_LIMIT 16U
+/* Direct async tickets own up to this many prepared range records. */
+#define FITSBIN_PREAD_ASYNC_RANGE_LIMIT 256U
+/* Mapped population accepts this many logical ranges before page deduplication. */
+#define FITSBIN_MMAP_PREFETCH_RANGE_LIMIT 640U
+
+/*
+ * Resolve the file-page covering interval for one exact mapped request.
+ * Alignment is calculated from immutable file offsets and clipped to the
+ * containing FITS payload. The returned mapped address and file offset name
+ * the same cover; the mapped address is only a token and is never
+ * dereferenced or faulted by this function.
+ */
+int fitsbin_mapped_range_page_cover(
+    fitsbin_t* fb,
+    const void* data,
+    size_t size,
+    const void** cover_data,
+    size_t* cover_size,
+    off_t* cover_file_offset,
+    size_t* exact_offset);
+
+/*
+ * Read one through FITSBIN_PREAD_RANGE_LIMIT fully validated mapped ranges
+ * under one demand-I/O credit. All ranges are resolved before I/O begins. A
+ * failure invalidates the whole batch from the caller's perspective.
+ * Disjoint destinations may be read in file-offset order. Any overlapping
+ * destinations retain caller order.
+ */
+int fitsbin_pread_mapped_ranges(
+    fitsbin_t* fb,
+    const fitsbin_pread_range_t* ranges,
+    size_t range_count);
+
+/*
+ * Submit a fully validated direct read into caller-owned unpublished storage.
+ * All mapped ranges are resolved before queueing and no mapped pointer is
+ * retained. The complete physical byte count must fit byte_budget.
+ *
+ * Return 1 when queued, zero when bounded service capacity is unavailable,
+ * and -1 for invalid input or failed preparation. After a return of 1, every
+ * destination must remain allocated and inaccessible to the caller until
+ * ticket_wait(), ticket_cancel_and_wait(), or a terminal ticket_poll(). Only
+ * a positive collected result permits publication; failure or cancellation
+ * invalidates the whole batch even when some destination bytes were written.
+ * Disjoint destinations may be read in file-offset order; overlapping
+ * destinations retain caller order. The source fitsbin must remain live
+ * through collection so operation counters can be applied.
+ *
+ * On a zero return, errno is ENODEV when the service is unavailable, EAGAIN
+ * when current queue occupancy prevents admission, and E2BIG when the
+ * unchanged ticket can never fit the service byte ceiling.
+ */
+int fitsbin_pread_mapped_ranges_submit(
+    fitsbin_t* fb,
+    const fitsbin_pread_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget,
+    fitsbin_payload_io_priority_t priority,
+    fitsbin_payload_io_ticket_t** ticket);
+
+/*
+ * Read the exact mapped payload bytes through the dedicated buffered-I/O
+ * description.  The mapped address is used only to resolve the immutable file
+ * offset; bytes are returned in caller storage.
+ *
+ * Return 0 on success and -1 on identity, range, allocation, or I/O failure.
+ */
+int fitsbin_pread_mapped_range(
+    fitsbin_t* fb,
+    const void* data,
+    size_t size,
+    void* destination);
+
+/*
+ * Prepare a complete bounded group of mapped ranges through exact buffered
+ * reads. Ranges are page aligned, sorted, deduplicated, and merged only when
+ * overlapping or adjacent. Oversized, unresolvable, or over-budget groups
+ * fail as a unit; callers must split larger plans explicitly. Correctness
+ * never depends on this operation. A fully resident source returns zero
+ * without issuing I/O or changing warm counters.
+ */
+int fitsbin_prefetch_ranges(
+    fitsbin_t* fb,
+    const fitsbin_prefetch_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget);
+
+/*
+ * Submit one complete current-index mapped-page population to the bounded
+ * loader. The source must first be initialized by
+ * fitsbin_configure_index_mmap(). The ticket copies validated page-aligned
+ * spans but borrows the fitsbin owner and its mappings.
+ *
+ * Return 1 when queued, zero when the optional service or bounded capacity is
+ * unavailable, and -1 for an invalid or failed preparation. The caller must
+ * keep every source mapping live through blocking or polled collection before
+ * closing the source fitsbin. A fully resident source returns zero without
+ * creating a ticket. On a zero return caused by the service, errno
+ * distinguishes ENODEV, transient admission refusal EAGAIN, and permanent
+ * size refusal E2BIG.
+ */
+int fitsbin_prefetch_ranges_submit(
+    fitsbin_t* fb,
+    const fitsbin_prefetch_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget,
+    fitsbin_payload_io_ticket_t** ticket);
+
+/*
+ * Submit a bounded mapped-population ticket whose exact ranges are planned on
+ * the I/O lane. byte_budget is reserved at admission; actual mapped bytes are
+ * recorded after the callback completes. plan_opaque and every object it can
+ * reach must remain alive and exclusively owned by the ticket until terminal
+ * collection. An empty successful plan collects as a positive logical result
+ * and does not increment mapped-warm counters. Refusal and failure leave the
+ * native mapped path authoritative.
+ */
+int fitsbin_prefetch_ranges_planned_submit(
+    fitsbin_t* fb,
+    fitsbin_payload_io_plan_fn plan,
+    void* plan_opaque,
+    size_t byte_budget,
+    fitsbin_payload_io_ticket_t** ticket);
+
+/*
+ * Wait for one ticket and apply operation-specific I/O counters to the
+ * still-live fitsbin. A failed or cancelled operation leaves the original
+ * synchronous solver path valid. A direct ticket returns its range count only
+ * after every destination is complete. destroy() is valid only after blocking
+ * or polled collection. The exact source passed at submission must remain
+ * live and must be passed again when collecting the ticket.
+ */
+int fitsbin_payload_io_ticket_wait(
+    fitsbin_t* fb,
+    fitsbin_payload_io_ticket_t* ticket);
+int fitsbin_payload_io_ticket_cancel_and_wait(
+    fitsbin_t* fb,
+    fitsbin_payload_io_ticket_t* ticket);
+
+/*
+ * Poll one ticket without waiting. Return one when terminal and place the
+ * ordinary wait result in result_out, zero while pending, and minus one for
+ * invalid or already-collected input. A terminal poll applies counters and
+ * must be followed by exactly one checked destroy. A terminal failure is
+ * reported as a successful poll with result_out set to -1 and errno set to
+ * the I/O failure.
+ */
+int fitsbin_payload_io_ticket_poll(
+    fitsbin_t* fb,
+    fitsbin_payload_io_ticket_t* ticket,
+    int* result_out);
+
+/*
+ * Request cancellation without waiting or applying counters. Return one for
+ * a new request, zero when already requested or terminal, and minus one for
+ * invalid input. Queued tickets become terminal immediately; running tickets
+ * complete cancellation at their next bounded polling point.
+ */
+int fitsbin_payload_io_ticket_cancel_async(
+    fitsbin_payload_io_ticket_t* ticket);
+
+/*
+ * Return the immutable nonzero completion ID assigned at successful
+ * submission, or zero for invalid or unpublished input. The caller must
+ * still own the live ticket.
+ */
+unsigned long long fitsbin_payload_io_ticket_completion_id(
+    const fitsbin_payload_io_ticket_t* ticket);
+
+/*
+ * Destroy a terminal, collected ticket. A failure returns minus one with
+ * errno set to EBUSY for pending or actively waited tickets, or EAGAIN when
+ * terminal counters have not been collected. Ticket operations, collection,
+ * and destruction require exclusive caller serialization. The legacy void
+ * wrapper preserves its original silent no-op behavior.
+ */
+int fitsbin_payload_io_ticket_destroy_checked(
+    fitsbin_payload_io_ticket_t* ticket);
+void fitsbin_payload_io_ticket_destroy(
+    fitsbin_payload_io_ticket_t* ticket);
+
+/*
+ * Populate every page-aligned mapped range without copying payload bytes.
+ * Ranges are sorted, deduplicated, and merged within each mapping. The whole
+ * aligned plan is preflighted against byte_budget and the process-wide byte
+ * ceiling before any page is touched. This operation never changes the base
+ * mapping advice. Refusal or failure therefore leaves the caller's NORMAL or
+ * RANDOM mapping policy intact.
+ *
+ * Return the number of fully populated spans, zero when the complete plan is
+ * not applicable, or -1 on invalid input or kernel failure.
+ */
+int fitsbin_advise_mapped_ranges(
+    fitsbin_t* fb,
+    const fitsbin_prefetch_range_t* ranges,
+    size_t range_count,
+    size_t byte_budget);
+
+/* Close only the dedicated payload reader; compute mappings remain valid. */
+int fitsbin_close_payload_fd(fitsbin_t* fb);
+
+/* Atomically take and reset this fitsbin's payload-I/O counters. */
+void fitsbin_take_payload_io_stats(
+    fitsbin_t* fb,
+    fitsbin_payload_io_stats_t* stats);
 
 /**
  Resolves a requested data range to the actual mmap region containing it.
@@ -233,6 +645,22 @@ int fitsbin_resolve_mapped_range(fitsbin_t* fb,
                                  size_t* map_size,
                                  const void** range_start,
                                  size_t* range_size);
+
+/*
+ * Apply advice only to the page-aligned mapped interval containing the
+ * requested data. This is used for access phases whose intent is narrower
+ * than the containing FITS payload chunk, such as a sequential PERM sweep.
+ *
+ * Return:
+ *   1  advice applied
+ *   0  range is not mmap-backed
+ *  -1  invalid input or kernel rejection
+ */
+int fitsbin_set_mmap_range_advice(
+    fitsbin_t* fb,
+    const void* data,
+    size_t size,
+    fitsbin_mmap_advice_t advice);
 
 int fitsbin_switch_to_reading(fitsbin_t* fb);
 
@@ -258,7 +686,24 @@ fitsbin_chunk_t* fitsbin_add_chunk(fitsbin_t* fb, fitsbin_chunk_t* chunk);
  */
 int fitsbin_read_chunk(fitsbin_t* fb, fitsbin_chunk_t* chunk);
 
+/*
+ * Reads and validates a chunk's FITS/table headers without mapping or
+ * copying its payload.  The chunk is not added to fb.
+ */
+int fitsbin_read_chunk_header(fitsbin_t* fb, fitsbin_chunk_t* chunk);
+
 FILE* fitsbin_get_fid(fitsbin_t* fb);
+
+int fitsbin_get_open_file_stat(
+    const fitsbin_t* fb,
+    struct stat* file_stat);
+
+void fitsbin_stat_times(
+    const struct stat* file_stat,
+    time_t* mtime_seconds,
+    long* mtime_nanoseconds,
+    time_t* ctime_seconds,
+    long* ctime_nanoseconds);
 
 int fitsbin_close(fitsbin_t* fb);
 
@@ -303,9 +748,10 @@ int fitsbin_write_chunk_to(fitsbin_t* fb, fitsbin_chunk_t* chunk, FILE* fid);
 /*
  * Index mmap policy.
  *
- * Fixed policies preserve one advice for the complete field. Adaptive begins
- * each field with RANDOM and changes to NORMAL only after one clean,
- * exhaustive, unsolved index-shard pass.
+ * Fixed policies preserve one base mapping advice for the complete field.
+ * Parallel production uses FIXED_RANDOM for every mapped index chunk, while
+ * serial callers remain NORMAL. Bounded exact page population is additive and
+ * policy-neutral.
  */
 typedef enum fitsbin_mmap_policy {
     FITSBIN_MMAP_POLICY_FIXED_NORMAL = 0,
@@ -343,6 +789,19 @@ const char* fitsbin_mmap_policy_name(
 const char* fitsbin_mmap_advice_name(
     fitsbin_mmap_advice_t advice);
 
+const char* fitsbin_mmap_region_name(
+    fitsbin_mmap_region_t region);
+
+fitsbin_mmap_advice_t fitsbin_get_mmap_advice(
+    const fitsbin_t* fb);
+
+/*
+ * Topology chunks use NORMAL. Payload chunks follow file/pass advice.
+ */
+fitsbin_mmap_advice_t fitsbin_get_chunk_mmap_advice(
+    const fitsbin_t* fb,
+    const fitsbin_chunk_t* chunk);
+
 void fitsbin_mmap_advice_state_init(
     fitsbin_mmap_advice_state_t* state,
     fitsbin_mmap_policy_t policy);
@@ -376,6 +835,18 @@ void fitsbin_mmap_set_thread_advice(
 void fitsbin_mmap_clear_thread_advice(void);
 
 fitsbin_mmap_advice_t fitsbin_mmap_current_advice(void);
+
+/* TRUE only while an outer shard worker owns the current index open. */
+anbool fitsbin_mmap_thread_advice_active(void);
+
+/*
+ * Mark index components opened by this thread as fully resident. The marker
+ * is captured by fitsbin_configure_index_mmap() and has no effect by itself.
+ */
+void fitsbin_payload_set_thread_full_resident(void);
+void fitsbin_payload_clear_thread_full_resident(void);
+anbool fitsbin_payload_is_fully_resident(
+    const fitsbin_t* fb);
 
 /*
  * Changes the logical advice and optionally reapplies it to existing chunks.

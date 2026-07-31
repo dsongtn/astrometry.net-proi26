@@ -11,6 +11,7 @@
 #include "astrometry/codekd.h"
 #include "astrometry/an-bool.h"
 #include "astrometry/anqfits.h"
+#include "astrometry/index_residency.h"
 
 /*
  * These routines handle loading of index files, which can consist of
@@ -38,6 +39,12 @@ typedef struct {
 
     // filename
     char* indexfn;
+
+    // Optional immutable RAM backing retained for this open index epoch.
+    index_residency_handle_t* residency;
+
+    // Source-backed demand epoch; release requeues deferred RAM preparation.
+    index_residency_handle_t* residency_source;
 
     // Below here: metadata about the index.
     char* indexname;
@@ -152,6 +159,20 @@ index_t* index_load(const char* indexname, int flags, index_t* dest);
  */
 void index_unload(index_t* index);
 
+/*
+ * Bind one process job's immutable index residency service. A concurrent
+ * binding is rejected rather than replacing another job's service.
+ */
+int index_bind_residency_service(index_residency_t* service);
+void index_unbind_residency_service(index_residency_t* service);
+anbool index_residency_service_active(void);
+
+/*
+ * Return the authoritative source identity, even when mappings use an
+ * immutable RAM backing file.
+ */
+int index_get_source_file_stat(const index_t* index, struct stat* identity);
+
 int index_reload(index_t* index);
 
 /**
@@ -159,6 +180,12 @@ int index_reload(index_t* index);
  you can call this function and the index will remain valid.
  */
 int index_close_fds(index_t* index);
+
+/*
+ * Close the V20 exact-payload reader descriptions after an index epoch.
+ * File-backed compute mappings remain valid and may stay in the job cache.
+ */
+int index_close_payload_fds(index_t* index);
 
 /**
  Close an index and free associated data structures, *without freeing

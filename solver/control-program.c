@@ -428,7 +428,10 @@ int main(int argc, char** args) {
             // 
             solver->distance_from_quad_bonus = TRUE;
 
-            solver_run(solver);
+            if (solver_run(solver)) {
+                ERROR("Solver execution failed");
+                goto skip;
+            }
 
             if (solver->best_match_solves) {
                 double ra, dec;
