@@ -20,6 +20,7 @@
 #include "healpix.h"
 #include "datalog.h"
 #include "index_shard_internal.h"
+#include "verify_theta_tail.h"
 
 #define DEBUGVERIFY 0
 
@@ -2445,6 +2446,10 @@ static int fixup_theta(int* theta, double* allodds,
         (size_t)v->NRall > SIZE_MAX / sizeof(*invrperm)) {
         return -1;
     }
+    if (verify_theta_mark_unprocessed(
+            theta, v->NT, ibailed, istopped)) {
+        return -1;
+    }
     permutation_stride = refxyz
         ? 3U * sizeof(double)
         : 2U * sizeof(double);
@@ -2519,16 +2524,6 @@ static int fixup_theta(int* theta, double* allodds,
             assert(v->refperm[i] < v->NRall);
         }
     }
-
-    // "theta" has length v->NT.
-
-    if (ibailed != -1)
-        for (i=ibailed+1; i<v->NT; i++)
-            theta[i] = THETA_BAILEDOUT;
-
-    if (istopped != -1)
-        for (i=istopped+1; i<v->NT; i++)
-            theta[i] = THETA_STOPPEDLOOKING;
 
     // At this point, "theta[0]" is the *reference* star index
     // that was matched by the test star "v->testperm[0]".
