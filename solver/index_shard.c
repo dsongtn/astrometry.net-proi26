@@ -6994,6 +6994,7 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
   int worker_count;
   int payload_io_lanes;
   int payload_io_width;
+  index_shard_width_plan_t width_plan;
 
    // pool already active for this engine job
   if (!index_shard_pthread_enabled(bp)) {
@@ -7202,19 +7203,27 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
 
   index_shard_global_pool = pool;
   payload_io_width = fitsbin_payload_io_service_width();
-  if (pool->payload_completion_registered) {
-    /*
-     * Mapped-page delivery width and outer compute width are independent.
-     * Every compute worker may own an outer index. A worker with no
-     * immediately claimable outer work may still execute READY staged work
-     * from any published owner.
-     */
-    pool->producer_width = (size_t)worker_count;
-    pool->helper_width = 0U;
-  } else {
+  if (index_shard_config_plan_widths(
+          worker_count,
+          payload_io_width,
+          pool->payload_completion_registered,
+          &width_plan)) {
+    logerr("[index-shard] invalid compute/delivery width plan "
+           "workers=%i payload_io_width=%i detached=%i\n",
+           worker_count,
+           payload_io_width,
+           pool->payload_completion_registered ? 1 : 0);
     pool->helper_width = worker_count > 1 ? 1U : 0U;
     pool->producer_width =
         (size_t)worker_count - pool->helper_width;
+  } else {
+    /*
+     * Outer ownership is bounded by mapped-page delivery capacity. Surplus
+     * compute threads stay in the same pool and may claim staged work from
+     * any published owner without opening another cold index mapping.
+     */
+    pool->producer_width = width_plan.producer_width;
+    pool->helper_width = width_plan.helper_width;
   }
   fitsbin_payload_io_configure_workers(
       pool->payload_completion_registered

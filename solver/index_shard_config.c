@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -126,4 +127,39 @@ int index_shard_config_effective_workers(int configured_workers,
   (void)nindexes;
 
   return workers;
+}
+
+int index_shard_config_plan_widths(
+    int worker_count,
+    int payload_io_width,
+    int detached_completion,
+    index_shard_width_plan_t *plan) {
+  size_t workers;
+  size_t producers;
+  size_t helpers;
+
+  if (!plan || worker_count < 1 || payload_io_width < 0) {
+    return -1;
+  }
+  workers = (size_t)worker_count;
+  if (detached_completion) {
+    size_t io_width = payload_io_width > 0
+        ? (size_t)payload_io_width : 1U;
+    size_t delivery_window = io_width > SIZE_MAX / 2U
+        ? SIZE_MAX : io_width * 2U;
+
+    producers = workers < delivery_window
+        ? workers : delivery_window;
+    helpers = workers - producers;
+  } else {
+    helpers = workers > 1U ? 1U : 0U;
+    producers = workers - helpers;
+  }
+  if (!producers || producers > workers ||
+      helpers != workers - producers) {
+    return -1;
+  }
+  plan->producer_width = producers;
+  plan->helper_width = helpers;
+  return 0;
 }
