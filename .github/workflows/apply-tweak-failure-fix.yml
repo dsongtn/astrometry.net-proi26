@@ -1,0 +1,90 @@
+name: Apply tweak failure fix
+
+on:
+  push:
+    branches:
+      - assistant/verification-reorder-buffer
+    paths:
+      - .github/proi26/tweak-failure-fix.patch
+      - .github/workflows/apply-tweak-failure-fix.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: proi26-tweak-failure-fix
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out assistant branch
+        uses: actions/checkout@v4
+        with:
+          ref: assistant/verification-reorder-buffer
+          fetch-depth: 0
+
+      - name: Verify, apply, compile, and commit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          PATCH=.github/proi26/tweak-failure-fix.patch
+          WORKFLOW=.github/workflows/apply-tweak-failure-fix.yml
+
+          test "$(git hash-object solver/tweak2.c)" = \
+            90ae1c0ff3af892def56c38c8c6ebb1be5c10b48
+          test "$(git hash-object solver/verify.c)" = \
+            f15f567c0a84f3e2029eb3fe8dbbf34f0ec3e594
+          test "$(git hash-object solver/solver.c)" = \
+            183f4ec0da4e415fab2cabe728d8ec8ddaf196d0
+          echo 'a2d0dfabcee8c5d18f0091a6d84186da38a53e254467dd7791e62e31c66a297a  .github/proi26/tweak-failure-fix.patch' |
+            sha256sum -c -
+
+          git apply --check "$PATCH"
+          git apply "$PATCH"
+          git diff --check
+
+          make config >/tmp/proi26-config.log 2>&1
+
+          CFLAGS=(
+            -std=gnu11 -g -Wall -Wextra -pthread -O2
+            -fno-omit-frame-pointer
+            -I../include -I../include/astrometry
+            -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE
+            '-DAN_GIT_REVISION=""'
+            '-DAN_GIT_DATE=""'
+            '-DAN_GIT_URL="https://github.com/dstndstn/astrometry.net"'
+            -I../catalogs -I../gsl-an -I../util -I.
+          )
+          (
+            cd solver
+            gcc "${CFLAGS[@]}" -Werror=implicit-function-declaration \
+              -fsyntax-only tweak2.c
+            gcc "${CFLAGS[@]}" -Werror=implicit-function-declaration \
+              -fsyntax-only verify.c
+            gcc "${CFLAGS[@]}" -Werror=implicit-function-declaration \
+              -fsyntax-only solver.c
+          )
+
+          test "$(git hash-object solver/tweak2.c)" = \
+            149ff00941fd39382dd8f8b328b113fbe0657dd5
+          test "$(git hash-object solver/verify.c)" = \
+            a07ba885ee41ec6d141b7457e053a438a4036ad1
+          test "$(git hash-object solver/solver.c)" = \
+            702ade963eb405ae3c677c33ebff7734938a64eb
+
+          git rm "$PATCH" "$WORKFLOW"
+          git add solver/tweak2.c solver/verify.c solver/solver.c
+
+          test "$(git diff --cached --name-only | sort)" = \
+            "$(printf '%s\n' \
+              .github/proi26/tweak-failure-fix.patch \
+              .github/workflows/apply-tweak-failure-fix.yml \
+              solver/solver.c solver/tweak2.c solver/verify.c | sort)"
+
+          git config user.name 'PROI26 Assistant'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: preserve verified solution when tweak verification fails'
+          git push origin HEAD:assistant/verification-reorder-buffer
