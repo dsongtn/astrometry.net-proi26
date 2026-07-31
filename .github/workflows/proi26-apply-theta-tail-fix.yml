@@ -1,0 +1,120 @@
+name: PROI26 apply verifier theta-tail fix
+
+on:
+  push:
+    branches:
+      - assistant/verification-reorder-buffer
+
+permissions:
+  contents: write
+
+jobs:
+  apply-production-fix:
+    if: contains(github.event.head_commit.message, '[apply-theta-tail]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out assistant branch
+        uses: actions/checkout@v4
+        with:
+          ref: assistant/verification-reorder-buffer
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply bounded production fix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(git rev-parse --abbrev-ref HEAD)" = \
+            "assistant/verification-reorder-buffer"
+          test -f tools/proi26-production/verify_theta_tail_fix.patch
+
+          # Remove the temporary tuning fingerprint/status wrapper.
+          git show \
+            4b85abbdd235072117178fec387577243fa88a19:include/astrometry/tweak2.h \
+            > include/astrometry/tweak2.h
+
+          # Remove temporary verifier diagnostics and their apply helper.
+          rm -rf tools/proi26-diagnostics
+
+          git apply --check \
+            tools/proi26-production/verify_theta_tail_fix.patch
+          git apply \
+            tools/proi26-production/verify_theta_tail_fix.patch
+
+          # The production patch itself is not part of the final source tree.
+          rm -rf tools/proi26-production
+
+      - name: Validate regression and source ordering
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cc \
+            -std=c11 \
+            -Wall -Wextra -Wpedantic \
+            -Iinclude -Iinclude/astrometry -Isolver \
+            solver/test-verify-theta-tail.c \
+            -o /tmp/test-verify-theta-tail
+
+          /tmp/test-verify-theta-tail |
+            grep -Fx 'VERIFY_THETA_TAIL_OK'
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('solver/verify.c').read_text(encoding='utf-8')
+          start = source.index('static int fixup_theta(')
+          end = source.index('\nvoid verify_count_hits(', start)
+          body = source[start:end]
+
+          materialize = body.index('verify_theta_mark_unprocessed(')
+          range_check = body.index('if (theta[i] >= v->NRall)', materialize)
+          assert materialize < range_check
+          assert body.count('theta[i] = THETA_BAILEDOUT') == 0
+          assert body.count('theta[i] = THETA_STOPPEDLOOKING') == 0
+
+          header = Path('solver/verify_theta_tail.h').read_text(
+              encoding='utf-8')
+          assert header.count('theta[i] = THETA_BAILEDOUT') == 1
+          assert header.count('theta[i] = THETA_STOPPEDLOOKING') == 1
+
+          tweak = Path('include/astrometry/tweak2.h').read_text(
+              encoding='utf-8')
+          assert '[tune-fingerprint]' not in tweak
+          assert 'tweak2_status_t' not in tweak
+
+          for removed in (
+              Path('tools/proi26-diagnostics'),
+              Path('tools/proi26-production'),
+          ):
+              assert not removed.exists()
+          PY
+
+      - name: Commit production source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name 'PROI26 Assistant'
+          git config user.email 'dsongtn@users.noreply.github.com'
+
+          git add -A -- \
+            include/astrometry/tweak2.h \
+            solver/verify.c \
+            solver/verify_theta_tail.h \
+            solver/test-verify-theta-tail.c \
+            solver/Makefile \
+            tools/proi26-diagnostics \
+            tools/proi26-production
+
+          printf '%s\n' '=== staged paths ==='
+          git diff --cached --name-status
+
+          git diff --cached --quiet && {
+            echo 'ERROR: production patch produced no staged changes' >&2
+            exit 1
+          }
+
+          git commit -m 'Fix verifier uninitialized theta tail'
+          git push origin HEAD:assistant/verification-reorder-buffer
