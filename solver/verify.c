@@ -3760,7 +3760,7 @@ double verify_star_lists_ror(double* refxys, int NR,
                              double** p_all_logodds, int** p_theta,
                              double* p_worstlogodds,
                              int** p_testperm, int** p_refperm) {
-    double X;
+    double X = -LARGE_VAL;
     verify_t v;
     double* eodds = NULL;
     int* etheta = NULL;
@@ -3779,6 +3779,25 @@ double verify_star_lists_ror(double* refxys, int NR,
     int Ngood;
     double effective_area;
     anbool score_completed;
+
+    if (p_besti) {
+        *p_besti = -1;
+    }
+    if (p_all_logodds) {
+        *p_all_logodds = NULL;
+    }
+    if (p_theta) {
+        *p_theta = NULL;
+    }
+    if (p_worstlogodds) {
+        *p_worstlogodds = -LARGE_VAL;
+    }
+    if (p_testperm) {
+        *p_testperm = NULL;
+    }
+    if (p_refperm) {
+        *p_refperm = NULL;
+    }
 
     memset(&v, 0, sizeof(verify_t));
     v.NRall = v.NR = NR;
