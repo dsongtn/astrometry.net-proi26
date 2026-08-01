@@ -184,7 +184,33 @@ typedef struct index_shard_pool index_shard_pool_t;
 typedef struct index_shard_helper_group index_shard_helper_group_t;
 typedef struct index_shard_staged_group index_shard_staged_group_t;
 
+#define INDEX_SHARD_COMPLETION_SLOT_NONE SIZE_MAX
+
+typedef enum index_shard_completion_entry_state {
+  INDEX_SHARD_COMPLETION_ENTRY_FREE = 0,
+  INDEX_SHARD_COMPLETION_ENTRY_EARLY,
+  INDEX_SHARD_COMPLETION_ENTRY_REGISTERED,
+  INDEX_SHARD_COMPLETION_ENTRY_NOTIFIED
+} index_shard_completion_entry_state_t;
+
+/*
+ * Scheduler-owned completion identity. The payload provider retains only its
+ * immutable numeric completion ID; no task, group, solver, index, or mapping
+ * pointer crosses into the provider. queue_mutex protects this registry.
+ */
+typedef struct index_shard_completion_entry {
+  unsigned long long completion_id;
+  unsigned long pool_generation;
+  unsigned long long owner_epoch;
+  size_t owner_worker;
+  size_t owner_index_order;
+  size_t task_index;
+  size_t next;
+  unsigned char state;
+} index_shard_completion_entry_t;
+
 typedef struct index_shard_thread_state {
+  index_shard_pool_t *pool;          // persistent pool, never task-owned
   onefield_t *bp;                   // master bp, reducer-owned for writes
   const solver_t *base_sp;          // read-only template for local solvers
   const index_shard_hooks_t *hooks; // bridge back into onefield.c
@@ -210,6 +236,17 @@ typedef struct index_shard_thread_state {
   size_t staged_max_compute_running;
   size_t staged_max_compute_running_global;
   unsigned long long staged_completion_epoch;
+
+  /* O(1) completion routing, bounded by workers times staged-task limit. */
+  index_shard_completion_entry_t *completion_entries;
+  size_t *completion_buckets;
+  size_t completion_entry_capacity;
+  size_t completion_bucket_count;
+  size_t completion_free_head;
+  size_t completion_active;
+  size_t staged_submit_callbacks_active;
+  anbool completion_registry_error;
+
   unsigned char *outer_states;
 
   index_shard_result_t *results;
@@ -313,6 +350,12 @@ typedef struct index_shard_thread_state {
   unsigned long long completion_groups_scanned;
   unsigned long long completion_tasks_scanned;
   unsigned long long completion_matches;
+  unsigned long long completion_registry_registered;
+  unsigned long long completion_registry_removed;
+  unsigned long long completion_registry_early;
+  unsigned long long completion_registry_misses;
+  unsigned long long completion_registry_duplicates;
+  unsigned long long completion_registry_invalid;
   unsigned long long selection_scans;
   unsigned long long selection_groups_scanned;
   unsigned long long selection_tasks_scanned;
@@ -442,6 +485,8 @@ struct index_shard_staged_group {
   double retire_seconds;
   unsigned long long owner_work;
   unsigned long long foreign_work;
+
+  size_t completion_registry_entries;
 
   anbool cancelling;
   anbool task_failed;
@@ -2822,6 +2867,353 @@ static int index_shard_helper_add_work(
   return 0;
 }
 
+static size_t index_shard_completion_hash(
+    unsigned long long completion_id,
+    size_t bucket_count) {
+  uint64_t value = (uint64_t)completion_id;
+
+  value ^= value >> 33;
+  value *= UINT64_C(0xff51afd7ed558ccd);
+  value ^= value >> 33;
+  value *= UINT64_C(0xc4ceb9fe1a85ec53);
+  value ^= value >> 33;
+  return (size_t)value & (bucket_count - 1U);
+}
+
+static int index_shard_completion_registry_init(
+    index_shard_thread_state_t *shared,
+    int worker_count) {
+  size_t entry_capacity;
+  size_t bucket_target;
+  size_t bucket_count = 1U;
+  size_t i;
+
+  if (!shared || worker_count < 1 ||
+      (size_t)worker_count >
+          SIZE_MAX / INDEX_SHARD_HELPER_MAX_TASKS) {
+    return -1;
+  }
+  entry_capacity =
+      (size_t)worker_count * INDEX_SHARD_HELPER_MAX_TASKS;
+  if (!entry_capacity || entry_capacity > SIZE_MAX / 2U) {
+    return -1;
+  }
+  bucket_target = entry_capacity * 2U;
+  while (bucket_count < bucket_target) {
+    if (bucket_count > SIZE_MAX / 2U) {
+      return -1;
+    }
+    bucket_count *= 2U;
+  }
+
+  shared->completion_buckets = calloc(
+      bucket_count, sizeof(shared->completion_buckets[0]));
+  shared->completion_entries = calloc(
+      entry_capacity, sizeof(shared->completion_entries[0]));
+  if (!shared->completion_buckets || !shared->completion_entries) {
+    free(shared->completion_buckets);
+    free(shared->completion_entries);
+    shared->completion_buckets = NULL;
+    shared->completion_entries = NULL;
+    return -1;
+  }
+  for (i = 0U; i < bucket_count; i++) {
+    shared->completion_buckets[i] =
+        INDEX_SHARD_COMPLETION_SLOT_NONE;
+  }
+  for (i = 0U; i < entry_capacity; i++) {
+    shared->completion_entries[i].next =
+        i + 1U < entry_capacity
+            ? i + 1U
+            : INDEX_SHARD_COMPLETION_SLOT_NONE;
+    shared->completion_entries[i].state =
+        INDEX_SHARD_COMPLETION_ENTRY_FREE;
+  }
+  shared->completion_bucket_count = bucket_count;
+  shared->completion_entry_capacity = entry_capacity;
+  shared->completion_free_head = 0U;
+  shared->completion_active = 0U;
+  shared->staged_submit_callbacks_active = 0U;
+  shared->completion_registry_error = FALSE;
+  return 0;
+}
+
+static void index_shard_completion_registry_destroy(
+    index_shard_thread_state_t *shared) {
+  if (!shared) {
+    return;
+  }
+  free(shared->completion_buckets);
+  free(shared->completion_entries);
+  shared->completion_buckets = NULL;
+  shared->completion_entries = NULL;
+  shared->completion_bucket_count = 0U;
+  shared->completion_entry_capacity = 0U;
+  shared->completion_free_head = INDEX_SHARD_COMPLETION_SLOT_NONE;
+  shared->completion_active = 0U;
+  shared->staged_submit_callbacks_active = 0U;
+  shared->completion_registry_error = FALSE;
+}
+
+/* queue_mutex must be held. */
+static size_t index_shard_completion_registry_find_locked(
+    const index_shard_thread_state_t *shared,
+    unsigned long long completion_id,
+    size_t *previous_out,
+    size_t *bucket_out) {
+  size_t bucket;
+  size_t previous = INDEX_SHARD_COMPLETION_SLOT_NONE;
+  size_t current;
+  size_t visited = 0U;
+
+  if (previous_out) {
+    *previous_out = INDEX_SHARD_COMPLETION_SLOT_NONE;
+  }
+  if (bucket_out) {
+    *bucket_out = INDEX_SHARD_COMPLETION_SLOT_NONE;
+  }
+  if (!shared || !completion_id ||
+      !shared->completion_buckets ||
+      !shared->completion_entries ||
+      !shared->completion_bucket_count ||
+      (shared->completion_bucket_count &
+       (shared->completion_bucket_count - 1U))) {
+    return INDEX_SHARD_COMPLETION_SLOT_NONE;
+  }
+  bucket = index_shard_completion_hash(
+      completion_id, shared->completion_bucket_count);
+  current = shared->completion_buckets[bucket];
+  while (current != INDEX_SHARD_COMPLETION_SLOT_NONE) {
+    const index_shard_completion_entry_t *entry;
+
+    if (current >= shared->completion_entry_capacity ||
+        visited++ >= shared->completion_entry_capacity) {
+      return INDEX_SHARD_COMPLETION_SLOT_NONE;
+    }
+    entry = &shared->completion_entries[current];
+    if (entry->state != INDEX_SHARD_COMPLETION_ENTRY_FREE &&
+        entry->completion_id == completion_id) {
+      if (previous_out) {
+        *previous_out = previous;
+      }
+      if (bucket_out) {
+        *bucket_out = bucket;
+      }
+      return current;
+    }
+    previous = current;
+    current = entry->next;
+  }
+  if (bucket_out) {
+    *bucket_out = bucket;
+  }
+  return INDEX_SHARD_COMPLETION_SLOT_NONE;
+}
+
+/* queue_mutex must be held. */
+static size_t index_shard_completion_registry_allocate_locked(
+    index_shard_thread_state_t *shared,
+    unsigned long long completion_id) {
+  index_shard_completion_entry_t *entry;
+  size_t bucket;
+  size_t slot;
+
+  if (!shared || !completion_id ||
+      !shared->completion_buckets ||
+      !shared->completion_entries) {
+    return INDEX_SHARD_COMPLETION_SLOT_NONE;
+  }
+  slot = shared->completion_free_head;
+  if (slot == INDEX_SHARD_COMPLETION_SLOT_NONE ||
+      slot >= shared->completion_entry_capacity ||
+      shared->completion_active >=
+          shared->completion_entry_capacity) {
+    return INDEX_SHARD_COMPLETION_SLOT_NONE;
+  }
+  entry = &shared->completion_entries[slot];
+  if (entry->state != INDEX_SHARD_COMPLETION_ENTRY_FREE) {
+    return INDEX_SHARD_COMPLETION_SLOT_NONE;
+  }
+  shared->completion_free_head = entry->next;
+  bucket = index_shard_completion_hash(
+      completion_id, shared->completion_bucket_count);
+  memset(entry, 0, sizeof(*entry));
+  entry->completion_id = completion_id;
+  entry->next = shared->completion_buckets[bucket];
+  shared->completion_buckets[bucket] = slot;
+  shared->completion_active++;
+  return slot;
+}
+
+/* queue_mutex must be held. */
+static int index_shard_completion_registry_unlink_locked(
+    index_shard_thread_state_t *shared,
+    size_t slot,
+    size_t previous,
+    size_t bucket) {
+  index_shard_completion_entry_t *entry;
+
+  if (!shared || slot >= shared->completion_entry_capacity ||
+      bucket >= shared->completion_bucket_count ||
+      !shared->completion_active) {
+    return -1;
+  }
+  entry = &shared->completion_entries[slot];
+  if (entry->state == INDEX_SHARD_COMPLETION_ENTRY_FREE) {
+    return -1;
+  }
+  if (previous == INDEX_SHARD_COMPLETION_SLOT_NONE) {
+    if (shared->completion_buckets[bucket] != slot) {
+      return -1;
+    }
+    shared->completion_buckets[bucket] = entry->next;
+  } else {
+    if (previous >= shared->completion_entry_capacity ||
+        shared->completion_entries[previous].next != slot) {
+      return -1;
+    }
+    shared->completion_entries[previous].next = entry->next;
+  }
+  memset(entry, 0, sizeof(*entry));
+  entry->state = INDEX_SHARD_COMPLETION_ENTRY_FREE;
+  entry->next = shared->completion_free_head;
+  shared->completion_free_head = slot;
+  shared->completion_active--;
+  return 0;
+}
+
+/* queue_mutex must be held. */
+static int index_shard_completion_registry_record_early_locked(
+    index_shard_thread_state_t *shared,
+    unsigned long long completion_id) {
+  index_shard_completion_entry_t *entry;
+  size_t slot;
+
+  if (!shared || !completion_id ||
+      index_shard_completion_registry_find_locked(
+          shared, completion_id, NULL, NULL) !=
+          INDEX_SHARD_COMPLETION_SLOT_NONE) {
+    return -1;
+  }
+  slot = index_shard_completion_registry_allocate_locked(
+      shared, completion_id);
+  if (slot == INDEX_SHARD_COMPLETION_SLOT_NONE) {
+    return -1;
+  }
+  entry = &shared->completion_entries[slot];
+  entry->state = INDEX_SHARD_COMPLETION_ENTRY_EARLY;
+  if (shared->observability_enabled) {
+    index_shard_observability_increment(
+        &shared->completion_registry_early);
+  }
+  return 0;
+}
+
+/* queue_mutex must be held. */
+static int index_shard_completion_registry_register_locked(
+    index_shard_thread_state_t *shared,
+    index_shard_staged_group_t *group,
+    size_t task_index,
+    unsigned long long completion_id,
+    anbool *already_notified) {
+  index_shard_completion_entry_t *entry;
+  size_t slot;
+
+  if (already_notified) {
+    *already_notified = FALSE;
+  }
+  if (!shared || !group || !group->pool ||
+      !completion_id || task_index >= group->task_count ||
+      group->owner_worker < 0 ||
+      group->owner_worker >= shared->worker_count ||
+      group->generation != group->pool->generation) {
+    return -1;
+  }
+  slot = index_shard_completion_registry_find_locked(
+      shared, completion_id, NULL, NULL);
+  if (slot == INDEX_SHARD_COMPLETION_SLOT_NONE) {
+    slot = index_shard_completion_registry_allocate_locked(
+        shared, completion_id);
+    if (slot == INDEX_SHARD_COMPLETION_SLOT_NONE) {
+      return -1;
+    }
+    entry = &shared->completion_entries[slot];
+    entry->state = INDEX_SHARD_COMPLETION_ENTRY_REGISTERED;
+  } else {
+    entry = &shared->completion_entries[slot];
+    if (entry->state != INDEX_SHARD_COMPLETION_ENTRY_EARLY) {
+      if (shared->observability_enabled) {
+        index_shard_observability_increment(
+            &shared->completion_registry_duplicates);
+      }
+      return -1;
+    }
+    entry->state = INDEX_SHARD_COMPLETION_ENTRY_NOTIFIED;
+    if (already_notified) {
+      *already_notified = TRUE;
+    }
+    if (shared->observability_enabled) {
+      index_shard_observability_increment(
+          &shared->completion_matches);
+    }
+  }
+  entry->pool_generation = group->generation;
+  entry->owner_epoch = group->owner_epoch;
+  entry->owner_worker = (size_t)group->owner_worker;
+  entry->owner_index_order = group->owner_index_order;
+  entry->task_index = task_index;
+  group->completion_registry_entries++;
+  if (shared->observability_enabled) {
+    index_shard_observability_increment(
+        &shared->completion_registry_registered);
+  }
+  return 0;
+}
+
+/* queue_mutex must be held. */
+static int index_shard_completion_registry_remove_locked(
+    index_shard_thread_state_t *shared,
+    index_shard_staged_group_t *group,
+    size_t task_index,
+    unsigned long long completion_id) {
+  index_shard_completion_entry_t *entry;
+  size_t previous;
+  size_t bucket;
+  size_t slot;
+
+  if (!shared || !group || !completion_id) {
+    return -1;
+  }
+  slot = index_shard_completion_registry_find_locked(
+      shared, completion_id, &previous, &bucket);
+  if (slot == INDEX_SHARD_COMPLETION_SLOT_NONE ||
+      slot >= shared->completion_entry_capacity ||
+      bucket >= shared->completion_bucket_count) {
+    return -1;
+  }
+  entry = &shared->completion_entries[slot];
+  if ((entry->state != INDEX_SHARD_COMPLETION_ENTRY_REGISTERED &&
+       entry->state != INDEX_SHARD_COMPLETION_ENTRY_NOTIFIED) ||
+      entry->pool_generation != group->generation ||
+      entry->owner_epoch != group->owner_epoch ||
+      entry->owner_worker != (size_t)group->owner_worker ||
+      entry->owner_index_order != group->owner_index_order ||
+      entry->task_index != task_index ||
+      !group->completion_registry_entries) {
+    return -1;
+  }
+  if (index_shard_completion_registry_unlink_locked(
+          shared, slot, previous, bucket)) {
+    return -1;
+  }
+  group->completion_registry_entries--;
+  if (shared->observability_enabled) {
+    index_shard_observability_increment(
+        &shared->completion_registry_removed);
+  }
+  return 0;
+}
+
 static unsigned long long index_shard_staged_task_work(
     const index_shard_staged_task_t *task) {
   return task->work_units ? task->work_units : 1U;
@@ -2937,8 +3329,11 @@ static void index_shard_staged_completion_notify(
   index_shard_pool_t *pool = opaque;
   index_shard_thread_state_t *shared;
   index_shard_staged_group_t *matched_group = NULL;
+  index_shard_staged_task_t *matched_task = NULL;
+  index_shard_completion_entry_t *entry = NULL;
+  size_t slot;
   size_t matches = 0U;
-  anbool wake = FALSE;
+  anbool invalid = FALSE;
   int owner;
 
   if (!pool || !completion_id) {
@@ -2954,61 +3349,85 @@ static void index_shard_staged_completion_notify(
   if (!shared->staged_completion_epoch) {
     shared->staged_completion_epoch++;
   }
-  for (owner = 0; owner < shared->worker_count; owner++) {
-    index_shard_worker_context_t *context =
-        &pool->contexts[owner];
-    index_shard_staged_group_t *group =
-        context->published_staged_group;
-    size_t task_index;
 
-    if (!group) {
-      continue;
-    }
-    if (shared->observability_enabled) {
-      index_shard_observability_increment(
-          &shared->completion_groups_scanned);
-    }
-    if (index_shard_staged_group_valid_locked(
-            pool, context, group)) {
-      group->internal_error = TRUE;
-      wake = TRUE;
-      continue;
-    }
-    for (task_index = 0U;
-         task_index < group->task_count;
-         task_index++) {
-      index_shard_staged_task_t *task =
-          &group->tasks[task_index];
-
+  slot = index_shard_completion_registry_find_locked(
+      shared, completion_id, NULL, NULL);
+  if (slot == INDEX_SHARD_COMPLETION_SLOT_NONE) {
+    /*
+     * submit() executes without queue_mutex. A fast provider may complete
+     * after ticket publication but before the submitter can register its
+     * task identity. Retain the numeric ID until that submit callback returns.
+     */
+    if (shared->staged_submit_callbacks_active) {
+      if (index_shard_completion_registry_record_early_locked(
+              shared, completion_id)) {
+        invalid = TRUE;
+      }
+    } else {
+      invalid = TRUE;
       if (shared->observability_enabled) {
         index_shard_observability_increment(
-            &shared->completion_tasks_scanned);
+            &shared->completion_registry_misses);
       }
-      if (task->scheduler_state ==
-          INDEX_SHARD_STAGED_TASK_SUBMIT_READY) {
-        wake = TRUE;
+    }
+  } else if (slot >= shared->completion_entry_capacity) {
+    invalid = TRUE;
+  } else {
+    entry = &shared->completion_entries[slot];
+    if (entry->state != INDEX_SHARD_COMPLETION_ENTRY_REGISTERED ||
+        entry->owner_worker >= (size_t)shared->worker_count) {
+      invalid = TRUE;
+      if (shared->observability_enabled) {
+        index_shard_observability_increment(
+            &shared->completion_registry_duplicates);
       }
-      if (task->completion_id != completion_id) {
-        continue;
-      }
-      matches++;
-      if (!matched_group) {
-        matched_group = group;
-      } else if (matched_group != group || matches > 1U) {
-        matched_group->internal_error = TRUE;
-        group->internal_error = TRUE;
-      }
-      if (task->scheduler_state !=
-              INDEX_SHARD_STAGED_TASK_IO_SUBMITTED &&
-          task->scheduler_state !=
-              INDEX_SHARD_STAGED_TASK_IO_POLLING &&
-          task->scheduler_state !=
-              INDEX_SHARD_STAGED_TASK_IO_CANCELLING) {
-        group->internal_error = TRUE;
+    } else {
+      index_shard_worker_context_t *context =
+          &pool->contexts[entry->owner_worker];
+
+      matched_group = context->published_staged_group;
+      if (!matched_group ||
+          index_shard_staged_group_valid_locked(
+              pool, context, matched_group) ||
+          matched_group->generation != entry->pool_generation ||
+          matched_group->owner_epoch != entry->owner_epoch ||
+          matched_group->owner_index_order !=
+              entry->owner_index_order ||
+          entry->task_index >= matched_group->task_count) {
+        invalid = TRUE;
       } else {
-        task->completion_pending = TRUE;
+        matched_task = &matched_group->tasks[entry->task_index];
+        if (matched_task->completion_id != completion_id ||
+            (matched_task->scheduler_state !=
+                 INDEX_SHARD_STAGED_TASK_IO_SUBMITTED &&
+             matched_task->scheduler_state !=
+                 INDEX_SHARD_STAGED_TASK_IO_POLLING &&
+             matched_task->scheduler_state !=
+                 INDEX_SHARD_STAGED_TASK_IO_CANCELLING) ||
+            matched_task->completion_pending) {
+          invalid = TRUE;
+        } else {
+          matched_task->completion_pending = TRUE;
+          entry->state = INDEX_SHARD_COMPLETION_ENTRY_NOTIFIED;
+          matches = 1U;
+        }
       }
-      wake = TRUE;
+    }
+  }
+
+  if (invalid) {
+    shared->completion_registry_error = TRUE;
+    if (shared->observability_enabled) {
+      index_shard_observability_increment(
+          &shared->completion_registry_invalid);
+    }
+    for (owner = 0; owner < shared->worker_count; owner++) {
+      index_shard_staged_group_t *group =
+          pool->contexts[owner].published_staged_group;
+
+      if (group) {
+        group->internal_error = TRUE;
+      }
     }
   }
   if (shared->observability_enabled) {
@@ -3016,9 +3435,8 @@ static void index_shard_staged_completion_notify(
         &shared->completion_matches,
         (unsigned long long)matches);
   }
-  if (wake) {
-    index_shard_queue_broadcast_locked(shared);
-  }
+  /* Gate 2A changes lookup only; later gates change selection and wakeups. */
+  index_shard_queue_broadcast_locked(shared);
   pthread_mutex_unlock(&shared->queue_mutex);
 }
 
@@ -3207,11 +3625,13 @@ static int index_shard_staged_select_locked(
     best_group->prepare_claims++;
     break;
   case INDEX_SHARD_STAGED_CLAIM_SUBMIT:
-    if (index_shard_staged_set_state_locked(
-        shared, best_group, &best_group->tasks[best_task],
-        INDEX_SHARD_STAGED_TASK_SUBMITTING)) {
+    if (shared->staged_submit_callbacks_active == SIZE_MAX ||
+        index_shard_staged_set_state_locked(
+            shared, best_group, &best_group->tasks[best_task],
+            INDEX_SHARD_STAGED_TASK_SUBMITTING)) {
       return -1;
     }
+    shared->staged_submit_callbacks_active++;
     best_group->submit_claims++;
     break;
   case INDEX_SHARD_STAGED_CLAIM_IO_POLL:
@@ -3761,11 +4181,20 @@ static void index_shard_staged_set_failed_locked(
 /* queue_mutex must be held. */
 static int index_shard_staged_release_ticket_locked(
     index_shard_thread_state_t *shared,
-    index_shard_staged_group_t *group) {
+    index_shard_staged_group_t *group,
+    index_shard_staged_task_t *task) {
   int invalid = FALSE;
 
-  if (!shared || !group) {
+  if (!shared || !group || !task) {
     return -1;
+  }
+  if (task->completion_id &&
+      index_shard_completion_registry_remove_locked(
+          shared,
+          group,
+          (size_t)(task - group->tasks),
+          task->completion_id)) {
+    invalid = TRUE;
   }
   if (group->io_submitted) {
     group->io_submitted--;
@@ -3785,43 +4214,10 @@ static int index_shard_staged_release_ticket_locked(
   }
   shared->staged_io_completed++;
   if (invalid) {
+    shared->completion_registry_error = TRUE;
     group->internal_error = TRUE;
   }
   return invalid ? -1 : 0;
-}
-
-/* queue_mutex must be held. */
-static int index_shard_staged_completion_id_active_locked(
-    const index_shard_staged_group_t *current_group,
-    const index_shard_staged_task_t *current_task,
-    unsigned long long completion_id) {
-  index_shard_pool_t *pool;
-  int owner;
-
-  if (!current_group || !current_group->pool || !completion_id) {
-    return -1;
-  }
-  pool = current_group->pool;
-  for (owner = 0; owner < pool->shared.worker_count; owner++) {
-    const index_shard_staged_group_t *group =
-        pool->contexts[owner].published_staged_group;
-    size_t task_index;
-
-    if (!group) {
-      continue;
-    }
-    for (task_index = 0U; task_index < group->task_count; task_index++) {
-      const index_shard_staged_task_t *task = &group->tasks[task_index];
-
-      if (group == current_group && task == current_task) {
-        continue;
-      }
-      if (task->completion_id == completion_id) {
-        return 1;
-      }
-    }
-  }
-  return 0;
 }
 
 static int index_shard_staged_complete_claim(
@@ -3882,6 +4278,15 @@ static int index_shard_staged_complete_claim(
     break;
   }
   group->running_count--;
+  if (claim->kind == INDEX_SHARD_STAGED_CLAIM_SUBMIT) {
+    if (!shared->staged_submit_callbacks_active) {
+      shared->completion_registry_error = TRUE;
+      group->internal_error = TRUE;
+      rc = -1;
+    } else {
+      shared->staged_submit_callbacks_active--;
+    }
+  }
   if (claim->kind == INDEX_SHARD_STAGED_CLAIM_EXECUTE) {
     if (!group->compute_running ||
         !shared->staged_compute_running_global) {
@@ -3941,10 +4346,7 @@ static int index_shard_staged_complete_claim(
   } else if (claim->kind == INDEX_SHARD_STAGED_CLAIM_SUBMIT) {
     if (((index_shard_staged_submit_status_t)callback_status ==
              INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED) !=
-            (completion_id != 0ULL) ||
-        (completion_id &&
-         index_shard_staged_completion_id_active_locked(
-             group, task, completion_id) != 0)) {
+            (completion_id != 0ULL)) {
       group->internal_error = TRUE;
       index_shard_staged_set_failed_locked(shared, group, task);
       rc = -1;
@@ -3961,15 +4363,24 @@ static int index_shard_staged_complete_claim(
         task->scheduler_epoch = claim->observed_completion_epoch;
         shared->staged_submit_retries++;
         break;
-      case INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED:
+      case INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED: {
+        anbool already_notified = FALSE;
+
         (void)index_shard_staged_set_state_locked(
             shared, group, task, INDEX_SHARD_STAGED_TASK_IO_SUBMITTED);
         task->scheduler_epoch = ~shared->staged_completion_epoch;
         task->cancel_sent = FALSE;
         task->completion_id = completion_id;
-        task->completion_pending =
-            shared->staged_completion_epoch !=
-                claim->observed_completion_epoch;
+        if (index_shard_completion_registry_register_locked(
+                shared, group, claim->task_index,
+                completion_id, &already_notified)) {
+          shared->completion_registry_error = TRUE;
+          group->internal_error = TRUE;
+          task->completion_pending = TRUE;
+          rc = -1;
+        } else {
+          task->completion_pending = already_notified;
+        }
         task->scheduler_submit_seconds = now;
         group->io_submitted++;
         if (group->io_submitted > group->max_io_submitted) {
@@ -3982,6 +4393,7 @@ static int index_shard_staged_complete_claim(
         shared->staged_source_leases++;
         shared->staged_io_submitted++;
         break;
+      }
       case INDEX_SHARD_STAGED_SUBMIT_COMPUTE_READY:
         (void)index_shard_staged_set_state_locked(
             shared, group, task, INDEX_SHARD_STAGED_TASK_COMPUTE_READY);
@@ -4011,7 +4423,7 @@ static int index_shard_staged_complete_claim(
       /* completion_pending preserves a notifier racing this unlocked poll. */
       break;
     case INDEX_SHARD_STAGED_IO_READY:
-      (void)index_shard_staged_release_ticket_locked(shared, group);
+      (void)index_shard_staged_release_ticket_locked(shared, group, task);
       task->completion_id = 0ULL;
       task->completion_pending = FALSE;
       if (task->scheduler_submit_seconds > 0.0 &&
@@ -4031,7 +4443,7 @@ static int index_shard_staged_complete_claim(
       }
       break;
     case INDEX_SHARD_STAGED_IO_FAILED:
-      (void)index_shard_staged_release_ticket_locked(shared, group);
+      (void)index_shard_staged_release_ticket_locked(shared, group, task);
       task->completion_id = 0ULL;
       task->completion_pending = FALSE;
       if (task->scheduler_submit_seconds > 0.0 &&
@@ -4051,7 +4463,7 @@ static int index_shard_staged_complete_claim(
       }
       break;
     case INDEX_SHARD_STAGED_IO_CANCELLED:
-      (void)index_shard_staged_release_ticket_locked(shared, group);
+      (void)index_shard_staged_release_ticket_locked(shared, group, task);
       task->completion_id = 0ULL;
       task->completion_pending = FALSE;
       task->scheduler_submit_seconds = 0.0;
@@ -4061,7 +4473,7 @@ static int index_shard_staged_complete_claim(
       break;
     case INDEX_SHARD_STAGED_IO_ERROR:
     default:
-      (void)index_shard_staged_release_ticket_locked(shared, group);
+      (void)index_shard_staged_release_ticket_locked(shared, group, task);
       task->completion_id = 0ULL;
       task->completion_pending = FALSE;
       task->scheduler_submit_seconds = 0.0;
@@ -5352,7 +5764,7 @@ index_shard_staged_run_ordered(
 
   if (group->running_count || group->compute_running ||
       group->io_submitted || group->compute_ready ||
-      group->reorder_ready) {
+      group->reorder_ready || group->completion_registry_entries) {
     group->internal_error = TRUE;
   }
   for (i = 0U; i < task_count; i++) {
@@ -6885,6 +7297,7 @@ static int index_shard_shared_init(index_shard_thread_state_t *shared) {
  * Destroy synchronization primitives after all workers have joined.
  */
 static void index_shard_shared_destroy(index_shard_thread_state_t *shared) {
+  index_shard_completion_registry_destroy(shared);
   pthread_cond_destroy(&shared->queue_cv);
   pthread_mutex_destroy(&shared->queue_mutex);
 
@@ -7090,6 +7503,18 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
     pthread_mutex_unlock(&index_shard_global_pool_mutex);
     return -1;
   }
+  pool->shared.pool = pool;
+  if (index_shard_completion_registry_init(
+          &pool->shared, worker_count)) {
+    index_shard_shared_destroy(&pool->shared);
+    pthread_cond_destroy(&pool->work_cv);
+    pthread_mutex_destroy(&pool->control_mutex);
+    pthread_mutex_destroy(&pool->inverse_cache_mutex);
+    free(pool);
+    pthread_mutex_unlock(&index_shard_global_pool_mutex);
+    return -1;
+  }
+
 
   pool->threads = calloc((size_t)worker_count, sizeof(pthread_t));
   pool->contexts = calloc((size_t)worker_count,
@@ -7423,6 +7848,16 @@ static int index_shard_pool_submit(
       return -1;
     }
   }
+  if (shared->completion_active ||
+      shared->staged_submit_callbacks_active) {
+    logerr("[index-shard] completion registry remained before pass "
+           "active=%zu submit_callbacks=%zu\n",
+           shared->completion_active,
+           shared->staged_submit_callbacks_active);
+    pthread_mutex_unlock(&shared->queue_mutex);
+    pthread_mutex_unlock(&pool->control_mutex);
+    return -1;
+  }
   if (shared->queue_waiters) {
     logerr("[index-shard] queue waiters remained before pass "
            "count=%zu\n", shared->queue_waiters);
@@ -7500,6 +7935,8 @@ static int index_shard_pool_submit(
   shared->staged_max_compute_running = 0U;
   shared->staged_max_compute_running_global = 0U;
   shared->staged_completion_epoch = 1U;
+  shared->staged_submit_callbacks_active = 0U;
+  shared->completion_registry_error = FALSE;
   shared->outer_states = outer_states;
   shared->outer_claims = 0U;
   shared->helper_groups_published = 0U;
@@ -7546,6 +7983,12 @@ static int index_shard_pool_submit(
   shared->completion_groups_scanned = 0U;
   shared->completion_tasks_scanned = 0U;
   shared->completion_matches = 0U;
+  shared->completion_registry_registered = 0U;
+  shared->completion_registry_removed = 0U;
+  shared->completion_registry_early = 0U;
+  shared->completion_registry_misses = 0U;
+  shared->completion_registry_duplicates = 0U;
+  shared->completion_registry_invalid = 0U;
   shared->selection_scans = 0U;
   shared->selection_groups_scanned = 0U;
   shared->selection_tasks_scanned = 0U;
@@ -7859,6 +8302,19 @@ index_shard_solve_impl(onefield_t *bp,
     status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
     helper_quiescence_valid = FALSE;
   }
+  if (pool->shared.completion_active ||
+      pool->shared.staged_submit_callbacks_active ||
+      pool->shared.completion_registry_error) {
+    logerr("[index-shard] completion registry remained after "
+           "worker quiescence active=%zu submit_callbacks=%zu "
+           "error=%i\n",
+           pool->shared.completion_active,
+           pool->shared.staged_submit_callbacks_active,
+           pool->shared.completion_registry_error ? 1 : 0);
+    rc = -1;
+    status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
+    helper_quiescence_valid = FALSE;
+  }
   if (pool->shared.staged_groups_published !=
       pool->shared.staged_groups_completed) {
     logerr("[index-shard] staged group lifecycle mismatch "
@@ -8148,7 +8604,11 @@ index_shard_solve_impl(onefield_t *bp,
           "queue_broadcasts=%llu queue_waits=%llu "
           "queue_wait_seconds=%.6f completions=%llu "
           "completion_groups=%llu completion_tasks=%llu "
-          "completion_matches=%llu selection_scans=%llu "
+          "completion_matches=%llu completion_registered=%llu "
+          "completion_removed=%llu completion_early=%llu "
+          "completion_misses=%llu completion_duplicates=%llu "
+          "completion_invalid=%llu completion_active=%zu "
+          "selection_scans=%llu "
           "selection_groups=%llu selection_tasks=%llu "
           "selection_misses=%llu helper_windows=%llu "
           "helper_window_seconds=%.6f verification_groups=%llu "
@@ -8162,6 +8622,13 @@ index_shard_solve_impl(onefield_t *bp,
           pool->shared.completion_groups_scanned,
           pool->shared.completion_tasks_scanned,
           pool->shared.completion_matches,
+          pool->shared.completion_registry_registered,
+          pool->shared.completion_registry_removed,
+          pool->shared.completion_registry_early,
+          pool->shared.completion_registry_misses,
+          pool->shared.completion_registry_duplicates,
+          pool->shared.completion_registry_invalid,
+          pool->shared.completion_active,
           pool->shared.selection_scans,
           pool->shared.selection_groups_scanned,
           pool->shared.selection_tasks_scanned,
