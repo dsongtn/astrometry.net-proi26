@@ -124,6 +124,35 @@ void engine_pass_apply(solver_t* solver, const engine_pass_t* pass) {
     solver->funits_upper = pass->funits_upper;
 }
 
+void engine_limit_policy_resolve(double job_wall_seconds,
+                                 double config_wall_seconds,
+                                 double job_cpu_seconds,
+                                 double config_cpu_seconds,
+                                 engine_limit_policy_t* policy) {
+    if (!policy) {
+        return;
+    }
+    memset(policy, 0, sizeof(*policy));
+
+    if (job_wall_seconds > 0.0 && config_wall_seconds > 0.0) {
+        policy->wall_seconds = MIN(job_wall_seconds, config_wall_seconds);
+        policy->wall_from_job = job_wall_seconds <= config_wall_seconds;
+        policy->wall_job_clamped = job_wall_seconds > config_wall_seconds;
+    } else if (job_wall_seconds > 0.0) {
+        policy->wall_seconds = job_wall_seconds;
+        policy->wall_from_job = TRUE;
+    } else if (config_wall_seconds > 0.0) {
+        policy->wall_seconds = config_wall_seconds;
+    }
+
+    if (job_cpu_seconds > 0.0) {
+        policy->cpu_seconds = job_cpu_seconds;
+        policy->cpu_from_job = TRUE;
+    } else if (config_cpu_seconds > 0.0) {
+        policy->cpu_seconds = config_cpu_seconds;
+    }
+}
+
 void engine_add_search_path(engine_t* engine, const char* path) {
     sl_append(engine->index_paths, path);
 }
@@ -361,6 +390,9 @@ int engine_parse_config_file_stream(engine_t* engine, FILE* fconf) {
             engine->maxwidth = atof(nextword);
         } else if (is_word(line, "cpulimit ", &nextword)) {
             engine->cpulimit = atof(nextword);
+        } else if (is_word(line, "walllimit ", &nextword) ||
+                   is_word(line, "wall_limit ", &nextword)) {
+            engine->walllimit = atof(nextword);
         } else if (is_word(line, "p_workers ", &nextword) ||
                    is_word(line, "index_shard_workers ", &nextword)) {
             int available_cpus = index_shard_config_available_cpus();
@@ -1940,7 +1972,8 @@ engine_t* engine_new() {
     // Default scale estimate: field width, in degrees:
     engine->minwidth = 0.1;
     engine->maxwidth = 180.0;
-    engine->cpulimit = 600.0;
+    engine->walllimit = 300.0;
+    engine->cpulimit = 0.0;
     engine->index_shard_workers_config = INDEX_SHARD_WORKERS_AUTO;
     return engine;
 }
@@ -2103,72 +2136,66 @@ job_t* engine_read_job_file(engine_t* engine, const char* jobfn) {
         dl_append(job->scales, arcsecperpix);
     }
 
-    // The job can only decrease the CPU limit.
-    // SECTION INDEX-SHARD: cpu-limit-precedence
+    // SECTION INDEX-SHARD: limit-precedence
     /*
-     * Upstream-compatible CPU-limit handling.
-     *
-     * Sources:
-     *   - bp->cpulimit      job/ANCLIM limit, normally produced by solve-field
-     *                       --cpulimit
-     *   - engine->cpulimit  backend/config limit from astrometry.cfg
-     *
-     * Semantics:
-     *   - if both exist, use the smaller one
-     *   - if only one exists, use that one
-     *   - if neither exists, run without a CPU limit
-     *
-     * This preserves the original astrometry.net behavior: solve-field may
-     * reduce a backend/config CPU limit but must not increase it.
-     *
-     * pthread index-sharding detail:
-     *   In pthread mode the effective limit is stored in bp->total_cpulimit and
-     *   bp->cpulimit is cleared.  This prevents worker-local onefield copies
-     * from treating the same budget as an independent per-index/per-worker
-     * limit.
+     * Wall time is the primary user-facing deadline.  A job may reduce the
+     * backend wall limit but may not increase it.  CPU time remains aggregate
+     * process user+system time; a job value overrides the optional config
+     * default because the site-level hard ceiling is now the wall limit.
      */
     {
+      engine_limit_policy_t limits;
+      double job_walllimit = bp->timelimit;
+      double cfg_walllimit = engine->walllimit;
       double job_cpulimit = bp->cpulimit;
       double cfg_cpulimit = engine->cpulimit;
-      double effective_cpulimit = 0.0;
 
-      if (job_cpulimit > 0.0 && cfg_cpulimit > 0.0) {
-        effective_cpulimit =
-            (job_cpulimit < cfg_cpulimit) ? job_cpulimit : cfg_cpulimit;
-      } else if (job_cpulimit > 0.0) {
-        effective_cpulimit = job_cpulimit;
-      } else if (cfg_cpulimit > 0.0) {
-        effective_cpulimit = cfg_cpulimit;
-      }
+      engine_limit_policy_resolve(
+          job_walllimit, cfg_walllimit,
+          job_cpulimit, cfg_cpulimit, &limits);
 
-      if (effective_cpulimit > 0.0) {
-        logverb("Using effective CPU time limit of %g seconds "
-                "(job=%g, config=%g)\n",
-                effective_cpulimit, job_cpulimit, cfg_cpulimit);
-      } else {
-        logverb("No CPU time limit set for this job "
-                "(job=%g, config=%g)\n",
-                job_cpulimit, cfg_cpulimit);
-      }
-
+      bp->timelimit = limits.wall_seconds;
+      bp->total_timelimit = limits.wall_seconds;
       if (index_shard_pthread_enabled(bp)) {
-        /*
-         * pthread path:
-         * total_cpulimit is the process-wide budget checked by
-         * index_shard_check_global_cpu_limit().
-         */
-        bp->total_cpulimit = effective_cpulimit;
+        bp->total_cpulimit = limits.cpu_seconds;
         bp->cpulimit = 0.0;
       } else {
-        /*
-         * Original/non-pthread path:
-         * keep bp->cpulimit as the ordinary effective run limit.
-         */
-        bp->cpulimit = effective_cpulimit;
-        bp->total_cpulimit = effective_cpulimit;
+        bp->cpulimit = limits.cpu_seconds;
+        bp->total_cpulimit = limits.cpu_seconds;
       }
 
-      bp->total_timelimit = bp->timelimit;
+      if (limits.wall_job_clamped) {
+        logmsg("Requested wall limit %g s reduced to backend limit %g s.\n",
+               job_walllimit, limits.wall_seconds);
+      }
+      if (limits.wall_seconds > 0.0 && limits.cpu_seconds > 0.0) {
+        logmsg("Limits: wall=%g s elapsed engine time; "
+               "CPU=%g aggregate process seconds; workers=%i.\n",
+               limits.wall_seconds, limits.cpu_seconds,
+               bp->index_shard_workers);
+      } else if (limits.wall_seconds > 0.0) {
+        logmsg("Limits: wall=%g s elapsed engine time; "
+               "CPU=unlimited aggregate process time; workers=%i.\n",
+               limits.wall_seconds, bp->index_shard_workers);
+      } else if (limits.cpu_seconds > 0.0) {
+        logmsg("Limits: wall=unlimited elapsed engine time; "
+               "CPU=%g aggregate process seconds; workers=%i.\n",
+               limits.cpu_seconds, bp->index_shard_workers);
+      } else {
+        logmsg("Limits: wall=unlimited elapsed engine time; "
+               "CPU=unlimited aggregate process time; workers=%i.\n",
+               bp->index_shard_workers);
+      }
+      logverb("[limits] wall_effective=%g wall_job=%g wall_config=%g "
+              "wall_source=%s wall_clamped=%i "
+              "cpu_effective=%g cpu_job=%g cpu_config=%g cpu_source=%s\n",
+              limits.wall_seconds, job_walllimit, cfg_walllimit,
+              limits.wall_from_job ? "job" :
+                  (cfg_walllimit > 0.0 ? "config" : "none"),
+              limits.wall_job_clamped ? 1 : 0,
+              limits.cpu_seconds, job_cpulimit, cfg_cpulimit,
+              limits.cpu_from_job ? "job" :
+                  (cfg_cpulimit > 0.0 ? "config" : "none"));
     }
 
     logverb("[index-shard] engine limits after setup: "

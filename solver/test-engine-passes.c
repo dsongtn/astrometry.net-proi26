@@ -123,13 +123,74 @@ static void range_major_scale_minor_order(void) {
     dl_free(job.scales);
 }
 
+static void primary_wall_and_optional_cpu_policy(void) {
+    engine_limit_policy_t limits;
+    engine_t* engine;
+
+    engine = engine_new();
+    CHECK(engine != NULL);
+    if (engine) {
+        CHECK(close_enough(engine->walllimit, 300.0));
+        CHECK(close_enough(engine->cpulimit, 0.0));
+        engine_free(engine);
+    }
+
+    {
+        FILE* config = tmpfile();
+
+        CHECK(config != NULL);
+        if (config) {
+            engine = engine_new();
+            CHECK(engine != NULL);
+            CHECK(fputs("walllimit 240\ncpulimit 0\n", config) >= 0);
+            rewind(config);
+            if (engine) {
+                CHECK(engine_parse_config_file_stream(engine, config) == 0);
+                CHECK(close_enough(engine->walllimit, 240.0));
+                CHECK(close_enough(engine->cpulimit, 0.0));
+                engine_free(engine);
+            }
+            fclose(config);
+        }
+    }
+
+    engine_limit_policy_resolve(0.0, 300.0, 0.0, 0.0, &limits);
+    CHECK(close_enough(limits.wall_seconds, 300.0));
+    CHECK(close_enough(limits.cpu_seconds, 0.0));
+    CHECK(!limits.wall_from_job);
+    CHECK(!limits.wall_job_clamped);
+    CHECK(!limits.cpu_from_job);
+
+    engine_limit_policy_resolve(60.0, 300.0, 720.0, 0.0, &limits);
+    CHECK(close_enough(limits.wall_seconds, 60.0));
+    CHECK(close_enough(limits.cpu_seconds, 720.0));
+    CHECK(limits.wall_from_job);
+    CHECK(!limits.wall_job_clamped);
+    CHECK(limits.cpu_from_job);
+
+    engine_limit_policy_resolve(600.0, 300.0, 720.0, 120.0, &limits);
+    CHECK(close_enough(limits.wall_seconds, 300.0));
+    CHECK(close_enough(limits.cpu_seconds, 720.0));
+    CHECK(!limits.wall_from_job);
+    CHECK(limits.wall_job_clamped);
+    CHECK(limits.cpu_from_job);
+
+    engine_limit_policy_resolve(600.0, 0.0, 0.0, 120.0, &limits);
+    CHECK(close_enough(limits.wall_seconds, 600.0));
+    CHECK(close_enough(limits.cpu_seconds, 120.0));
+    CHECK(limits.wall_from_job);
+    CHECK(!limits.wall_job_clamped);
+    CHECK(!limits.cpu_from_job);
+}
+
 int main(void) {
     bounded_then_open_resets_endobj();
     range_major_scale_minor_order();
+    primary_wall_and_optional_cpu_policy();
     if (failures) {
         fprintf(stderr, "ENGINE_PASS_TEST_FAILED failures=%i\n", failures);
         return 1;
     }
-    printf("ENGINE_PASS_TEST_OK cases=2 ordered_passes=9\n");
+    printf("ENGINE_PASS_TEST_OK cases=3 ordered_passes=9\n");
     return 0;
 }

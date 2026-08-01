@@ -34,6 +34,7 @@ struct engine {
     anbool inparallel;
     double minwidth;
     double maxwidth;
+    double walllimit;
     float cpulimit;
     /*
      * Site-level worker request. Zero is the internal representation of
