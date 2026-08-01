@@ -186,6 +186,10 @@ typedef struct index_shard_staged_group index_shard_staged_group_t;
 
 #define INDEX_SHARD_COMPLETION_SLOT_NONE SIZE_MAX
 
+#if INDEX_SHARD_HELPER_MAX_TASKS > 64U
+#error "staged runnable masks require at most 64 tasks"
+#endif
+
 typedef enum index_shard_completion_entry_state {
   INDEX_SHARD_COMPLETION_ENTRY_FREE = 0,
   INDEX_SHARD_COMPLETION_ENTRY_EARLY,
@@ -344,6 +348,9 @@ typedef struct index_shard_thread_state {
   /* Aggregate scheduler observability; updated only while profiling is on. */
   anbool observability_enabled;
   unsigned long long queue_broadcasts;
+  unsigned long long queue_signals;
+  unsigned long long owner_signals;
+  unsigned long long owner_broadcasts;
   unsigned long long queue_wait_calls;
   double queue_wait_seconds;
   unsigned long long completion_notifications;
@@ -595,6 +602,11 @@ typedef struct index_shard_worker_context {
   unsigned long helper_preparation_generation;
   size_t helper_preparation_index_order;
   size_t helper_preparation_workers;
+
+  /* queue_mutex is the predicate mutex for this owner-only condition. */
+  pthread_cond_t owner_cv;
+  anbool owner_cv_ready;
+  anbool owner_waiting;
 
 } index_shard_worker_context_t;
 
@@ -2022,13 +2034,84 @@ static void index_shard_observability_add(
 }
 
 /* queue_mutex must be held. */
+static void index_shard_queue_signal_locked(
+    index_shard_thread_state_t *shared) {
+  if (!shared || !shared->queue_waiters) {
+    return;
+  }
+  if (shared->observability_enabled) {
+    index_shard_observability_increment(
+        &shared->queue_signals);
+  }
+  pthread_cond_signal(&shared->queue_cv);
+}
+
+/* queue_mutex must be held. */
+static void index_shard_owner_signal_locked(
+    index_shard_thread_state_t *shared,
+    int owner_worker) {
+  index_shard_worker_context_t *owner;
+
+  if (!shared || !shared->pool || owner_worker < 0 ||
+      owner_worker >= shared->worker_count) {
+    return;
+  }
+  owner = &shared->pool->contexts[owner_worker];
+  if (!owner->owner_cv_ready || !owner->owner_waiting) {
+    return;
+  }
+  if (shared->observability_enabled) {
+    index_shard_observability_increment(
+        &shared->owner_signals);
+  }
+  pthread_cond_signal(&owner->owner_cv);
+}
+
+/* queue_mutex must be held. */
+static void index_shard_notify_progress_locked(
+    index_shard_thread_state_t *shared,
+    int owner_worker) {
+  index_shard_queue_signal_locked(shared);
+  index_shard_owner_signal_locked(shared, owner_worker);
+}
+
+/*
+ * Global terminal/lifecycle events must wake every worker and every owner.
+ * Ordinary task transitions use targeted signals above.
+ * queue_mutex must be held.
+ */
 static void index_shard_queue_broadcast_locked(
     index_shard_thread_state_t *shared) {
-  if (shared && shared->observability_enabled) {
-    index_shard_observability_increment(
-        &shared->queue_broadcasts);
+  int owner_worker;
+
+  if (!shared) {
+    return;
   }
-  pthread_cond_broadcast(&shared->queue_cv);
+  if (shared->queue_waiters) {
+    if (shared->observability_enabled) {
+      index_shard_observability_increment(
+          &shared->queue_broadcasts);
+    }
+    pthread_cond_broadcast(&shared->queue_cv);
+  }
+  if (!shared->pool) {
+    return;
+  }
+  for (owner_worker = 0;
+       owner_worker < shared->worker_count;
+       owner_worker++) {
+    index_shard_worker_context_t *owner =
+        &shared->pool->contexts[owner_worker];
+
+    if (!owner->owner_cv_ready || !owner->owner_waiting) {
+      continue;
+    }
+    if (shared->observability_enabled) {
+      index_shard_observability_increment(
+          &shared->owner_broadcasts);
+    }
+    pthread_cond_broadcast(&owner->owner_cv);
+  }
 }
 
 // ANCHOR INDEX-SHARD: wake-pass-waiters
@@ -3254,7 +3337,10 @@ static int index_shard_staged_task_bit_locked(
     const index_shard_staged_task_t *task,
     uint64_t *bit_out,
     size_t *task_index_out) {
-  ptrdiff_t offset;
+  uintptr_t base;
+  uintptr_t address;
+  size_t byte_offset;
+  size_t task_index;
 
   if (bit_out) {
     *bit_out = UINT64_C(0);
@@ -3267,15 +3353,24 @@ static int index_shard_staged_task_bit_locked(
       group->task_count > INDEX_SHARD_HELPER_MAX_TASKS) {
     return -1;
   }
-  offset = task - group->tasks;
-  if (offset < 0 || (size_t)offset >= group->task_count) {
+  base = (uintptr_t)group->tasks;
+  address = (uintptr_t)task;
+  if (address < base) {
+    return -1;
+  }
+  byte_offset = (size_t)(address - base);
+  if (byte_offset % sizeof(group->tasks[0])) {
+    return -1;
+  }
+  task_index = byte_offset / sizeof(group->tasks[0]);
+  if (task_index >= group->task_count) {
     return -1;
   }
   if (bit_out) {
-    *bit_out = UINT64_C(1) << (size_t)offset;
+    *bit_out = UINT64_C(1) << task_index;
   }
   if (task_index_out) {
-    *task_index_out = (size_t)offset;
+    *task_index_out = task_index;
   }
   return 0;
 }
@@ -3643,8 +3738,23 @@ static void index_shard_staged_completion_notify(
         &shared->completion_matches,
         (unsigned long long)matches);
   }
-  /* Gate 2A changes lookup only; later gates change selection and wakeups. */
-  index_shard_queue_broadcast_locked(shared);
+  if (invalid) {
+    index_shard_queue_broadcast_locked(shared);
+  } else {
+    index_shard_queue_signal_locked(shared);
+    if (matched_group) {
+      index_shard_owner_signal_locked(
+          shared, matched_group->owner_worker);
+    }
+    for (owner = 0; owner < shared->worker_count; owner++) {
+      index_shard_staged_group_t *group =
+          pool->contexts[owner].published_staged_group;
+
+      if (group && group->submit_ready_mask) {
+        index_shard_owner_signal_locked(shared, owner);
+      }
+    }
+  }
   pthread_mutex_unlock(&shared->queue_mutex);
 }
 
@@ -3898,6 +4008,8 @@ static int index_shard_staged_select_locked(
       best_group->foreign_work += work;
     }
   }
+  /* Work-conserving handoff: another waiter may claim remaining work. */
+  index_shard_queue_signal_locked(shared);
   return 0;
 }
 
@@ -4133,7 +4245,7 @@ static int index_shard_helper_select_locked(
       &best->tasks[claim->task_index]);
   best->foreign_claims++;
   shared->helper_tasks_foreign++;
-  index_shard_queue_broadcast_locked(shared);
+  index_shard_queue_signal_locked(shared);
   pthread_mutex_unlock(&shared->state_mutex);
   return 0;
 }
@@ -4289,7 +4401,10 @@ static int index_shard_helper_complete_claim(
       !group->running_count || group->internal_error ||
       group->task_failed || group->stop_seen ||
       canonical_ready) {
-    index_shard_queue_broadcast_locked(shared);
+    index_shard_notify_progress_locked(
+        shared, group->owner_worker);
+  } else if (group->ready_count) {
+    index_shard_queue_signal_locked(shared);
   }
   pthread_mutex_unlock(&shared->queue_mutex);
   return rc;
@@ -4734,7 +4849,8 @@ static int index_shard_staged_complete_claim(
            callback_status,
            task->scheduler_state);
   }
-  index_shard_queue_broadcast_locked(shared);
+  index_shard_notify_progress_locked(
+      shared, group->owner_worker);
   pthread_mutex_unlock(&shared->queue_mutex);
   return rc;
 }
@@ -5017,7 +5133,8 @@ static int index_shard_staged_retire_one(
     index_shard_staged_set_failed_locked(shared, group, task);
     index_shard_staged_cancel_ready_locked(shared, group);
   }
-  index_shard_queue_broadcast_locked(shared);
+  index_shard_notify_progress_locked(
+      shared, group->owner_worker);
   pthread_mutex_unlock(&shared->queue_mutex);
   return status == INDEX_SHARD_STAGED_RETIRE_OK ||
       status == INDEX_SHARD_STAGED_RETIRE_MORE
@@ -5154,7 +5271,8 @@ static int index_shard_helper_retire_one(
         group,
         INDEX_SHARD_HELPER_TASK_STOPPED);
   }
-  index_shard_queue_broadcast_locked(shared);
+  index_shard_notify_progress_locked(
+      shared, group->owner_worker);
   pthread_mutex_unlock(&shared->queue_mutex);
   return status == INDEX_SHARD_HELPER_RETIRE_OK ? 0 : -1;
 }
@@ -5253,7 +5371,7 @@ static int index_shard_helper_prepare_clear_locked(
   ctx->helper_preparation_generation = 0U;
   ctx->helper_preparation_index_order = SIZE_MAX;
   ctx->helper_preparation_workers = 0U;
-  index_shard_queue_broadcast_locked(shared);
+  index_shard_queue_signal_locked(shared);
   return invalid ? -1 : 0;
 }
 
@@ -5460,7 +5578,7 @@ index_shard_helper_run_internal(
   pthread_mutex_unlock(&shared->state_mutex);
   fitsbin_payload_io_begin_helper_window();
   helper_window_active = TRUE;
-  index_shard_queue_broadcast_locked(shared);
+  index_shard_queue_signal_locked(shared);
   pthread_mutex_unlock(&shared->queue_mutex);
   fitsbin_payload_io_notify_wait_helpers();
 
@@ -5533,8 +5651,14 @@ index_shard_helper_run_internal(
 
         shared->helper_owner_wait_calls++;
         wait_start = monotonic_seconds();
-        wait_status = pthread_cond_wait(
-            &shared->queue_cv, &shared->queue_mutex);
+        if (!ctx->owner_cv_ready || ctx->owner_waiting) {
+          wait_status = EINVAL;
+        } else {
+          ctx->owner_waiting = TRUE;
+          wait_status = pthread_cond_wait(
+              &ctx->owner_cv, &shared->queue_mutex);
+          ctx->owner_waiting = FALSE;
+        }
         shared->helper_owner_wait_seconds +=
             monotonic_seconds() - wait_start;
         if (wait_status) {
@@ -5556,7 +5680,7 @@ index_shard_helper_run_internal(
       if (group.ready_count <= outstanding &&
           !group.owner_reserve_yielded) {
         group.owner_reserve_yielded = TRUE;
-        index_shard_queue_broadcast_locked(shared);
+        index_shard_queue_signal_locked(shared);
         pthread_mutex_unlock(&shared->queue_mutex);
         sched_yield();
         continue;
@@ -5645,7 +5769,8 @@ index_shard_helper_run_internal(
   } else {
     shared->helper_groups_active--;
   }
-  index_shard_queue_broadcast_locked(shared);
+  index_shard_notify_progress_locked(
+      shared, group.owner_worker);
   pthread_mutex_unlock(&shared->queue_mutex);
 
   if (helper_window_active) {
@@ -5874,7 +5999,7 @@ index_shard_staged_run_ordered(
   ctx->published_staged_group = group;
   shared->staged_groups_active++;
   shared->staged_groups_published++;
-  index_shard_queue_broadcast_locked(shared);
+  index_shard_queue_signal_locked(shared);
   pthread_mutex_unlock(&shared->queue_mutex);
   fitsbin_payload_io_notify_wait_helpers();
 
@@ -5957,8 +6082,14 @@ index_shard_staged_run_ordered(
 
       shared->staged_owner_wait_calls++;
       wait_start = monotonic_seconds();
-      wait_status = pthread_cond_wait(
-          &shared->queue_cv, &shared->queue_mutex);
+      if (!ctx->owner_cv_ready || ctx->owner_waiting) {
+        wait_status = EINVAL;
+      } else {
+        ctx->owner_waiting = TRUE;
+        wait_status = pthread_cond_wait(
+            &ctx->owner_cv, &shared->queue_mutex);
+        ctx->owner_waiting = FALSE;
+      }
       shared->staged_owner_wait_seconds +=
           monotonic_seconds() - wait_start;
       if (wait_status) {
@@ -6034,7 +6165,8 @@ index_shard_staged_run_ordered(
   shared->staged_result_to_retire_seconds +=
       group->result_to_retire_seconds;
   shared->staged_retire_seconds += group->retire_seconds;
-  index_shard_queue_broadcast_locked(shared);
+  index_shard_notify_progress_locked(
+      shared, group->owner_worker);
   pthread_mutex_unlock(&shared->queue_mutex);
 
   if (stats) {
@@ -6131,6 +6263,12 @@ static int index_shard_claim_outer_locked(
            fitsbin_mmap_advice_name(*mmap_advice),
            monotonic_seconds() - shared->pass_wall_start);
   }
+  /*
+   * A targeted publication may wake a worker that consumes the canonical
+   * outer slot before looking at already-published inner work. Hand off one
+   * additional wake so that outer-first priority cannot strand that work.
+   */
+  index_shard_queue_signal_locked(shared);
   return 0;
 }
 
@@ -6233,9 +6371,6 @@ index_shard_select_work(
       return INDEX_SHARD_WORK_ERROR;
     }
     shared->queue_waiters--;
-    if (!shared->queue_waiters) {
-      index_shard_queue_broadcast_locked(shared);
-    }
     if (inner_selection) {
       pthread_mutex_unlock(&shared->queue_mutex);
       return INDEX_SHARD_WORK_ERROR;
@@ -6535,6 +6670,9 @@ static void index_shard_finish_outer_claim(
   }
   if (!shared->outer_running) {
     index_shard_queue_broadcast_locked(shared);
+  } else if (shared->outer_unclaimed &&
+             shared->outer_running < shared->producer_width) {
+    index_shard_queue_signal_locked(shared);
   }
   pthread_mutex_unlock(&shared->queue_mutex);
 
@@ -7606,6 +7744,23 @@ static void index_shard_pool_release_pass(index_shard_pool_t *pool) {
   pthread_mutex_unlock(&pool->control_mutex);
 }
 
+static void index_shard_context_owner_cvs_destroy(
+    index_shard_pool_t *pool) {
+  int i;
+
+  if (!pool || !pool->contexts) {
+    return;
+  }
+  for (i = 0; i < pool->worker_count; i++) {
+    if (!pool->contexts[i].owner_cv_ready) {
+      continue;
+    }
+    pthread_cond_destroy(&pool->contexts[i].owner_cv);
+    pool->contexts[i].owner_cv_ready = FALSE;
+    pool->contexts[i].owner_waiting = FALSE;
+  }
+}
+
 // ANCHOR INDEX-SHARD: pool-start
 /*
  * Create persistent worker pool.
@@ -7748,41 +7903,52 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
       return -1;
     }
 
-  // worker contexts are stable for lifetime of the pool
+  // worker contexts and owner conditions are stable for pool lifetime.
   for (i = 0; i < worker_count; i++) {
     pool->contexts[i].worker_id = i;
     pool->contexts[i].generation_seen = 0;
     pool->contexts[i].pool = pool;
+    if (pthread_cond_init(&pool->contexts[i].owner_cv, NULL)) {
+      index_shard_context_owner_cvs_destroy(pool);
+      free(pool->threads);
+      free(pool->contexts);
+      index_shard_shared_destroy(&pool->shared);
+      pthread_cond_destroy(&pool->work_cv);
+      pthread_mutex_destroy(&pool->control_mutex);
+      pthread_mutex_destroy(&pool->inverse_cache_mutex);
+      free(pool);
+      pthread_mutex_unlock(&index_shard_global_pool_mutex);
+      return -1;
+    }
+    pool->contexts[i].owner_cv_ready = TRUE;
+  }
 
-    if (pthread_create(&pool->threads[i], NULL, index_shard_worker_main, &pool->contexts[i])) {
+  for (i = 0; i < worker_count; i++) {
+    if (pthread_create(
+            &pool->threads[i], NULL,
+            index_shard_worker_main, &pool->contexts[i])) {
       int j;
 
       pthread_mutex_lock(&pool->control_mutex);
       pool->shutdown = TRUE;
       pthread_cond_broadcast(&pool->work_cv);
       pthread_mutex_unlock(&pool->control_mutex);
-
-            for (j = 0; j < i; j++) {
+      for (j = 0; j < i; j++) {
         pthread_join(pool->threads[j], NULL);
       }
-
-       free(pool->threads);
+      index_shard_context_owner_cvs_destroy(pool);
+      free(pool->threads);
       free(pool->contexts);
-
       index_shard_shared_destroy(&pool->shared);
-
       pthread_cond_destroy(&pool->work_cv);
       pthread_mutex_destroy(&pool->control_mutex);
       pthread_mutex_destroy(&pool->inverse_cache_mutex);
-
       free(pool);
-
       pthread_mutex_unlock(&index_shard_global_pool_mutex);
       return -1;
     }
   }
 
-  /* Include worker scheduling/entry latency in pool startup, not first pass. */
   pthread_mutex_lock(&pool->control_mutex);
   while (pool->ready_workers < worker_count) {
     pthread_cond_wait(&pool->work_cv, &pool->control_mutex);
@@ -7801,6 +7967,7 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
       pthread_join(pool->threads[i], NULL);
     }
     free(pool->threads);
+    index_shard_context_owner_cvs_destroy(pool);
     free(pool->contexts);
     index_shard_shared_destroy(&pool->shared);
     pthread_cond_destroy(&pool->work_cv);
@@ -7961,6 +8128,7 @@ void index_shard_pool_stop(onefield_t *bp) {
     return;
   }
   free(pool->threads);
+  index_shard_context_owner_cvs_destroy(pool);
   free(pool->contexts);
   index_shard_shared_destroy(&pool->shared);
 
@@ -8050,6 +8218,7 @@ static int index_shard_pool_submit(
   for (i = 0; i < worker_count; i++) {
     if (pool->contexts[i].published_helper_group ||
         pool->contexts[i].published_staged_group ||
+        pool->contexts[i].owner_waiting ||
         pool->contexts[i].staged_owner_callback_active ||
         pool->contexts[i].staged_owner_callback_group ||
         pool->contexts[i].helper_preparation_active) {
@@ -8189,6 +8358,9 @@ static int index_shard_pool_submit(
   shared->observability_enabled =
       log_get_level() >= LOG_VERB;
   shared->queue_broadcasts = 0U;
+  shared->queue_signals = 0U;
+  shared->owner_signals = 0U;
+  shared->owner_broadcasts = 0U;
   shared->queue_wait_calls = 0U;
   shared->queue_wait_seconds = 0.0;
   shared->completion_notifications = 0U;
@@ -8813,8 +8985,9 @@ index_shard_solve_impl(onefield_t *bp,
           pool->shared.staged_owner_wait_seconds);
 
   logverb("[index-shard] scheduler-observability generation=%lu "
-          "queue_broadcasts=%llu queue_waits=%llu "
-          "queue_wait_seconds=%.6f completions=%llu "
+          "queue_broadcasts=%llu queue_signals=%llu "
+          "owner_signals=%llu owner_broadcasts=%llu "
+          "queue_waits=%llu queue_wait_seconds=%.6f completions=%llu "
           "completion_groups=%llu completion_tasks=%llu "
           "completion_matches=%llu completion_registered=%llu "
           "completion_removed=%llu completion_early=%llu "
@@ -8828,6 +9001,9 @@ index_shard_solve_impl(onefield_t *bp,
           "max_compute_running_global=%zu\n",
           pool->generation,
           pool->shared.queue_broadcasts,
+          pool->shared.queue_signals,
+          pool->shared.owner_signals,
+          pool->shared.owner_broadcasts,
           pool->shared.queue_wait_calls,
           pool->shared.queue_wait_seconds,
           pool->shared.completion_notifications,
@@ -9229,11 +9405,19 @@ static int index_shard_staged_retire_test_init(
     pthread_mutex_destroy(&shared->queue_mutex);
     return -1;
   }
+  shared->worker_count = 2;
+  if (index_shard_completion_registry_init(shared, 2)) {
+    pthread_cond_destroy(&shared->queue_cv);
+    pthread_mutex_destroy(&shared->state_mutex);
+    pthread_mutex_destroy(&shared->queue_mutex);
+    return -1;
+  }
   return 0;
 }
 
 static void index_shard_staged_retire_test_destroy(
     index_shard_thread_state_t *shared) {
+  index_shard_completion_registry_destroy(shared);
   pthread_cond_destroy(&shared->queue_cv);
   pthread_mutex_destroy(&shared->state_mutex);
   pthread_mutex_destroy(&shared->queue_mutex);
@@ -9270,12 +9454,14 @@ static int index_shard_staged_retire_test_order(void) {
   group.retire = index_shard_staged_retire_test_callback;
   group.owner_context = &context;
   context.shared = &shared;
-  tasks[0].scheduler_state =
-      INDEX_SHARD_STAGED_TASK_PREPARE_READY;
-  tasks[1].scheduler_state =
-      INDEX_SHARD_STAGED_TASK_RESULTS_READY;
-  group.reorder_ready = 1U;
-  shared.staged_reorder_ready = 1U;
+  pthread_mutex_lock(&shared.queue_mutex);
+  failures += index_shard_staged_set_state_locked(
+      &shared, &group, &tasks[0],
+      INDEX_SHARD_STAGED_TASK_PREPARE_READY) != 0;
+  failures += index_shard_staged_set_state_locked(
+      &shared, &group, &tasks[1],
+      INDEX_SHARD_STAGED_TASK_RESULTS_READY) != 0;
+  pthread_mutex_unlock(&shared.queue_mutex);
 
   failures += index_shard_staged_retire_one(&shared, &group) != 1;
   failures += context.calls != 0U;
@@ -9339,14 +9525,14 @@ static int index_shard_staged_retire_test_terminal(void) {
   group.owner_context = &context;
   context.shared = &shared;
   context.stop_during_retire = TRUE;
-  tasks[0].scheduler_state =
-      INDEX_SHARD_STAGED_TASK_RESULTS_READY;
-  tasks[1].scheduler_state =
-      INDEX_SHARD_STAGED_TASK_COMPUTE_READY;
-  group.reorder_ready = 1U;
-  group.compute_ready = 1U;
-  shared.staged_reorder_ready = 1U;
-  shared.staged_compute_ready = 1U;
+  pthread_mutex_lock(&shared.queue_mutex);
+  failures += index_shard_staged_set_state_locked(
+      &shared, &group, &tasks[0],
+      INDEX_SHARD_STAGED_TASK_RESULTS_READY) != 0;
+  failures += index_shard_staged_set_state_locked(
+      &shared, &group, &tasks[1],
+      INDEX_SHARD_STAGED_TASK_COMPUTE_READY) != 0;
+  pthread_mutex_unlock(&shared.queue_mutex);
 
   failures += index_shard_staged_retire_one(&shared, &group) != -1;
   failures += context.calls != 1U;
@@ -9400,22 +9586,222 @@ static int index_shard_staged_child_helper_test(void) {
 
 static int index_shard_observability_counter_test(void) {
   index_shard_thread_state_t shared;
+  index_shard_pool_t pool;
+  index_shard_worker_context_t contexts[2];
+  unsigned char outer_states[2] = {
+      INDEX_SHARD_OUTER_UNCLAIMED,
+      INDEX_SHARD_OUTER_UNCLAIMED
+  };
+  fitsbin_mmap_advice_t mmap_advice = FITSBIN_MMAP_ADVICE_NORMAL;
+  size_t index_order = SIZE_MAX;
   int failures = 0;
 
   if (index_shard_staged_retire_test_init(&shared)) {
     return 1;
   }
+  memset(&pool, 0, sizeof(pool));
+  memset(contexts, 0, sizeof(contexts));
+  pool.contexts = contexts;
+  pool.worker_count = 2;
+  shared.pool = &pool;
+  shared.worker_count = 2;
+  contexts[0].owner_cv_ready =
+      pthread_cond_init(&contexts[0].owner_cv, NULL) == 0;
+  if (!contexts[0].owner_cv_ready) {
+    index_shard_staged_retire_test_destroy(&shared);
+    return 1;
+  }
+
   shared.observability_enabled = TRUE;
+  shared.outer_states = outer_states;
+  shared.nindexes = 2U;
+  shared.outer_unclaimed = 2U;
+  shared.producer_width = 2U;
   pthread_mutex_lock(&shared.queue_mutex);
+  shared.queue_waiters = 1U;
+  index_shard_queue_signal_locked(&shared);
+  failures += shared.queue_signals != 1U;
+  failures += index_shard_claim_outer_locked(
+      &contexts[0], &shared, 0U,
+      &index_order, &mmap_advice) != 0;
+  failures += index_order != 0U;
+  failures += shared.queue_signals != 2U;
+  failures += shared.outer_running != 1U;
+  failures += shared.outer_unclaimed != 1U;
+  contexts[0].owner_waiting = TRUE;
+  index_shard_owner_signal_locked(&shared, 0);
+  failures += shared.owner_signals != 1U;
   index_shard_queue_broadcast_locked(&shared);
-  pthread_mutex_unlock(&shared.queue_mutex);
   failures += shared.queue_broadcasts != 1U;
-  shared.observability_enabled = FALSE;
-  pthread_mutex_lock(&shared.queue_mutex);
+  failures += shared.owner_broadcasts != 1U;
+  contexts[0].owner_waiting = FALSE;
+  shared.queue_waiters = 0U;
   index_shard_queue_broadcast_locked(&shared);
-  pthread_mutex_unlock(&shared.queue_mutex);
   failures += shared.queue_broadcasts != 1U;
+  failures += shared.owner_broadcasts != 1U;
+  pthread_mutex_unlock(&shared.queue_mutex);
+
+  pthread_cond_destroy(&contexts[0].owner_cv);
   index_shard_staged_retire_test_destroy(&shared);
+  return failures;
+}
+
+static int index_shard_staged_mask_selection_test(void) {
+  index_shard_pool_t pool;
+  index_shard_worker_context_t contexts[2];
+  index_shard_staged_group_t groups[2];
+  index_shard_staged_task_t tasks[2][2];
+  index_shard_staged_claim_t claim;
+  index_shard_thread_state_t *shared;
+  int failures = 0;
+  int i;
+
+  memset(&pool, 0, sizeof(pool));
+  memset(contexts, 0, sizeof(contexts));
+  memset(groups, 0, sizeof(groups));
+  memset(tasks, 0, sizeof(tasks));
+  shared = &pool.shared;
+  if (index_shard_staged_retire_test_init(shared)) {
+    return 1;
+  }
+  pool.worker_count = 2;
+  pool.generation = 7U;
+  pool.contexts = contexts;
+  shared->pool = &pool;
+  shared->worker_count = 2;
+  shared->observability_enabled = TRUE;
+
+  for (i = 0; i < 2; i++) {
+    contexts[i].worker_id = i;
+    contexts[i].pool = &pool;
+    contexts[i].generation_seen = pool.generation;
+    contexts[i].current_outer_active = TRUE;
+    contexts[i].current_index_order = i ? 3U : 5U;
+    contexts[i].staged_group_epoch = 11U + (unsigned long long)i;
+    contexts[i].published_staged_group = &groups[i];
+    groups[i].pool = &pool;
+    groups[i].tasks = tasks[i];
+    groups[i].task_count = 2U;
+    groups[i].generation = pool.generation;
+    groups[i].owner_epoch = contexts[i].staged_group_epoch;
+    groups[i].owner_worker = i;
+    groups[i].owner_index_order = contexts[i].current_index_order;
+  }
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_set_state_locked(
+      shared, &groups[0], &tasks[0][0],
+      INDEX_SHARD_STAGED_TASK_COMPUTE_READY) != 0;
+  failures += index_shard_staged_set_state_locked(
+      shared, &groups[1], &tasks[1][1],
+      INDEX_SHARD_STAGED_TASK_COMPUTE_READY) != 0;
+  failures += index_shard_staged_select_locked(
+      &contexts[0], shared,
+      INDEX_SHARD_STAGED_SELECT_COMPUTE,
+      FALSE, &claim) != 0;
+  failures += claim.group != &groups[1];
+  failures += claim.task_index != 1U;
+  failures += claim.kind != INDEX_SHARD_STAGED_CLAIM_EXECUTE;
+  failures += shared->selection_tasks_scanned != 0U;
+  failures += groups[1].compute_ready_mask != UINT64_C(0);
+  failures += tasks[1][1].scheduler_state !=
+      INDEX_SHARD_STAGED_TASK_EXECUTING;
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  index_shard_staged_retire_test_destroy(shared);
+  return failures;
+}
+
+static int index_shard_completion_registry_test(void) {
+  index_shard_pool_t pool;
+  index_shard_worker_context_t contexts[2];
+  index_shard_staged_group_t group;
+  index_shard_staged_task_t tasks[2];
+  index_shard_thread_state_t *shared;
+  anbool early = FALSE;
+  int failures = 0;
+
+  memset(&pool, 0, sizeof(pool));
+  memset(contexts, 0, sizeof(contexts));
+  memset(&group, 0, sizeof(group));
+  memset(tasks, 0, sizeof(tasks));
+  shared = &pool.shared;
+  if (index_shard_staged_retire_test_init(shared)) {
+    return 1;
+  }
+  pool.worker_count = 2;
+  pool.generation = 9U;
+  pool.contexts = contexts;
+  shared->pool = &pool;
+  shared->worker_count = 2;
+  shared->observability_enabled = TRUE;
+  contexts[0].worker_id = 0;
+  contexts[0].pool = &pool;
+  contexts[0].generation_seen = pool.generation;
+  contexts[0].current_outer_active = TRUE;
+  contexts[0].current_index_order = 4U;
+  contexts[0].staged_group_epoch = 13U;
+  contexts[0].published_staged_group = &group;
+  group.pool = &pool;
+  group.tasks = tasks;
+  group.task_count = 2U;
+  group.generation = pool.generation;
+  group.owner_epoch = contexts[0].staged_group_epoch;
+  group.owner_worker = 0;
+  group.owner_index_order = contexts[0].current_index_order;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[0],
+      INDEX_SHARD_STAGED_TASK_IO_SUBMITTED) != 0;
+  tasks[0].completion_id = 101U;
+  failures += index_shard_completion_registry_register_locked(
+      shared, &group, 0U, 101U, &early) != 0;
+  failures += early;
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  index_shard_staged_completion_notify(&pool, 101U);
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += !tasks[0].completion_pending;
+  failures += !(group.completion_pending_mask & UINT64_C(1));
+  failures += shared->completion_groups_scanned != 0U;
+  failures += shared->completion_tasks_scanned != 0U;
+  failures += shared->completion_matches != 1U;
+  failures += index_shard_completion_registry_remove_locked(
+      shared, &group, 0U, 101U) != 0;
+  tasks[0].completion_id = 0U;
+  failures += index_shard_staged_set_completion_pending_locked(
+      &group, &tasks[0], FALSE) != 0;
+
+  shared->staged_submit_callbacks_active = 1U;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  index_shard_staged_completion_notify(&pool, 202U);
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[1],
+      INDEX_SHARD_STAGED_TASK_IO_SUBMITTED) != 0;
+  tasks[1].completion_id = 202U;
+  early = FALSE;
+  failures += index_shard_completion_registry_register_locked(
+      shared, &group, 1U, 202U, &early) != 0;
+  failures += !early;
+  shared->staged_submit_callbacks_active = 0U;
+  failures += index_shard_staged_set_completion_pending_locked(
+      &group, &tasks[1], early) != 0;
+  failures += index_shard_completion_registry_remove_locked(
+      shared, &group, 1U, 202U) != 0;
+  tasks[1].completion_id = 0U;
+  failures += index_shard_staged_set_completion_pending_locked(
+      &group, &tasks[1], FALSE) != 0;
+  failures += shared->completion_active != 0U;
+  failures += group.completion_registry_entries != 0U;
+  failures += shared->completion_registry_early != 1U;
+  failures += shared->completion_registry_invalid != 0U;
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  contexts[0].published_staged_group = NULL;
+  index_shard_staged_retire_test_destroy(shared);
   return failures;
 }
 
@@ -9423,7 +9809,9 @@ int index_shard_test_staged_retire_more(void) {
   return index_shard_staged_retire_test_order() +
       index_shard_staged_retire_test_terminal() +
       index_shard_staged_child_helper_test() +
-      index_shard_observability_counter_test();
+      index_shard_observability_counter_test() +
+      index_shard_staged_mask_selection_test() +
+      index_shard_completion_registry_test();
 }
 
 #endif
