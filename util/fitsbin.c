@@ -466,6 +466,22 @@ int fitsbin_configure_index_mmap(fitsbin_t* fb) {
 #define FITSBIN_PAYLOAD_IO_DEMAND_RESERVED_BYTES \
     (FITSBIN_PAYLOAD_IO_MAX_BYTES / 4U)
 
+/*
+ * Internal transport A/B.  The parent source is the direct-first comparator.
+ * This candidate refuses asynchronous direct tickets only for nonresident
+ * sparse payload mappings, which is the production verification-sweep case;
+ * the solver then exercises its existing exact mapped-population fallback.
+ * Synchronous exact reads and non-sparse direct-ticket callers are unchanged.
+ * This is deliberately not a public runtime option.
+ */
+#ifndef FITSBIN_PAYLOAD_SPARSE_ASYNC_DIRECT_ENABLED
+#define FITSBIN_PAYLOAD_SPARSE_ASYNC_DIRECT_ENABLED 0
+#endif
+#if FITSBIN_PAYLOAD_SPARSE_ASYNC_DIRECT_ENABLED != 0 && \
+    FITSBIN_PAYLOAD_SPARSE_ASYNC_DIRECT_ENABLED != 1
+#error "FITSBIN_PAYLOAD_SPARSE_ASYNC_DIRECT_ENABLED must be 0 or 1"
+#endif
+
 typedef struct fitsbin_file_span {
     off_t begin;
     off_t end;
@@ -632,6 +648,26 @@ static unsigned long long
     fitsbin_payload_io_service_direct_submitted = 0ULL;
 static unsigned long long
     fitsbin_payload_io_service_direct_ready = 0ULL;
+
+typedef struct fitsbin_payload_transport_metrics {
+    unsigned long long direct_attempts;
+    unsigned long long direct_policy_refused;
+    unsigned long long mapped_submitted;
+    unsigned long long mapped_ready;
+    unsigned long long direct_ranges;
+    unsigned long long direct_bytes;
+    unsigned long long mapped_spans;
+    unsigned long long mapped_bytes;
+    unsigned long long pread_calls;
+    unsigned long long pread_bytes;
+    unsigned long long readahead_calls;
+    unsigned long long readahead_bytes;
+    unsigned long long populate_calls;
+    unsigned long long populate_bytes;
+} fitsbin_payload_transport_metrics_t;
+
+static fitsbin_payload_transport_metrics_t
+    fitsbin_payload_io_transport_metrics;
 static unsigned long long fitsbin_payload_io_service_cancelled = 0ULL;
 static unsigned long long fitsbin_payload_io_service_failed = 0ULL;
 static unsigned long long fitsbin_payload_io_service_planned_bytes = 0ULL;
@@ -647,6 +683,7 @@ static unsigned long long
     fitsbin_payload_io_service_queue_submit_failures = 0ULL;
 static int fitsbin_payload_io_service_lanes = 0;
 static anbool fitsbin_payload_io_service_running = FALSE;
+static anbool fitsbin_payload_io_transport_metrics_enabled = FALSE;
 static anbool fitsbin_payload_io_service_accepting = FALSE;
 static anbool fitsbin_payload_io_service_stopping = FALSE;
 static fitsbin_payload_io_completion_notify_fn
@@ -1327,11 +1364,26 @@ static int fitsbin_mapped_file_offset(
     return -1;
 }
 
-static int fitsbin_pread_all(
+static void fitsbin_payload_counter_add(
+    unsigned long long* counter,
+    unsigned long long value) {
+    if (!counter || !value || *counter == ULLONG_MAX) {
+        return;
+    }
+    if (value > ULLONG_MAX - *counter) {
+        *counter = ULLONG_MAX;
+    } else {
+        *counter += value;
+    }
+}
+
+static int fitsbin_pread_all_counted(
     int fd,
     void* destination,
     size_t size,
-    off_t offset) {
+    off_t offset,
+    unsigned long long* calls,
+    unsigned long long* bytes) {
     unsigned char* output = destination;
     size_t complete = 0U;
 
@@ -1343,7 +1395,10 @@ static int fitsbin_pread_all(
         return -1;
     }
     while (complete < size) {
-        ssize_t count = pread(
+        ssize_t count;
+
+        fitsbin_payload_counter_add(calls, 1ULL);
+        count = pread(
             fd,
             output + complete,
             size - complete,
@@ -1351,6 +1406,8 @@ static int fitsbin_pread_all(
 
         if (count > 0) {
             complete += (size_t)count;
+            fitsbin_payload_counter_add(
+                bytes, (unsigned long long)count);
             continue;
         }
         if (count < 0 && errno == EINTR) {
@@ -1362,6 +1419,15 @@ static int fitsbin_pread_all(
         return -1;
     }
     return 0;
+}
+
+static int fitsbin_pread_all(
+    int fd,
+    void* destination,
+    size_t size,
+    off_t offset) {
+    return fitsbin_pread_all_counted(
+        fd, destination, size, offset, NULL, NULL);
 }
 
 int fitsbin_mapped_range_page_cover(
@@ -2655,6 +2721,13 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
         struct timespec plan_finish;
         unsigned long long plan_nanoseconds = 0ULL;
         unsigned long long read_nanoseconds = 0ULL;
+        unsigned long long pread_calls = 0ULL;
+        unsigned long long pread_bytes = 0ULL;
+        unsigned long long readahead_calls = 0ULL;
+        unsigned long long readahead_bytes = 0ULL;
+        unsigned long long populate_calls = 0ULL;
+        unsigned long long populate_bytes = 0ULL;
+        anbool transport_metrics = FALSE;
         anbool plan_measured = FALSE;
         anbool measured;
         anbool cancelled;
@@ -2715,6 +2788,8 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
         }
         ticket = fitsbin_payload_io_dequeue_locked();
         assert(ticket);
+        transport_metrics =
+            fitsbin_payload_io_transport_metrics_enabled;
         pthread_mutex_unlock(&fitsbin_payload_io_mutex);
 
         cancelled = __atomic_load_n(
@@ -2729,11 +2804,13 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
                 fitsbin_prepared_pread_range_t* range =
                     &ticket->ranges[work_index];
 
-                if (fitsbin_pread_all(
+                if (fitsbin_pread_all_counted(
                         ticket->fd,
                         range->destination,
                         range->size,
-                        range->offset)) {
+                        range->offset,
+                        transport_metrics ? &pread_calls : NULL,
+                        transport_metrics ? &pread_bytes : NULL)) {
                     saved_errno = errno ? errno : EIO;
                     status = -1;
                     break;
@@ -2801,6 +2878,10 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
                 int queue_status;
 
                 do {
+                    if (transport_metrics) {
+                        fitsbin_payload_counter_add(
+                            &readahead_calls, 1ULL);
+                    }
                     queue_status = readahead(
                         ticket->fd, span->begin, span_bytes);
                 } while (queue_status && errno == EINTR);
@@ -2810,6 +2891,11 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
                 }
                 ticket->queued_ranges_submitted++;
                 ticket->queued_bytes_submitted += span_bytes;
+                if (transport_metrics) {
+                    fitsbin_payload_counter_add(
+                        &readahead_bytes,
+                        (unsigned long long)span_bytes);
+                }
                 cancelled = __atomic_load_n(
                     &ticket->cancel_requested,
                     __ATOMIC_ACQUIRE);
@@ -2831,6 +2917,10 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
                     populate_status = -1;
                 } else {
                     do {
+                        if (transport_metrics) {
+                            fitsbin_payload_counter_add(
+                                &populate_calls, 1ULL);
+                        }
                         populate_status = madvise(
                             (void*)span->begin,
                             span_bytes,
@@ -2851,6 +2941,11 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
                             __ATOMIC_RELEASE);
                     }
                     break;
+                }
+                if (transport_metrics) {
+                    fitsbin_payload_counter_add(
+                        &populate_bytes,
+                        (unsigned long long)span_bytes);
                 }
                 cancelled = __atomic_load_n(
                     &ticket->cancel_requested,
@@ -2891,6 +2986,41 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
         }
         ticket->read_nanoseconds = read_nanoseconds;
         fitsbin_payload_io_service_read_nanoseconds += read_nanoseconds;
+        if (transport_metrics) {
+            fitsbin_payload_counter_add(
+                &fitsbin_payload_io_transport_metrics.pread_calls,
+                pread_calls);
+            fitsbin_payload_counter_add(
+                &fitsbin_payload_io_transport_metrics.pread_bytes,
+                pread_bytes);
+            fitsbin_payload_counter_add(
+                &fitsbin_payload_io_transport_metrics.readahead_calls,
+                readahead_calls);
+            fitsbin_payload_counter_add(
+                &fitsbin_payload_io_transport_metrics.readahead_bytes,
+                readahead_bytes);
+            fitsbin_payload_counter_add(
+                &fitsbin_payload_io_transport_metrics.populate_calls,
+                populate_calls);
+            fitsbin_payload_counter_add(
+                &fitsbin_payload_io_transport_metrics.populate_bytes,
+                populate_bytes);
+            if (ticket->kind == FITSBIN_PAYLOAD_IO_TICKET_DIRECT) {
+                fitsbin_payload_counter_add(
+                    &fitsbin_payload_io_transport_metrics.direct_ranges,
+                    (unsigned long long)ticket->range_count);
+                fitsbin_payload_counter_add(
+                    &fitsbin_payload_io_transport_metrics.direct_bytes,
+                    (unsigned long long)ticket->byte_count);
+            } else {
+                fitsbin_payload_counter_add(
+                    &fitsbin_payload_io_transport_metrics.mapped_spans,
+                    (unsigned long long)ticket->span_count);
+                fitsbin_payload_counter_add(
+                    &fitsbin_payload_io_transport_metrics.mapped_bytes,
+                    (unsigned long long)ticket->byte_count);
+            }
+        }
         fitsbin_payload_io_service_queued_ranges +=
             (unsigned long long)ticket->queued_ranges_submitted;
         fitsbin_payload_io_service_queued_bytes +=
@@ -2916,6 +3046,10 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
             fitsbin_payload_io_service_ready++;
             if (ticket->kind == FITSBIN_PAYLOAD_IO_TICKET_DIRECT) {
                 fitsbin_payload_io_service_direct_ready++;
+            } else if (fitsbin_payload_io_transport_metrics_enabled) {
+                fitsbin_payload_counter_add(
+                    &fitsbin_payload_io_transport_metrics.mapped_ready,
+                    1ULL);
             }
         }
         pthread_cond_signal(&ticket->completion_cv);
@@ -2947,6 +3081,8 @@ int fitsbin_payload_io_service_start(int lane_count) {
         pthread_mutex_unlock(&fitsbin_payload_io_mutex);
         return 0;
     }
+    fitsbin_payload_io_transport_metrics_enabled =
+        log_get_level() >= LOG_VERB;
     fitsbin_payload_io_service_running = TRUE;
     fitsbin_payload_io_service_accepting = TRUE;
     fitsbin_payload_io_service_stopping = FALSE;
@@ -2955,6 +3091,8 @@ int fitsbin_payload_io_service_start(int lane_count) {
     fitsbin_payload_io_service_ready = 0ULL;
     fitsbin_payload_io_service_direct_submitted = 0ULL;
     fitsbin_payload_io_service_direct_ready = 0ULL;
+    memset(&fitsbin_payload_io_transport_metrics, 0,
+           sizeof(fitsbin_payload_io_transport_metrics));
     fitsbin_payload_io_service_cancelled = 0ULL;
     fitsbin_payload_io_service_failed = 0ULL;
     fitsbin_payload_io_service_planned_bytes = 0ULL;
@@ -2991,6 +3129,7 @@ int fitsbin_payload_io_service_start(int lane_count) {
     }
     pthread_mutex_lock(&fitsbin_payload_io_mutex);
     fitsbin_payload_io_service_running = FALSE;
+    fitsbin_payload_io_transport_metrics_enabled = FALSE;
     fitsbin_payload_io_service_stopping = FALSE;
     fitsbin_payload_io_service_lanes = 0;
     pthread_mutex_unlock(&fitsbin_payload_io_mutex);
@@ -2999,6 +3138,11 @@ int fitsbin_payload_io_service_start(int lane_count) {
 }
 
 void fitsbin_payload_io_service_stop(void) {
+#if FITSBIN_PAYLOAD_SPARSE_ASYNC_DIRECT_ENABLED
+    const char* transport_policy = "sparse-direct-enabled";
+#else
+    const char* transport_policy = "sparse-mapped-only";
+#endif
     int lane_count;
     int lane;
 
@@ -3023,6 +3167,7 @@ void fitsbin_payload_io_service_stop(void) {
     assert(!fitsbin_payload_io_service_bytes);
     logverb("[fitsbin] payload-broker submitted=%llu ready=%llu "
             "direct_submitted=%llu direct_ready=%llu "
+            "mapped_submitted=%llu mapped_ready=%llu "
             "cancelled=%llu failed=%llu planned_bytes=%llu "
             "queued_ranges=%llu queued_bytes=%llu "
             "queue_failures=%llu/%llu "
@@ -3031,6 +3176,8 @@ void fitsbin_payload_io_service_stop(void) {
             fitsbin_payload_io_service_ready,
             fitsbin_payload_io_service_direct_submitted,
             fitsbin_payload_io_service_direct_ready,
+            fitsbin_payload_io_transport_metrics.mapped_submitted,
+            fitsbin_payload_io_transport_metrics.mapped_ready,
             fitsbin_payload_io_service_cancelled,
             fitsbin_payload_io_service_failed,
             fitsbin_payload_io_service_planned_bytes,
@@ -3042,7 +3189,28 @@ void fitsbin_payload_io_service_stop(void) {
                 1000000000.0,
             (double)fitsbin_payload_io_service_read_nanoseconds /
                 1000000000.0);
+    logverb("[fitsbin] payload-transport policy=%s "
+            "direct_attempts=%llu direct_policy_refused=%llu "
+            "direct_ranges=%llu direct_bytes=%llu "
+            "mapped_spans=%llu mapped_bytes=%llu "
+            "pread_calls=%llu pread_bytes=%llu "
+            "readahead_calls=%llu readahead_bytes=%llu "
+            "populate_calls=%llu populate_bytes=%llu\n",
+            transport_policy,
+            fitsbin_payload_io_transport_metrics.direct_attempts,
+            fitsbin_payload_io_transport_metrics.direct_policy_refused,
+            fitsbin_payload_io_transport_metrics.direct_ranges,
+            fitsbin_payload_io_transport_metrics.direct_bytes,
+            fitsbin_payload_io_transport_metrics.mapped_spans,
+            fitsbin_payload_io_transport_metrics.mapped_bytes,
+            fitsbin_payload_io_transport_metrics.pread_calls,
+            fitsbin_payload_io_transport_metrics.pread_bytes,
+            fitsbin_payload_io_transport_metrics.readahead_calls,
+            fitsbin_payload_io_transport_metrics.readahead_bytes,
+            fitsbin_payload_io_transport_metrics.populate_calls,
+            fitsbin_payload_io_transport_metrics.populate_bytes);
     fitsbin_payload_io_service_running = FALSE;
+    fitsbin_payload_io_transport_metrics_enabled = FALSE;
     fitsbin_payload_io_service_stopping = FALSE;
     fitsbin_payload_io_service_lanes = 0;
     pthread_mutex_unlock(&fitsbin_payload_io_mutex);
@@ -3113,6 +3281,10 @@ static int fitsbin_payload_io_submit_ticket(
     fitsbin_payload_io_service_submitted++;
     if (ticket->kind == FITSBIN_PAYLOAD_IO_TICKET_DIRECT) {
         fitsbin_payload_io_service_direct_submitted++;
+    } else if (fitsbin_payload_io_transport_metrics_enabled) {
+        fitsbin_payload_counter_add(
+            &fitsbin_payload_io_transport_metrics.mapped_submitted,
+            1ULL);
     }
     if (!ticket->plan) {
         fitsbin_payload_io_service_planned_bytes +=
@@ -3154,12 +3326,31 @@ int fitsbin_pread_mapped_ranges_submit(
         return -1;
     }
     pthread_mutex_lock(&fitsbin_payload_io_mutex);
+    if (fitsbin_payload_io_transport_metrics_enabled) {
+        fitsbin_payload_counter_add(
+            &fitsbin_payload_io_transport_metrics.direct_attempts,
+            1ULL);
+    }
     if (!fitsbin_payload_io_service_running ||
         !fitsbin_payload_io_service_accepting) {
         pthread_mutex_unlock(&fitsbin_payload_io_mutex);
         errno = ENODEV;
         return 0;
     }
+#if !FITSBIN_PAYLOAD_SPARSE_ASYNC_DIRECT_ENABLED
+    if (fitsbin_get_mmap_advice(fb) == FITSBIN_MMAP_ADVICE_RANDOM &&
+        !fitsbin_payload_is_fully_resident(fb)) {
+        if (fitsbin_payload_io_transport_metrics_enabled) {
+            fitsbin_payload_counter_add(
+                &fitsbin_payload_io_transport_metrics.
+                    direct_policy_refused,
+                1ULL);
+        }
+        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
+        errno = ENOTSUP;
+        return 0;
+    }
+#endif
     pthread_mutex_unlock(&fitsbin_payload_io_mutex);
 
     ticket = fitsbin_payload_io_ticket_alloc();

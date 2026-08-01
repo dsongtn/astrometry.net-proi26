@@ -467,9 +467,12 @@ int fitsbin_pread_mapped_ranges(
  * destinations retain caller order. The source fitsbin must remain live
  * through collection so operation counters can be applied.
  *
- * On a zero return, errno is ENODEV when the service is unavailable, EAGAIN
- * when current queue occupancy prevents admission, and E2BIG when the
- * unchanged ticket can never fit the service byte ceiling.
+ * On a zero return, errno is ENOTSUP when the exact source candidate disables
+ * asynchronous direct transport for a nonresident sparse payload mapping,
+ * ENODEV when the service is unavailable,
+ * EAGAIN when current queue occupancy prevents admission, and E2BIG when the
+ * unchanged ticket can never fit the service byte ceiling.  Callers must keep
+ * their authoritative mapped fallback available for every zero return.
  */
 int fitsbin_pread_mapped_ranges_submit(
     fitsbin_t* fb,
