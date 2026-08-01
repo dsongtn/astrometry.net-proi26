@@ -4183,6 +4183,13 @@ static size_t solver_ab_descriptor_expansion(
 #define SOLVER_CANDIDATE_DELIVERY_LIMIT \
     (FITSBIN_PREAD_ASYNC_RANGE_LIMIT / 2U)
 #define SOLVER_VERIFY_QUERY_LOOKAHEAD 16U
+#ifndef SOLVER_VERIFY_SWEEP_ASYNC_DIRECT_ENABLED
+#define SOLVER_VERIFY_SWEEP_ASYNC_DIRECT_ENABLED 0
+#endif
+#if SOLVER_VERIFY_SWEEP_ASYNC_DIRECT_ENABLED != 0 && \
+    SOLVER_VERIFY_SWEEP_ASYNC_DIRECT_ENABLED != 1
+#error "SOLVER_VERIFY_SWEEP_ASYNC_DIRECT_ENABLED must be 0 or 1"
+#endif
 #define SOLVER_CANDIDATE_STAR_LIMIT \
     (SOLVER_CANDIDATE_DELIVERY_LIMIT * DQMAX)
 #if SOLVER_CANDIDATE_STAR_LIMIT > FITSBIN_MMAP_PREFETCH_RANGE_LIMIT
@@ -6641,9 +6648,11 @@ static int solver_codekd_packet_submit_verification_pages(
 static int solver_codekd_packet_submit_sweep_pages(
     solver_codekd_search_packet_t* packet) {
     fitsbin_t* source;
+#if SOLVER_VERIFY_SWEEP_ASYNC_DIRECT_ENABLED
     size_t offset;
     size_t range_index;
     anbool direct = FALSE;
+#endif
     int submit_status;
 
     if (!packet || packet->delivery_source ||
@@ -6677,6 +6686,7 @@ static int solver_codekd_packet_submit_sweep_pages(
         return 2;
     }
 
+#if SOLVER_VERIFY_SWEEP_ASYNC_DIRECT_ENABLED
     if (packet->verify_sweep_reads ||
         packet->verify_sweep_buffers ||
         packet->verify_sweep_storage ||
@@ -6760,8 +6770,18 @@ static int solver_codekd_packet_submit_sweep_pages(
                 packet->verify_sweep_aligned_bytes;
         }
     }
+#else
+    /*
+     * A mapped-only transport comparison must bypass the direct scratch path
+     * before its range arrays and page-sized destination buffer are allocated.
+     * Refusing the later fitsbin submit is not equivalent: it retains the
+     * allocation, initialization, and free traffic for every sweep ticket.
+     */
+    solver_codekd_packet_clear_sweep_storage(packet);
+#endif
 
     errno = 0;
+#if SOLVER_VERIFY_SWEEP_ASYNC_DIRECT_ENABLED
     if (direct) {
         submit_status = fitsbin_pread_mapped_ranges_submit(
             source,
@@ -6789,6 +6809,7 @@ static int solver_codekd_packet_submit_sweep_pages(
         solver_codekd_packet_clear_sweep_storage(packet);
         errno = 0;
     }
+#endif
     submit_status = fitsbin_prefetch_ranges_submit(
         source,
         packet->page_workspace->sealed_ranges,
