@@ -33,4 +33,18 @@ anbool engine_pass_cursor_next(const job_t* job,
 
 void engine_pass_apply(solver_t* solver, const engine_pass_t* pass);
 
+typedef struct engine_limit_policy {
+    double wall_seconds;
+    double cpu_seconds;
+    anbool wall_job_clamped;
+    anbool wall_from_job;
+    anbool cpu_from_job;
+} engine_limit_policy_t;
+
+void engine_limit_policy_resolve(double job_wall_seconds,
+                                 double config_wall_seconds,
+                                 double job_cpu_seconds,
+                                 double config_cpu_seconds,
+                                 engine_limit_policy_t* policy);
+
 #endif

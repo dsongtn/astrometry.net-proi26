@@ -182,7 +182,12 @@ star, so "\-d 10" or "\-d 1\-10" mean look at the top ten brightest stars only.
 Cut the source list to have this many items (after sorting, if applicable).
 .TP
 \fB\-l\fR, \fB\-\-cpulimit\fR \fIseconds\fR
-Give up solving after the specified number of seconds of CPU time
+Optional aggregate user plus system CPU budget across all astrometry-engine
+threads. Parallel execution can consume this budget faster than elapsed time.
+.TP
+\fB\-\-wall\-limit\fR \fIseconds\fR
+Elapsed astrometry-engine deadline, independent of worker count. The job value
+may reduce but not exceed the backend wall limit.
 .TP
 \fB\-\-p\-workers\fR \fIauto|count\fR
 Set the number of parallel solver workers.  \fBauto\fR uses up to four CPUs
