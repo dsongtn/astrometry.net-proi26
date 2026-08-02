@@ -4,8 +4,16 @@
  */
 
 /*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
+ * Developer navigation: persistent pthread pool
+ * ---------------------------------------------
+ * This module creates, reuses, and destroys the single job-level worker pool.
+ * Worker contexts, condition variables, and shared synchronization objects
+ * are stable for the complete pool lifetime; individual passes are separated
+ * by generation and are submitted by index_shard_pass.c.
+ *
+ * Pool shutdown is a quiescence operation. It must wake every predicate,
+ * prevent new claims, join all threads, and destroy synchronization storage
+ * only after no worker, staged completion, or owner lease can refer to it.
  */
 #include <assert.h>
 #include <errno.h>

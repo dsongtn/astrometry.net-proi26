@@ -2,7 +2,20 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
-/* CodeKD descriptor generation and bounded payload delivery. */
+/*
+ * Developer navigation: packet production and data readiness
+ * ----------------------------------------------------------
+ * This module connects native hypothesis descriptors to CodeKD, Quad, Star,
+ * and selected verification page delivery. It submits only complete bounded
+ * plans, collects their tickets, advances the packet state machine, and opens
+ * short candidate windows whose backing lifetimes remain owned by the packet.
+ *
+ * I/O completion means that the exact process mapping was populated when the
+ * ticket completed; pages are not pinned and native mmap remains
+ * authoritative.
+ * Refusal, eviction, unsupported population, cancellation, or I/O failure must
+ * preserve the descriptor sequence and use owner replay or explicit failure.
+ */
 
 #include <assert.h>
 #include <errno.h>

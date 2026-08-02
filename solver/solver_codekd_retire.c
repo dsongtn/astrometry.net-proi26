@@ -2,7 +2,18 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
-/* Ordered CodeKD result retirement and owner reduction. */
+/*
+ * Developer navigation: canonical owner retirement
+ * ------------------------------------------------
+ * This is the only CodeKD packet layer allowed to replay result slots into the
+ * mutable solver flow. It consumes descriptors and hits in native sequence,
+ * restores the corresponding solver counters/context, invokes resolution and
+ * verification, and advances the owner's retirement cursor.
+ *
+ * Out-of-order packet completion is permitted; out-of-order retirement is not.
+ * Stop and error paths must leave each slot either retired exactly once or
+ * explicitly owned by cleanup, never silently skipped or replayed twice.
+ */
 
 #include <stdint.h>
 #include <stdlib.h>

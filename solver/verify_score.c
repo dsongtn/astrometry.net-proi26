@@ -3,6 +3,19 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+/*
+ * Developer navigation: native verification scoring
+ * -------------------------------------------------
+ * This module owns star-list matching and log-odds accumulation after a
+ * candidate has been projected. The bounded flat spatial lookup accelerates
+ * nearest-neighbor queries for the common case, while exact ties and geometry
+ * outside its contract retain the original KD-tree behavior.
+ *
+ * Candidate thresholds, distractor/conflict handling, match order, and early
+ * acceptance are scientific behavior. Do not partition or reorder this loop
+ * without proving identical retirement and floating-point semantics.
+ */
+
 #include <assert.h>
 #include <math.h>
 #include <stdint.h>

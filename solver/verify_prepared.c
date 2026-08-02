@@ -3,6 +3,21 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+/*
+ * Developer navigation: index-free verification contexts
+ * ------------------------------------------------------
+ * This module separates index-backed query/capture work from scoring. Query
+ * objects own native StarKD result arrays while borrowing their source only
+ * until sweep capture. Prepared hits then own copied index-derived arrays and
+ * a WCS snapshot, while their test-field coordinates remain an explicitly
+ * pass-bounded immutable borrow.
+ *
+ * Creation and destruction functions are paired lifecycle boundaries. A
+ * partial object must be safe to destroy, and an unsupported or failed prepare
+ * returns the candidate to the native verification path without changing its
+ * score, order, or thresholds.
+ */
+
 #include <assert.h>
 #include <limits.h>
 #include <math.h>

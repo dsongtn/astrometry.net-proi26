@@ -1,3 +1,17 @@
+/*
+ # This file is part of the Astrometry.net suite.
+ # Licensed under a 3-clause BSD style license - see LICENSE
+ */
+
+/*
+ * Index-shard public configuration parsing.
+ *
+ * This small module is intentionally independent from the pthread pool. It
+ * reports CPUs visible to the process and parses the public worker-count
+ * value. The engine validates and records the result before pool creation;
+ * producer/helper role selection is not part of configuration parsing.
+ */
+
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>

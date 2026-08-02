@@ -2,6 +2,20 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
+
+/*
+ * Developer navigation: mapping policy and mapped population
+ * ----------------------------------------------------------
+ * This module resolves FITSBIN data mappings, applies the pass-local mixed
+ * mmap policy, and performs advice/population on exact mapped ranges. Serial
+ * callers have no thread override and retain NORMAL behavior. Parallel sparse
+ * payload mappings may use RANDOM while compact topology remains NORMAL.
+ *
+ * Advice is a performance policy, not an ownership or readiness guarantee.
+ * Mapping contents and native dereference remain authoritative after every
+ * unsupported call or advisory failure. Exact-range planning and asynchronous
+ * ticket ownership live in the payload plan/service modules.
+ */
 #include <errno.h>
 #include <stdlib.h>
 #include <stdarg.h>

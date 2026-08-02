@@ -13,6 +13,15 @@
 #include "tic.h"
 #include "index_shard_internal.h"
 
+/*
+ * Shared native arithmetic and stop helpers.
+ *
+ * These inline functions are used by the original owner path and extracted
+ * modules. Keep their operation order stable where documented: apparently
+ * equivalent floating-point rewrites can change traversal under finite limits.
+ * The stop helper only requests cooperative owner unwind.
+ */
+
 enum {
     A = 0,
     B = 1,

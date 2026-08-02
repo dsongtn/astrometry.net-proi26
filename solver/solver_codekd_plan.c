@@ -2,7 +2,19 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
-/* CodeKD page-set planning and packet lifecycle. */
+/*
+ * Developer navigation: packet storage and complete page plans
+ * -----------------------------------------------------------
+ * This module allocates bounded packet waves, converts logical descriptor
+ * needs into mapping-specific page sets, seals complete plans, and owns the
+ * cleanup of every packet arena, ticket, prepared query, and temporary page
+ * workspace.
+ *
+ * Physical pages may be sorted, deduplicated, and conservatively coalesced;
+ * logical descriptors and KD hits may not be reordered. A truncated or
+ * over-budget plan is never labelled READY. It records refusal and routes the
+ * still-owned logical work to exact owner replay.
+ */
 
 #include <assert.h>
 #include <errno.h>

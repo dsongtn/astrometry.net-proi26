@@ -11,6 +11,16 @@
 #include "index_shard_internal.h"
 #include "verify.h"
 
+/*
+ * Private verification module boundary.
+ *
+ * verify_score.c owns native star-list scoring; verify_projection.c may
+ * project
+ * disjoint immutable ranges through shard helpers; verify_prepared.c owns the
+ * index-free query and hit lifecycles. Weak helper references keep standalone
+ * legacy tools on the original inline path when the shard runtime is absent.
+ */
+
 typedef struct verify_s {
     const sip_t* wcs;
 

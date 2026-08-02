@@ -8,6 +8,8 @@
 
 #include "solver.h"
 
+/* Reporting-only boundary; solver_profile_t remains owned by its solver. */
+
 void solver_profile_report(const solver_t* solver);
 
 #endif

@@ -2,6 +2,15 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
+/*
+ * Parallel-solver navigation
+ * --------------------------
+ * This remains the FITS binary-table facade and authoritative data owner.
+ * fitsbin_mmap.c owns mapping policy, payload_source.c owns exact source
+ * operations, payload_plan.c owns bounded page plans, and payload_service.c
+ * owns asynchronous tickets and I/O lanes. Those modules prepare access; they
+ * do not replace the FITSBIN mapping or change decoded table semantics.
+ */
 #include <errno.h>
 #include <stdlib.h>
 #include <stdarg.h>

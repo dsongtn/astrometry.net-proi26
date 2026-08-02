@@ -1,6 +1,21 @@
 /*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
+ # This file is part of the Astrometry.net suite.
+ # Licensed under a 3-clause BSD style license - see LICENSE
+ */
+
+/*
+ * Developer navigation: bounded helper execution
+ * ----------------------------------------------
+ * Helpers execute already-published immutable work groups for an outer owner.
+ * A successful claim transfers execution of that group once, not ownership of
+ * the owner's index, solver, reducer cursor, or result. The owner may execute
+ * unclaimed groups itself and remains the only authority that retires outputs.
+ *
+ * Helper callbacks must be independently runnable, bounded, and nonblocking on
+ * child work in this same pool. Cancellation retires the running lifetime
+ * lease and returns through the group's predicate; it never abandons storage.
+ * See index_shard_private.h for lock order and index_shard_staged.c for the
+ * asynchronous completion registry.
  */
 #include <assert.h>
 #include <errno.h>
@@ -24,15 +39,7 @@
 #include "astrometry/tic.h"
 #include "astrometry/fitsbin.h"
 #include "astrometry/fitsioutils.h"
-/*
- # This file is part of the Astrometry.net suite.
- # Licensed under a 3-clause BSD style license - see LICENSE
- */
-/*
- * Helper and staged claim execution, cancellation, and retirement.
- *
- * This module owns bounded synchronous helper groups.
- */
+/* Helper and staged claim execution, cancellation, and retirement. */
 
 anbool index_shard_helper_outer_claimable_locked(
     const index_shard_thread_state_t *shared) {

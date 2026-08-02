@@ -4,8 +4,16 @@
  */
 
 /*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
+ * Developer navigation: one submitted shard pass
+ * ----------------------------------------------
+ * This module is the pass lifecycle coordinator. It resets generation-scoped
+ * queues and result slots, binds onefield hooks and immutable worker views,
+ * submits the generation to the persistent pool, waits for quiescence, and
+ * invokes the single reducer/master commit boundary.
+ *
+ * Pass setup must leave no state visible to workers before all arrays and
+ * predicates are ready. Teardown must drain staged completions and owner
+ * leases before any index, field view, or payload service can disappear.
  */
 #include <assert.h>
 #include <errno.h>

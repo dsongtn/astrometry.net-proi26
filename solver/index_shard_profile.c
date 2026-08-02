@@ -1,6 +1,18 @@
 /*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
+ # This file is part of the Astrometry.net suite.
+ # Licensed under a 3-clause BSD style license - see LICENSE
+ */
+
+/*
+ * Developer navigation: aggregate observability
+ * ---------------------------------------------
+ * This module takes synchronized snapshots and aggregates pass, task, helper,
+ * delivery, and phase counters. It reports coarse evidence after work rather
+ * than instrumenting every hot query or page access.
+ *
+ * Profiling is observational: it cannot elect a winner, change a task state,
+ * or alter scheduler policy. Snapshot helpers obey the lock-order exceptions
+ * documented below so diagnostics cannot create a new deadlock path.
  */
 #include <assert.h>
 #include <errno.h>
@@ -24,15 +36,7 @@
 #include "astrometry/tic.h"
 #include "astrometry/fitsbin.h"
 #include "astrometry/fitsioutils.h"
-/*
- # This file is part of the Astrometry.net suite.
- # Licensed under a 3-clause BSD style license - see LICENSE
- */
-/*
- * Pass, task, and phase profiling snapshots and aggregate counters.
- *
- * This module owns immutable snapshots and aggregate observability helpers.
- */
+/* Pass, task, and phase profiling snapshots and aggregate counters. */
 
 
 // ANCHOR INDEX-SHARD: pass-state-snapshot

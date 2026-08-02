@@ -13,6 +13,16 @@
 #include "index_shard_internal.h"
 #include "onefield.h"
 
+/*
+ * Private onefield navigation boundary.
+ *
+ * The first group below owns configured-index acquisition and release. The
+ * job-cache group owns source-identity-checked reuse. The field-view group
+ * exposes master-owned immutable field data to pass-bounded worker views. The
+ * final shard entry point connects those resources to reducer-only result
+ * publication. No declaration here permits shared mutable solver state.
+ */
+
 /* Filename-loaded indexes transfer to one task and are released once. */
 size_t onefield_internal_index_count(const onefield_t* bp);
 index_t* onefield_internal_get_index(onefield_t* bp, size_t index_order);

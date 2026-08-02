@@ -3,6 +3,20 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+/*
+ * Developer navigation
+ * --------------------
+ * This module owns job-scoped reuse above individual shard tasks. The master
+ * onefield_t owns cached field storage and any prepared index entries; worker
+ * views borrow only immutable data while the enclosing shard pass is alive.
+ * Source identity is revalidated before reuse, and flush is the lifetime
+ * boundary for all cached entries.
+ *
+ * Preparation may overlap other work, but it must not mutate worker solver
+ * state or make a borrowed mapping outlive its source. A miss, refusal, or
+ * identity change returns to the normal index/field loading path.
+ */
+
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>

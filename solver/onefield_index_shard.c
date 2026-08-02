@@ -3,6 +3,20 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+/*
+ * Developer navigation
+ * --------------------
+ * This is the ownership bridge between the upstream onefield flow and the
+ * index-shard pool. It implements hooks for index acquisition/release, creates
+ * worker-private onefield/solver views, runs one selected index, freezes its
+ * result, and transfers only the reducer-selected winner back to the master.
+ *
+ * Worker callbacks may observe cooperative stop state, but they never publish
+ * directly to master-visible solver state. Filename-loaded indexes transfer
+ * to exactly one task; preloaded indexes remain borrowed. Any fallback must
+ * occur before a parallel result can have mutated the master.
+ */
+
 #include <assert.h>
 #include <libgen.h>
 #include <math.h>

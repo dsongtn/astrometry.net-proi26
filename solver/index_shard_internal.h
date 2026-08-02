@@ -7,6 +7,16 @@
 #include "astrometry/bl.h"
 #include "astrometry/index.h"
 #include "astrometry/index_shard.h"
+
+/*
+ * Cross-subsystem contract for parallel solver work.
+ *
+ * onefield supplies outer-task hooks; solver/verify modules publish bounded
+ * helper or staged packages; the shard pool executes them; only the owner
+ * retires their output; and only the reducer publishes a final result. Public
+ * callers should use index_shard.h instead. Changes here require an audit of
+ * producer, claimant, owner, cancellation, and destructor together.
+ */
 /*
  * Terminal status and ownership contract.
  *

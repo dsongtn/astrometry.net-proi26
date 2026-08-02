@@ -2,7 +2,18 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
-/* Solver profile aggregation and trace reporting. */
+/*
+ * Developer navigation: solver-core observability
+ * ------------------------------------------------
+ * This module combines worker-private solver_profile_t values and emits one
+ * coarse report after meaningful work boundaries. Counters describe native
+ * traversal, packet delivery, verification, and fallback outcomes; they are
+ * evidence only and must never select a scientific or scheduling path.
+ *
+ * Keep hot-loop event recording in the owning module and aggregate it here.
+ * New counters need saturating/overflow-safe accumulation and an explicit
+ * interpretation that does not equate activity with useful speedup.
+ */
 
 #include <limits.h>
 

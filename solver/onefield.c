@@ -10,6 +10,18 @@
  * Output: .match .rdls .wcs, ...
  */
 
+/*
+ * Parallel-solver navigation
+ * --------------------------
+ * This remains the upstream single-field facade and W1 scientific path.
+ * onefield_job_cache.c owns job/pass-bounded field and index reuse;
+ * onefield_index_shard.c adapts the same field/index operations to worker-
+ * private views and reducer-only publication for W2 and above.
+ *
+ * A parallel path may be entered only at the explicit shard bridge. Native
+ * serial fallback is valid only before master-visible parallel transfer.
+ */
+
 #include <sys/types.h>
 #include <sys/time.h>
 #include <libgen.h>

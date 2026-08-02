@@ -29,6 +29,23 @@
  * mutex for queue_cv and every owner_cv; result_mutex owns result_cv.
  */
 /*
+ * File map for state transitions:
+ *
+ *   control.c   - TLS, limits, terminal observation, cooperative stop
+ *   scheduler.c - queue predicates and exactly-once claims
+ *   worker.c    - outer-owner and claimed-package execution
+ *   helper.c    - bounded helper groups and their lifetime leases
+ *   staged.c    - asynchronous completion registry and READY promotion
+ *   reducer.c   - failure classification, arbitration, and master transfer
+ *   pass.c      - generation setup, submission, quiescence, and reduction
+ *   pool.c      - persistent thread and synchronization-object lifetime
+ *   inverse.c   - separately locked inverse-permutation cache
+ *   profile.c   - aggregate observation only
+ *
+ * Add shared mutable state here only when its owner, protecting mutex,
+ * generation behavior, and teardown order are explicit.
+ */
+/*
  * SECTION INDEX-SHARD: types
  */
 /*

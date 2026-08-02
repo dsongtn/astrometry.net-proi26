@@ -2,6 +2,19 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
+
+/*
+ * Developer navigation: exact payload source primitives
+ * -----------------------------------------------------
+ * This module validates file identity, manages the duplicate payload file
+ * descriptor, resolves a mapped address to its backing file offset, and
+ * provides complete counted pread operations. It defines source mechanics;
+ * it does not own the asynchronous queue or solver packet state.
+ *
+ * Every range is bounds checked against the source and mapping. Partial reads,
+ * identity changes, and descriptor failures are explicit errors so callers can
+ * retain native mmap fallback without accepting partially prepared data.
+ */
 #include <errno.h>
 #include <stdlib.h>
 #include <stdarg.h>

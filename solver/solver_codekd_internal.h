@@ -16,6 +16,21 @@
 #include "solver_hypothesis_internal.h"
 #include "../libkd/kdtree_prefetch_internal.h"
 
+/*
+ * CodeKD packet state and ownership contract.
+ *
+ * solver_codekd_plan.c owns arenas and page-plan completeness;
+ * solver_codekd_delivery.c owns I/O tickets and readiness transitions;
+ * solver_codekd_verification.c owns prepared verification products;
+ * solver_codekd_staged.c adapts states to the shard scheduler; and
+ * solver_codekd_retire.c is the owner-only scientific reduction boundary.
+ *
+ * State may advance out of execution order, but sequence and retirement
+ * cursors are monotonic. Every pointer below needs an explicit classification:
+ * packet-owned storage or a pass-bounded immutable borrow before it crosses a
+ * worker.
+ */
+
 #define SOLVER_CODEKD_SEARCH_OPTIONS \
     (KD_OPTIONS_SMALL_RADIUS | \
      KD_OPTIONS_COMPUTE_DISTS | \

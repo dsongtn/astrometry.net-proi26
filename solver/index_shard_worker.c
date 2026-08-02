@@ -4,8 +4,17 @@
  */
 
 /*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
+ * Developer navigation: worker and outer-owner execution
+ * -----------------------------------------------------
+ * Worker threads enter here after the scheduler assigns a claim. For an outer
+ * claim, one context acquires one index, builds worker-private onefield and
+ * solver state, runs the native solver flow, freezes its result, and releases
+ * the index through the matching hook. Inner claims execute only their bounded
+ * immutable package and return it to the original owner.
+ *
+ * There is intentionally no persistent index_t cache in this layer. Every
+ * exit path must clear TLS/advice state and produce exactly one terminal task
+ * transition before the context can claim work from another generation.
  */
 #include <assert.h>
 #include <errno.h>

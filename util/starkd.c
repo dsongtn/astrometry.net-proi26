@@ -3,6 +3,15 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+/*
+ * Parallel-solver navigation
+ * --------------------------
+ * This file owns the native StarKD object, queries, and decoded row behavior.
+ * starkd_payload.c only derives and prepares bounded DATA/PERM row ranges for
+ * that native access. Preparation failure therefore changes performance only;
+ * the query and result path in this facade remains authoritative.
+ */
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>

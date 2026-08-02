@@ -3,6 +3,19 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+/*
+ * Developer navigation: bounded projection assistance
+ * ---------------------------------------------------
+ * This module projects independent reference-star ranges through one immutable
+ * TAN or SIP snapshot. Each helper writes a disjoint output slice; the caller
+ * owns allocation, joins the group, and consumes results in original star
+ * order.
+ *
+ * Small inputs, unavailable helpers, allocation failure, stop, or helper error
+ * use the native inline projection path. No helper may mutate a live WCS or
+ * decide verification acceptance.
+ */
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>

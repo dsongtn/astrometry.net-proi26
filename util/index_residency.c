@@ -3,6 +3,19 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+/*
+ * Developer navigation: optional whole-file residency service
+ * -----------------------------------------------------------
+ * This standalone service can copy complete, source-validated index files into
+ * immutable backing and issue reference-counted handles. It has independent
+ * admission, loader, eviction, cancellation, and shutdown lifecycles.
+ *
+ * The current engine does not activate job-local cohort copying. This module
+ * must not be used as a hidden page cache or described as pinned memory. A
+ * fallback result carries no handle and leaves the original source path fully
+ * authoritative.
+ */
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif

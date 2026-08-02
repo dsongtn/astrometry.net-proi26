@@ -9,6 +9,20 @@
  * indices with the job description to create an input file for 'onefield'.
  * Runs and merges the results.
  */
+/*
+ * Parallel-solver navigation
+ * --------------------------
+ * Keep this file as the recognizable engine facade and job loop. Supporting
+ * responsibilities are split as follows:
+ *
+ *   engine_job.c       job parsing and job_t lifetime
+ *   engine_pass.c      canonical depth/scale pass cursor
+ *   engine_policy.c    effective limits and worker-count validation
+ *   engine_residency.c optional complete-cohort admission boundary
+ *
+ * The engine creates job/pass services; onefield owns a field solve; the
+ * index-shard reducer remains the only parallel result-publication authority.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -29,6 +29,20 @@
 #include "astrometry/tic.h"
 #include "astrometry/fitsbin.h"
 #include "astrometry/fitsioutils.h"
+
+/*
+ * Developer navigation: result and terminal authority
+ * --------------------------------------------------
+ * Workers freeze results into per-index slots. This module classifies hook
+ * failures, arbitrates completed scientific candidates, establishes terminal
+ * precedence, disposes losers, and transfers at most one winner to the master
+ * onefield/solver state.
+ *
+ * Outer quick commit and inner canonical retirement are distinct: a valid
+ * completed index may win before an earlier configured index, but work inside
+ * each owned index must already have retired in its required legacy order.
+ * Once master-visible transfer begins, serial fallback is forbidden.
+ */
 /*
  * SECTION INDEX-SHARD: result
  */

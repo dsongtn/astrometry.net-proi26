@@ -12,6 +12,15 @@
 #include "astrometry/engine.h"
 #include "astrometry/solver.h"
 
+/*
+ * Value-only engine control structures.
+ *
+ * A cursor produces the canonical depth/scale pass sequence. A limit policy
+ * records both the effective values and their origin so terminal reporting can
+ * distinguish job and configuration limits. These structures do not own
+ * solver, index, pool, or payload resources.
+ */
+
 typedef struct engine_pass {
     size_t ordinal;
     size_t depth_index;

@@ -2,6 +2,20 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
+
+/*
+ * Developer navigation: bounded physical range planning
+ * -----------------------------------------------------
+ * This module page-aligns logical requests, resolves their exact mapping and
+ * file spans, sorts/deduplicates mapping pages, applies strict coalescing and
+ * overread budgets, and records recently completed pages for the same mapping
+ * generation.
+ *
+ * Mapped-page identity is the readiness authority; file-offset identity is
+ * only a secondary storage-work key. Capacity or budget exhaustion returns an
+ * incomplete/refused plan to the caller and must never be promoted to READY.
+ * Logical KD hit or candidate order is outside this module and is unchanged.
+ */
 #include <errno.h>
 #include <stdlib.h>
 #include <stdarg.h>

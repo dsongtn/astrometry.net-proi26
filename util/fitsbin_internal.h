@@ -12,6 +12,18 @@
 
 #include "fitsbin.h"
 
+/*
+ * FITSBIN payload-delivery layering.
+ *
+ * fitsbin_mmap.c owns policy and exact mapping operations;
+ * fitsbin_payload_source.c owns source identity and complete reads;
+ * fitsbin_payload_plan.c owns page alignment, deduplication, and bounds; and
+ * fitsbin_payload_service.c owns lanes, queues, tickets, and completion.
+ *
+ * Bounds below are safety/backpressure limits, not scientific search limits.
+ * Hitting one must refuse, split, or fall back without dropping logical work.
+ */
+
 #if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
 #define ASTROMETRY_THREAD_LOCAL _Thread_local
 #elif defined(__GNUC__)

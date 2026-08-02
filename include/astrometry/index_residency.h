@@ -13,6 +13,15 @@
 typedef struct index_residency index_residency_t;
 typedef struct index_residency_handle index_residency_handle_t;
 
+/*
+ * Optional complete-file residency API.
+ *
+ * The service and every acquired handle have separate reference lifetimes.
+ * Callers must treat FALLBACK as normal operation and continue through the
+ * original file. A returned immutable mapping is reclaimable by the kernel;
+ * the API does not promise pinned physical pages or production admission.
+ */
+
 typedef enum index_residency_priority {
     INDEX_RESIDENCY_PRIORITY_SPECULATIVE = 0,
     INDEX_RESIDENCY_PRIORITY_LOOKAHEAD = 1,

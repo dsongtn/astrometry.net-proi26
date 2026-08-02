@@ -3,6 +3,20 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+/*
+ * Developer navigation
+ * --------------------
+ * This file is the engine-side admission boundary for optional whole-file
+ * index residency. It measures a cohort, derives a conservative memory limit
+ * from host, cgroup, and address-space constraints, and creates the service
+ * only when the complete admission contract can be satisfied.
+ *
+ * Production job-local residency is currently quarantined: native mappings
+ * and bounded exact-demand delivery remain authoritative. Do not confuse this
+ * service with fitsbin_payload_service.c, and do not describe sealed memfd
+ * backing as pinned or unreclaimable memory.
+ */
+
 #include <errno.h>
 #include <inttypes.h>
 #include <stdint.h>

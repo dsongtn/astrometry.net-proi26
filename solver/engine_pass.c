@@ -3,6 +3,18 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+/*
+ * Developer navigation
+ * --------------------
+ * This is the deterministic depth/scale cursor used by the engine job loop.
+ * engine_pass_cursor_next() converts user-facing ranges into one immutable
+ * engine_pass_t; engine_pass_apply() copies that pass into a solver instance.
+ *
+ * The cursor contains no worker or index state. Parallel and serial execution
+ * must consume the same pass sequence, so scheduling policy must not be added
+ * here and a pass must never be skipped because of worker availability.
+ */
+
 #include <string.h>
 
 #include "engine_internal.h"

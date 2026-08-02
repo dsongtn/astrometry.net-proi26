@@ -10,6 +10,15 @@
 
 #include "solver.h"
 
+/*
+ * Bounded native-geometry cache contract.
+ *
+ * solver_t owns solver_field_geometry when field_geometry_owned is true.
+ * Pair pointers borrow the table and are valid only while that owner remains
+ * compatible and alive. Allocation or compatibility failure selects the
+ * original per-pair calculation; it is not a scientific failure.
+ */
+
 #ifndef SOLVER_FIELD_GEOMETRY_BUDGET_BYTES
 #define SOLVER_FIELD_GEOMETRY_BUDGET_BYTES \
     (64ULL * 1024ULL * 1024ULL)

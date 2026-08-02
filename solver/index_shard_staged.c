@@ -1,6 +1,19 @@
 /*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
+ # This file is part of the Astrometry.net suite.
+ # Licensed under a 3-clause BSD style license - see LICENSE
+ */
+
+/*
+ * Developer navigation: asynchronous staged work
+ * ----------------------------------------------
+ * This module owns the registry that connects numeric completion identities to
+ * generation-scoped staged tasks. It records early completions, promotes only
+ * fully ready tasks, selects their next state, and removes each registration
+ * exactly once during completion, cancellation, or drain.
+ *
+ * The registry deliberately carries no solver, index, or mapping pointer in an
+ * external completion callback. Owner-held task storage supplies those
+ * lifetimes after the generation and identity checks succeed.
  */
 #include <assert.h>
 #include <errno.h>
@@ -24,15 +37,7 @@
 #include "astrometry/tic.h"
 #include "astrometry/fitsbin.h"
 #include "astrometry/fitsioutils.h"
-/*
- # This file is part of the Astrometry.net suite.
- # Licensed under a 3-clause BSD style license - see LICENSE
- */
-/*
- * Inner claim types, completion registry, and staged state selection.
- *
- * This module owns staged completion routing and READY task transitions.
- */
+/* Inner claim types, completion registry, and READY state transitions. */
 
 
 unsigned long long index_shard_helper_task_work(

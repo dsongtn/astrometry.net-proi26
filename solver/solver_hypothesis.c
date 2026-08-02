@@ -2,7 +2,20 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
-/* AB-pair enumeration, descriptors, and bounded verification waves. */
+/*
+ * Developer navigation: native traversal packaging
+ * ------------------------------------------------
+ * This module walks the solver's original AB-pair, combination, permutation,
+ * and parity order. It can materialize a bounded contiguous descriptor range
+ * or an immutable verification package, but sequence numbers and order digests
+ * remain tied to native traversal rather than worker identity or completion
+ * time.
+ *
+ * The owner retains mutable solver state and canonical retirement. Helpers may
+ * compute disjoint prepared outputs only after all required context is copied
+ * or leased. An unsupported size, allocation failure, stop, or refused package
+ * resumes the exact owner path without dropping or repeating a hypothesis.
+ */
 
 #include <errno.h>
 #include <limits.h>

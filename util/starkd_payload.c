@@ -2,6 +2,19 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
+
+/*
+ * Developer navigation: sparse StarKD row delivery
+ * ------------------------------------------------
+ * This module translates a bounded list of logical star identifiers into the
+ * exact DATA/PERM rows later dereferenced by native StarKD access. It can use
+ * synchronous advice or submit mapped preparation through the FITSBIN
+ * provider. startree_get_ready() still performs the authoritative decode.
+ *
+ * Row requests may be physically coalesced, but returned stars retain caller
+ * order. Over-budget, unsupported, or failed preparation falls back to native
+ * mapped access and never narrows the requested star set.
+ */
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>

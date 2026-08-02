@@ -2,7 +2,19 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
-/* Staged packet callbacks and exact owner execution. */
+/*
+ * Developer navigation: shard-scheduler adapter
+ * ---------------------------------------------
+ * This module implements the staged-task callbacks consumed by the index-shard
+ * scheduler. It maps packet states to prepare, submit, poll, execute, cancel,
+ * and owner operations without exposing mutable solver state to foreign
+ * workers.
+ *
+ * An I/O-submitted packet is not compute work and must not be called READY
+ * until its complete ticket succeeds. A claimed compute stage executes once.
+ * Owner replay remains available for exact logical work that cannot safely use
+ * the staged path.
+ */
 
 #include <errno.h>
 #include <stdint.h>

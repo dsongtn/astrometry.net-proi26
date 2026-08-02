@@ -10,6 +10,15 @@
 #include "astrometry/index_residency.h"
 #include "astrometry/onefield.h"
 
+/*
+ * Private engine cross-module boundary.
+ *
+ * engine_job.c owns job parsing and image dimensions; engine_policy.c resolves
+ * limits and requested worker width; engine_residency.c owns optional cohort
+ * admission. None of these declarations transfers index or solver ownership.
+ * Keep pass-only types and functions in engine_internal.h.
+ */
+
 double engine_job_imagew(job_t* job);
 double engine_job_imageh(job_t* job);
 

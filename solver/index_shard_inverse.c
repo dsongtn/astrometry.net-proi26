@@ -1,6 +1,19 @@
 /*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
+ # This file is part of the Astrometry.net suite.
+ # Licensed under a 3-clause BSD style license - see LICENSE
+ */
+
+/*
+ * Developer navigation: inverse-permutation preparation
+ * ----------------------------------------------------
+ * This module owns the bounded cache of inverse index permutations used by
+ * owner solvers. Cache entries are keyed and source-validated, reference
+ * counted through explicit leases, and evicted only when no borrower remains.
+ * Preparation can overlap an active pass but never transfers index ownership.
+ *
+ * A refused, failed, stale, or over-budget entry falls back to the native
+ * owner-side construction. The inverse-cache mutex is independent from the
+ * shard lock order documented in index_shard_private.h.
  */
 #include <assert.h>
 #include <errno.h>
@@ -24,15 +37,7 @@
 #include "astrometry/tic.h"
 #include "astrometry/fitsbin.h"
 #include "astrometry/fitsioutils.h"
-/*
- # This file is part of the Astrometry.net suite.
- # Licensed under a 3-clause BSD style license - see LICENSE
- */
-/*
- * Bounded inverse-permutation cache and asynchronous preparation.
- *
- * This module owns the bounded inverse-permutation cache and its leases.
- */
+/* Bounded inverse-permutation cache and asynchronous preparation. */
 
 size_t index_shard_inverse_cache_budget(void) {
   struct rlimit address_limit;

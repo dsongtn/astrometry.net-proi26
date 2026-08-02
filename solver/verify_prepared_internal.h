@@ -10,6 +10,15 @@
 
 #include "verify_internal.h"
 
+/*
+ * Prepared-object ownership summary.
+ *
+ * verify_index_query owns refxyz, refstarid, and captured sweep storage while
+ * borrowing source. verify_prepared_hit owns its index-derived arrays and WCS
+ * value; verify.testxy may borrow the pass field. Destruction must therefore
+ * complete before the field view or source lifetime ends.
+ */
+
 typedef enum verify_prepared_state {
     VERIFY_PREPARED_READY = 0,
     VERIFY_PREPARED_NO_REFERENCE = 1,

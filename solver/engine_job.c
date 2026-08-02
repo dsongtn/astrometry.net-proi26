@@ -3,6 +3,19 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+/*
+ * Developer navigation
+ * --------------------
+ * This module owns the job-description boundary: allocation, destruction,
+ * parsing, and validation of the values that engine.c later executes.
+ * engine_read_job_file() is the main entry point; job_free() is the matching
+ * owner cleanup. The scale and depth lists belong to job_t after parsing.
+ *
+ * Keep execution policy out of this file. Worker-width resolution belongs in
+ * engine_policy.c, pass enumeration belongs in engine_pass.c, and all index
+ * ownership, cancellation, and result publication begins below onefield.
+ */
+
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>

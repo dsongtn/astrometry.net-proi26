@@ -4,8 +4,17 @@
  */
 
 /*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
+ * Developer navigation: claim selection and wake predicates
+ * ---------------------------------------------------------
+ * This module decides which already-admissible unit a worker claims next:
+ * an outer index while producer capacity is available, or bounded inner work
+ * published by an owner. Claims occur under queue_mutex and change execution
+ * state exactly once; they never transfer outer ownership or reducer
+ * authority.
+ *
+ * Queue predicates include terminal and generation state so spurious wakeups
+ * cannot claim stale work. Width policy is supplied by pass setup; this module
+ * must not introduce image-, index-family-, or worker-count special cases.
  */
 #include <assert.h>
 #include <errno.h>

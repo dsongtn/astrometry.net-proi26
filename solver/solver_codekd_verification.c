@@ -2,7 +2,18 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
-/* Prepared verification queries, matching, and score windows. */
+/*
+ * Developer navigation: prepared verification inside a CodeKD packet
+ * -------------------------------------------------------------------
+ * After CodeKD and candidate payloads are ready, this module builds bounded
+ * index-free verification contexts, captures required StarKD sweep data, and
+ * optionally publishes disjoint score work. Prepared arrays are immutable to
+ * helpers and remain owned by the packet until owner retirement or cleanup.
+ *
+ * Physical page-plan order is independent from scientific result order. Query
+ * results, candidate matches, scores, thresholds, and first-valid behavior are
+ * reduced only in canonical descriptor/candidate sequence by the owner.
+ */
 
 #include <limits.h>
 #include <stdint.h>

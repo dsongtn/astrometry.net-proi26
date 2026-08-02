@@ -2,7 +2,19 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
-/* Bounded field-geometry cache construction and pair lookup. */
+/*
+ * Developer navigation: worker-private field geometry
+ * ---------------------------------------------------
+ * This module precomputes the invariant geometry of field-star pairs for one
+ * compatible solver configuration. The owning solver keeps the bounded
+ * triangular table and may reuse it across solver_run() calls; borrowed worker
+ * views never mutate or free another owner's table.
+ *
+ * The helpers reproduce the native coordinate and scale tests. Allocation,
+ * incompatibility, or budget refusal leaves the original inline computation
+ * authoritative. Do not change expression order here independently from the
+ * contracted arithmetic in solver_inline_internal.h.
+ */
 
 #include <stdint.h>
 #include <stdlib.h>

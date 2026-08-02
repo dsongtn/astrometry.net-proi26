@@ -3,6 +3,18 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+/*
+ * Developer navigation
+ * --------------------
+ * This module resolves public job/configuration controls before a pass starts.
+ * It selects the effective wall and CPU limits and validates the requested
+ * index-shard width against CPUs visible through process affinity.
+ *
+ * The result is policy input, not a scheduler decision. Pool roles, producer
+ * width, helper eligibility, and payload-I/O width are derived later by the
+ * index-shard and FITSBIN layers. Keep W1 mapped to the native serial path.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

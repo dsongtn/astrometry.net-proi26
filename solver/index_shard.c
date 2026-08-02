@@ -25,6 +25,13 @@
  *   - no worker writes directly into master bp->solutions
  *   - no persistent full index_t cache in production path
  *   - index load/release follows the original onefield ownership hooks
+ *
+ * Navigation:
+ *   - index_shard_private.h defines shared state, locks, and the module map
+ *   - index_shard_pass.c owns one generation from submit through quiescence
+ *   - index_shard_scheduler.c and worker.c own claims and execution
+ *   - index_shard_staged.c and helper.c own inner-package completion
+ *   - index_shard_reducer.c is the sole master-publication boundary
  */
 #include "index_shard_private.h"
 

@@ -17,6 +17,15 @@
 #include "index_shard_internal.h"
 #include "solver_field_geometry_internal.h"
 
+/*
+ * Immutable packaging boundary for native hypothesis traversal.
+ *
+ * Descriptor sequence is canonical. Packet capacities and byte budgets bound
+ * transport only; reaching a bound must split work or return it to the owner,
+ * never prune scientific candidates. Verification packets own copied arrays
+ * and explicit leases until owner retirement or destruction.
+ */
+
 #ifndef SOLVER_AB_CANDIDATE_LIMIT_BYTES
 #define SOLVER_AB_CANDIDATE_LIMIT_BYTES (768U * 1024U)
 #endif

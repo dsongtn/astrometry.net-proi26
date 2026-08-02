@@ -2,6 +2,22 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
+/*
+ * Parallel-solver navigation
+ * --------------------------
+ * This file remains the authoritative mutable solver control flow, including
+ * solver_run(), resolution, verification calls, limits, and acceptance.
+ * Extracted project modules provide bounded services around that flow:
+ *
+ *   solver_field_geometry.c  compatible worker-private pair geometry
+ *   solver_hypothesis.c      native-order descriptors and verification waves
+ *   solver_codekd_*.c        bounded delivery/compute packets and retirement
+ *   solver_profile.c         aggregate observation
+ *
+ * No extracted module may concurrently mutate this solver_t. Foreign workers
+ * receive immutable packages; the owning solver retires their products in
+ * canonical order and retains the native path as fallback.
+ */
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>

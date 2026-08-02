@@ -3,6 +3,16 @@
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
 
+/*
+ * Parallel-solver navigation
+ * --------------------------
+ * This file remains the public verification facade and candidate-control flow.
+ * verify_score.c contains star-list scoring, verify_projection.c contains the
+ * optional bounded projection helper, and verify_prepared.c owns index-free
+ * contexts used by CodeKD packets. All paths retain the thresholds, order, and
+ * final acceptance semantics defined here and in the original verifier.
+ */
+
 #include <assert.h>
 #include <limits.h>
 #include <math.h>

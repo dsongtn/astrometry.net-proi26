@@ -2,6 +2,20 @@
  # This file is part of the Astrometry.net suite.
  # Licensed under a 3-clause BSD style license - see LICENSE
  */
+
+/*
+ * Developer navigation: bounded payload I/O service
+ * -------------------------------------------------
+ * This module owns the persistent I/O lanes, priority queues, admission
+ * budgets, completion notifier, and payload-ticket state machine. A ticket
+ * moves from planned to submitted and then to exactly one terminal state;
+ * waiters, cancellation, drain, and destruction share explicit ownership.
+ *
+ * I/O lanes populate mappings or perform bounded direct transport but never
+ * execute solver mathematics. Numeric completion identities cross into the
+ * shard registry; solver/index/mapping lifetimes remain with the submitting
+ * owner. Refusal or service shutdown leaves native mapped access available.
+ */
 #include <errno.h>
 #include <stdlib.h>
 #include <stdarg.h>

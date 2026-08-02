@@ -4,8 +4,16 @@
  */
 
 /*
- * Private implementation module for the index-shard subsystem.
- * See index_shard_private.h for ownership and lock-order invariants.
+ * Developer navigation: pass-wide control
+ * ---------------------------------------
+ * This module owns worker TLS, global-limit sampling, terminal-state queries,
+ * and cooperative stop propagation. TLS lets callbacks reached through the
+ * legacy solver stack find their current worker/pass without adding mutable
+ * pool state to upstream function signatures.
+ *
+ * Control code may request unwind, but it does not arbitrate candidates or
+ * transfer results. Those are reducer responsibilities. All waits and state
+ * changes follow the locks and terminal precedence in index_shard_private.h.
  */
 #include <assert.h>
 #include <errno.h>

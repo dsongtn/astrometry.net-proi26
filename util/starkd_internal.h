@@ -7,6 +7,8 @@
 
 #include "starkd.h"
 
+/* Internal row-index helpers used by bounded payload preparation only. */
+
 int startree_data_count_internal(const startree_t* s);
 int startree_data_index_internal(startree_t* s, int starid);
 
