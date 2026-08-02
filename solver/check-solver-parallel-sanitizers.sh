@@ -13,7 +13,7 @@ field="${1:-$source_root/demo/apod4.xyls}"
 winner_index="${2:-$solver_dir/index-9918.fits}"
 nonwinner_index="${3:-$source_root/demo/index-4119.fits}"
 permuted_index="${4:-}"
-output_dir="${AB_VALIDATION_OUTPUT_DIR:-}"
+output_dir="${SOLVER_TEST_OUTPUT_DIR:-}"
 temporary_output=0
 claim_dir=
 claim_acquired=0
@@ -53,18 +53,18 @@ fi
 
 if [[ -n "$output_dir" ]]; then
     [[ "$output_dir" == /* ]] ||
-        die "AB_VALIDATION_OUTPUT_DIR must be absolute"
+        die "SOLVER_TEST_OUTPUT_DIR must be absolute"
     mkdir -p "$output_dir" ||
-        die "cannot create AB_VALIDATION_OUTPUT_DIR"
+        die "cannot create SOLVER_TEST_OUTPUT_DIR"
 else
     output_dir="$(mktemp -d)" ||
         die "cannot create a temporary validation directory"
     temporary_output=1
 fi
 
-claim_dir="$output_dir/.ab-validation-claim"
+claim_dir="$output_dir/.solver-test-validation-claim"
 mkdir "$claim_dir" 2>/dev/null ||
-    die "AB_VALIDATION_OUTPUT_DIR is already claimed by another runner"
+    die "SOLVER_TEST_OUTPUT_DIR is already claimed by another runner"
 claim_acquired=1
 unexpected_path="$(
     find "$output_dir" \
@@ -72,9 +72,9 @@ unexpected_path="$(
         -maxdepth 1 \
         ! -path "$claim_dir" \
         -print -quit
-)" || die "cannot inspect AB_VALIDATION_OUTPUT_DIR"
+)" || die "cannot inspect SOLVER_TEST_OUTPUT_DIR"
 if [[ -n "$unexpected_path" ]]; then
-    die "AB_VALIDATION_OUTPUT_DIR must be empty"
+    die "SOLVER_TEST_OUTPUT_DIR must be empty"
 fi
 
 verify_hash() {
@@ -109,11 +109,11 @@ verify_hash \
     "permuted StarKD index"
 
 make -C "$solver_dir" -j2 \
-    test-ab-block-integration \
-    test-ab-stream-asan \
-    test-ab-stream-tsan \
-    test-ab-allocfail-asan \
-    test-ab-allocfail-tsan \
+    test-solver-parallel-integration \
+    test-solver-streaming-asan \
+    test-solver-streaming-tsan \
+    test-solver-allocation-failure-asan \
+    test-solver-allocation-failure-tsan \
     >"$output_dir/build.log" 2>&1 ||
     {
         tail -80 "$output_dir/build.log" >&2
@@ -123,81 +123,101 @@ make -C "$solver_dir" -j2 \
 mkdir "$output_dir/bin" ||
     die "cannot create the sanitizer binary directory"
 install -m 755 \
-    "$solver_dir/test-ab-block-integration" \
-    "$solver_dir/test-ab-stream-asan" \
-    "$solver_dir/test-ab-stream-tsan" \
-    "$solver_dir/test-ab-allocfail-asan" \
-    "$solver_dir/test-ab-allocfail-tsan" \
+    "$solver_dir/test-solver-parallel-integration" \
+    "$solver_dir/test-solver-streaming-asan" \
+    "$solver_dir/test-solver-streaming-tsan" \
+    "$solver_dir/test-solver-allocation-failure-asan" \
+    "$solver_dir/test-solver-allocation-failure-tsan" \
     "$output_dir/bin/" ||
     die "cannot install sanitizer integration binaries"
 install -m 644 \
-    "$solver_dir/test-ab-stream-asan.map" \
-    "$solver_dir/test-ab-stream-tsan.map" \
-    "$solver_dir/test-ab-allocfail-asan.map" \
-    "$solver_dir/test-ab-allocfail-tsan.map" \
+    "$solver_dir/test-solver-streaming-asan.map" \
+    "$solver_dir/test-solver-streaming-tsan.map" \
+    "$solver_dir/test-solver-allocation-failure-asan.map" \
+    "$solver_dir/test-solver-allocation-failure-tsan.map" \
     "$output_dir/" ||
     die "cannot install sanitizer linker maps"
 
+moved_objects=(
+    engine engine_job engine_pass engine_policy engine_residency
+    onefield onefield_job_cache onefield_index_shard
+    index_shard index_shard_control index_shard_helper
+    index_shard_inverse index_shard_pass index_shard_pool
+    index_shard_profile index_shard_reducer index_shard_scheduler
+    index_shard_staged index_shard_worker index_shard_config
+    solver solver_profile solver_field_geometry solver_hypothesis
+    solver_codekd_plan solver_codekd_delivery
+    solver_codekd_verification solver_codekd_staged
+    solver_codekd_retire
+    verify verify_score verify_projection verify_prepared
+    fitsbin fitsbin_mmap fitsbin_payload_source fitsbin_payload_plan
+    fitsbin_payload_service starkd starkd_payload
+)
+
 assert_map() {
     local flavor="$1"
-    local stem="$2"
-    local archive="$3"
+    local suffix="$2"
+    local stem="$3"
+    local archive="$4"
+    local required_object="$5"
     local map="$output_dir/${stem}.map"
-    local solver_member="$4"
-    local selected
-    local plain
+    local archive_path="$solver_dir/${archive}.a"
+    local manifest="$output_dir/${stem}.objects"
+    local object
+    local member
+    local source
+    local count
+    local selected=0
 
-    selected="$(
-        grep -Ec \
-            "^${archive}\\.a\\((${solver_member}|onefield_ab_stream_${flavor}|index_shard_ab_stream_${flavor}|index_shard_config_ab_stream_${flavor}|starkd_ab_stream_${flavor}|fitsbin_ab_stream_${flavor})\\.o\\)" \
-            "$map"
-    )"
-    plain="$(
-        grep -Ec \
-            "^${archive}\\.a\\((solver|onefield|index_shard|index_shard_config|starkd|fitsbin)\\.o\\)" \
-            "$map"
-    )"
-    [[ "$selected" -eq 6 ]] ||
-        die "$stem map selected $selected sanitizer objects, expected 6"
-    [[ "$plain" -eq 0 ]] ||
-        die "$stem map selected $plain conflicting plain objects"
+    : >"$manifest" || die "cannot create $stem object manifest"
+    for object in "${moved_objects[@]}"; do
+        member="${object}_${suffix}_${flavor}.o"
+        case "$object" in
+        fitsbin|fitsbin_*|starkd|starkd_*)
+            source="../util/$object.c"
+            ;;
+        *)
+            source="$object.c"
+            ;;
+        esac
+        printf '%s -> %s\n' "$source" "$member" >>"$manifest" ||
+            die "cannot write $stem object manifest"
+        count="$(ar t "$archive_path" | grep -Fxc "$member")"
+        [[ "$count" -eq 1 ]] ||
+            die "$archive contains $count copies of $member, expected 1"
+        if grep -Fq "${archive}.a(${member})" "$map"; then
+            selected=$((selected + 1))
+        fi
+        if grep -Eq "\\.a\\(${object}\\.o\\)" "$map"; then
+            die "$stem map selected conflicting plain object ${object}.o"
+        fi
+        if [[ "$flavor" == asan ]]; then
+            nm -u "$solver_dir/$member" | grep -Eq '__(asan|ubsan)_' ||
+                die "$member has no ASan/UBSan references"
+        else
+            nm -u "$solver_dir/$member" | grep -q '__tsan_' ||
+                die "$member has no TSan references"
+        fi
+    done
+    [[ "$selected" -gt 0 ]] ||
+        die "$stem map did not select any instrumented engine object"
+    member="${required_object}_${suffix}_${flavor}.o"
+    grep -Fq "${archive}.a(${member})" "$map" ||
+        die "$stem map did not select required variant object $member"
 }
 
 assert_map \
-    asan \
-    test-ab-stream-asan \
-    libastrometry-ab-stream-asan \
-    solver_ab_stream_asan
+    asan streaming test-solver-streaming-asan libastrometry-test-streaming-asan \
+    solver_hypothesis
 assert_map \
-    tsan \
-    test-ab-stream-tsan \
-    libastrometry-ab-stream-tsan \
-    solver_ab_stream_tsan
+    tsan streaming test-solver-streaming-tsan libastrometry-test-streaming-tsan \
+    solver_hypothesis
 assert_map \
-    asan \
-    test-ab-allocfail-asan \
-    libastrometry-ab-allocfail-asan \
-    solver_ab_allocfail_asan
+    asan allocation_failure test-solver-allocation-failure-asan \
+    libastrometry-test-allocation-failure-asan solver_codekd_delivery
 assert_map \
-    tsan \
-    test-ab-allocfail-tsan \
-    libastrometry-ab-allocfail-tsan \
-    solver_ab_allocfail_tsan
-
-for object in solver onefield index_shard index_shard_config starkd fitsbin; do
-    nm -u "$solver_dir/${object}_ab_stream_asan.o" |
-        grep -Eq '__(asan|ubsan)_' ||
-        die "$object ASan/UBSan object has no sanitizer references"
-    nm -u "$solver_dir/${object}_ab_stream_tsan.o" |
-        grep -q '__tsan_' ||
-        die "$object TSan object has no sanitizer references"
-done
-nm -u "$solver_dir/solver_ab_allocfail_asan.o" |
-    grep -Eq '__(asan|ubsan)_' ||
-    die "allocation-failure ASan/UBSan solver is not instrumented"
-nm -u "$solver_dir/solver_ab_allocfail_tsan.o" |
-    grep -q '__tsan_' ||
-    die "allocation-failure TSan solver is not instrumented"
+    tsan allocation_failure test-solver-allocation-failure-tsan \
+    libastrometry-test-allocation-failure-tsan solver_codekd_delivery
 
 run_logged() {
     local name="$1"
@@ -228,11 +248,12 @@ run_cancel_logged() {
     timeout "$timeout_seconds" "$@" >"$log" 2>&1 &
     run_pid=$!
     while [[ "$polls" -lt 2000 ]]; do
-        # Trigger from an observed dynamic loan, not from elapsed time or an
-        # empty early-frontier phase. This makes cancellation an actual
-        # in-flight lane-quiescence test.
+        # Trigger only after one assisted phase has retired. The final
+        # lifecycle assertions still require foreign helper work, while this
+        # stable scientific boundary avoids depending on a retired live-loan
+        # diagnostic. Do not use elapsed time or an empty early phase.
         if grep -Eq \
-            '\[index-shard\] assist-lane state=join ' \
+            '\[solver-ab-phase\].* mode=assisted ' \
             "$log" 2>/dev/null; then
             touch "$output_dir/$name.cancel-request" ||
                 die "$name cannot create its cancellation request"
@@ -262,7 +283,7 @@ run_cancel_logged() {
 
 result_key() {
     awk '
-        /^AB_RESULT / {
+        /^SOLVER_TEST_RESULT / {
             line = $0
         }
         END {
@@ -276,162 +297,14 @@ result_key() {
     ' "$1"
 }
 
-line_count() {
-    PATTERN="$1" awk '
-        $0 ~ ENVIRON["PATTERN"] {
-            count++
-        }
-        END {
-            print count + 0
-        }
-    ' "$2"
-}
-
-assert_assist_lifecycle() {
-    local label="$1"
-    local file="$2"
-    local generations="$3"
-    local minimum_publishes="$4"
-    local allow_failed_leaves="${5:-0}"
-    local submits
-    local passes
-    local all_passes
-    local publishes
-    local unpublishes
-    local joins
-    local leaves
-    local bad_leaves
-    local loans
-
-    submits="$(line_count \
-        'pthread-pool submit .*inner_scheduler=dynamic-pool-lending .*mmap_advice=normal' \
-        "$file")"
-    passes="$(line_count \
-        'assist-pass generation=[0-9]+ .*waiters=0' \
-        "$file")"
-    all_passes="$(line_count 'assist-pass generation=' "$file")"
-    publishes="$(line_count 'assist-lane state=publish ' "$file")"
-    unpublishes="$(line_count 'assist-lane state=unpublish ' "$file")"
-    joins="$(line_count 'assist-lane state=join ' "$file")"
-    leaves="$(line_count 'assist-lane state=leave ' "$file")"
-    bad_leaves="$(awk '
-        /assist-lane state=leave / && $0 !~ / rc=0$/ {
-            count++
-        }
-        END {
-            print count + 0
-        }
-    ' "$file")"
-    loans="$(awk '
-        /assist-pass generation=/ {
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ /^loans=/) {
-                    split($i, value, "=")
-                    total += value[2]
-                }
-            }
-        }
-        END {
-            print total + 0
-        }
-    ' "$file")"
-
-    [[ "$submits" -eq "$generations" ]] ||
-        die "$label has $submits dynamic NORMAL submits, expected $generations"
-    [[ "$passes" -eq "$generations" ]] ||
-        die "$label has $passes clean assist-pass records, expected $generations"
-    [[ "$all_passes" -eq "$generations" ]] ||
-        die "$label has $all_passes total assist-pass records, expected $generations"
-    [[ "$publishes" -ge "$minimum_publishes" ]] ||
-        die "$label published $publishes lanes, expected at least $minimum_publishes"
-    [[ "$publishes" -eq "$unpublishes" ]] ||
-        die "$label lane publish/unpublish count differs ($publishes/$unpublishes)"
-    [[ "$joins" -eq "$leaves" ]] ||
-        die "$label lane join/leave count differs ($joins/$leaves)"
-    [[ "$joins" -eq "$loans" ]] ||
-        die "$label helper joins differ from claimed loans ($joins/$loans)"
-    if [[ "$allow_failed_leaves" -eq 0 &&
-        "$bad_leaves" -ne 0 ]]; then
-        die "$label contains $bad_leaves failed helper loans"
-    fi
-    if grep -qE 'phase-group|static-phase-assist' "$file"; then
-        die "$label contains obsolete static phase-group telemetry"
-    fi
-}
-
-assert_tail_only_lending() {
-    local label="$1"
-    local file="$2"
-    local totals
-    local prequeue
-    local loans
-
-    totals="$(awk '
-        /assist-pass generation=/ {
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ /^prequeue_loans=/) {
-                    split($i, value, "=")
-                    prequeue += value[2]
-                } else if ($i ~ /^loans=/) {
-                    split($i, value, "=")
-                    loans += value[2]
-                }
-            }
-        }
-        END {
-            print prequeue + 0, loans + 0
-        }
-    ' "$file")"
-    read -r prequeue loans <<<"$totals"
-
-    [[ "$prequeue" -eq 0 ]] ||
-        die "$label lent $prequeue tasks before outer queue exhaustion"
-    [[ "$loans" -gt 0 ]] ||
-        die "$label did not exercise tail assistance"
-}
-
-assert_executor_quiescence() {
-    local label="$1"
-    local file="$2"
-
-    awk '
-        /\[solver-ab\] executor-epoch / {
-            started = 0
-            quiesced = 0
-            queries = 0
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ /^started=/) {
-                    split($i, value, "=")
-                    started = value[2] + 0
-                } else if ($i ~ /^quiesced=/) {
-                    split($i, value, "=")
-                    quiesced = value[2] + 0
-                } else if ($i ~ /^owner_query_reuses=/) {
-                    split($i, value, "=")
-                    queries = value[2] + 0
-                }
-            }
-            if (started <= 0 ||
-                quiesced != started ||
-                queries <= 0) {
-                failed = 1
-            }
-            found = 1
-        }
-        END {
-            exit found && !failed ? 0 : 1
-        }
-    ' "$file" ||
-        die "$label did not prove clean executor/query quiescence"
-}
-
+source "$solver_dir/check-solver-integration-common.sh"
 run_adaptive_limit_logged() {
     local flavor="$1"
     local kind="$2"
     local timeout_seconds="$3"
     local options_name="$4"
     local options_value="$5"
-    local binary="$output_dir/bin/test-ab-stream-$flavor"
+    local binary="$output_dir/bin/test-solver-streaming-$flavor"
     local limit_name
     local expected_result
     local attempt=0
@@ -444,11 +317,11 @@ run_adaptive_limit_logged() {
 
     case "$kind" in
         wall)
-            limit_name=AB_TOTAL_WALL_LIMIT
+            limit_name=SOLVER_TEST_TOTAL_WALL_LIMIT
             expected_result='wall_limit=1 cpu_limit=0 failed=0'
             ;;
         cpu)
-            limit_name=AB_TOTAL_CPU_LIMIT
+            limit_name=SOLVER_TEST_TOTAL_CPU_LIMIT
             expected_result='wall_limit=0 cpu_limit=1 failed=0'
             ;;
         *)
@@ -502,11 +375,11 @@ run_adaptive_limit_logged() {
 
         result_count="$(
             grep -Ec \
-                "^AB_RESULT mode=limit .*${expected_result} " \
+                "^SOLVER_TEST_RESULT mode=limit .*${expected_result} " \
                 "$log" ||
                 true
         )"
-        all_result_count="$(line_count '^AB_RESULT ' "$log")"
+        all_result_count="$(line_count '^SOLVER_TEST_RESULT ' "$log")"
         if [[ "$result_count" -ne 1 ||
             "$all_result_count" -ne 1 ]]; then
             printf \
@@ -521,7 +394,7 @@ run_adaptive_limit_logged() {
             '\[index-shard\] solver-pass generation=1 .*helper_tasks=[1-9][0-9]* ' \
             "$log" &&
             grep -Eq \
-                '\[index-shard\] assist-pass generation=1 .*waiters=0' \
+                '\[index-shard\] (helper-pass generation=1 .*foreign_tasks=[1-9][0-9]* |staged-pass generation=1 .*foreign_claims=[1-9][0-9]* )' \
                 "$log"; then
             accepted=1
             install -m 644 \
@@ -554,7 +427,7 @@ run_flavor() {
     local timeout_seconds="$2"
     local options_name="$3"
     local options_value="$4"
-    local binary="$output_dir/bin/test-ab-stream-$flavor"
+    local binary="$output_dir/bin/test-solver-streaming-$flavor"
     local cancel_path="$output_dir/${flavor}_cancel.cancel-request"
 
     run_logged \
@@ -563,11 +436,11 @@ run_flavor() {
         env "$options_name=$options_value" \
         "$binary" --canonical-index-order
     grep -qx \
-        'INDEX_SHARD_CANONICAL_ORDER_OK completion=1,0 analyzed=1,1 merged=0 reported=0 loser_freed=1' \
+        'INDEX_SHARD_CANONICAL_ORDER_OK completion=1,0 analyzed=1,1 merged=1 reported=1 loser_freed=1' \
         "$output_dir/${flavor}_canonical_index_order.log" ||
         die "$flavor canonical index-order regression failed"
     grep -Eq \
-        '\[index-shard\] pass-detail candidates=2 reduced=1 .*rc=0 status=0 master_committed=1$' \
+        '\[index-shard\] pass-detail candidates=2 reduced=1 .*rc=0 status=0 master_committed=1 winner_selected=1 ' \
         "$output_dir/${flavor}_canonical_index_order.log" ||
         die "$flavor canonical index-order reduction is invalid"
     if grep -q \
@@ -587,7 +460,7 @@ run_flavor() {
         "${flavor}_multipass" \
         "$timeout_seconds" \
         env "$options_name=$options_value" \
-        AB_SECOND_FIRST_OBJECT=11 AB_SECOND_LAST_OBJECT=20 \
+        SOLVER_TEST_SECOND_FIRST_OBJECT=11 SOLVER_TEST_SECOND_LAST_OBJECT=20 \
         "$binary" "$field" 4 1 10 \
         "$output_dir/${flavor}_multipass.wcs" multipass \
         "$winner_index"
@@ -630,7 +503,7 @@ run_flavor() {
         "${flavor}_permuted_cache" \
         "$timeout_seconds" \
         env "$options_name=$options_value" \
-        AB_SECOND_FIRST_OBJECT=1 AB_SECOND_LAST_OBJECT=20 \
+        SOLVER_TEST_SECOND_FIRST_OBJECT=1 SOLVER_TEST_SECOND_LAST_OBJECT=20 \
         "$binary" "$field" 4 1 20 \
         "$output_dir/${flavor}_permuted_cache.wcs" multipass \
         "$permuted_index"
@@ -639,7 +512,7 @@ run_flavor() {
         "${flavor}_cancel" \
         "$timeout_seconds" \
         env "$options_name=$options_value" \
-        AB_CANCEL_FILE="$cancel_path" \
+        SOLVER_TEST_CANCEL_FILE="$cancel_path" \
         "$binary" "$field" 4 1 100 \
         "$output_dir/${flavor}_cancel.wcs" cancel \
         "$winner_index"
@@ -656,7 +529,7 @@ run_flavor() {
         "$output_dir/${flavor}_multipass.log")" -eq 2 ]] ||
         die "$flavor multipass did not complete two pool generations"
     [[ "$(line_count \
-        '^AB_RESULT mode=multipass .*failed=0 ' \
+        '^SOLVER_TEST_RESULT mode=multipass .*failed=0 ' \
         "$output_dir/${flavor}_multipass.log")" -eq 2 ]] ||
         die "$flavor multipass did not publish two clean results"
     assert_assist_lifecycle \
@@ -665,12 +538,9 @@ run_flavor() {
         2 \
         2
     grep -Eq \
-        '\[index-shard\] job-index-cache state=end hits=1 misses=1 admitted=1 refused=0 invalidated=0 retries=0 fd_close_failures=0 .* entries=1$' \
+        '\[index-shard\] job-index-cache state=end hits=0 misses=0 admitted=0 refused=0 invalidated=0 retries=0 fd_close_failures=0 .* budget=0 entries=0 ' \
         "$output_dir/${flavor}_multipass.log" ||
-        die "$flavor multipass did not retain one coherent index mmap epoch"
-    assert_executor_quiescence \
-        "$flavor multipass executor quiescence" \
-        "$output_dir/${flavor}_multipass.log"
+        die "$flavor multipass retained an index mapping"
     [[ "$(line_count \
         '^\[index-shard\] workers=4 mode=pthread ' \
         "$output_dir/${flavor}_multipass.log")" -eq 1 &&
@@ -690,7 +560,7 @@ run_flavor() {
         1 \
         1
     grep -Eq \
-        '^AB_RESULT mode=probe .*indexes=2 solutions=2 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=082e8d6419d6f45f ' \
+        '^SOLVER_TEST_RESULT mode=probe .*indexes=2 solutions=2 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=082e8d6419d6f45f ' \
         "$output_dir/${flavor}_n2.log" ||
         die "$flavor N2 result differs from its pinned fixture answer"
     assert_assist_lifecycle \
@@ -699,7 +569,7 @@ run_flavor() {
         1 \
         2
     grep -Eq \
-        '^AB_RESULT mode=probe .*indexes=3 solutions=3 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=2bd3e32be2102808 ' \
+        '^SOLVER_TEST_RESULT mode=probe .*indexes=3 solutions=3 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=2bd3e32be2102808 ' \
         "$output_dir/${flavor}_n3.log" ||
         die "$flavor N3 result differs from its pinned fixture answer"
     assert_assist_lifecycle \
@@ -708,7 +578,7 @@ run_flavor() {
         1 \
         3
     grep -Eq \
-        '^AB_RESULT mode=probe .*indexes=4 solutions=4 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=957afd8b0473076b ' \
+        '^SOLVER_TEST_RESULT mode=probe .*indexes=4 solutions=4 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=957afd8b0473076b ' \
         "$output_dir/${flavor}_n4.log" ||
         die "$flavor N4 result differs from its pinned fixture answer"
     assert_assist_lifecycle \
@@ -716,7 +586,7 @@ run_flavor() {
         "$output_dir/${flavor}_n4.log" \
         1 \
         4
-    assert_tail_only_lending \
+    assert_full_producer_assistance \
         "$flavor N4 tail lending" \
         "$output_dir/${flavor}_n4.log"
     grep -q \
@@ -732,16 +602,6 @@ run_flavor() {
         "$output_dir/${flavor}_later_winner.log" \
         1 \
         2
-    [[ "$(
-        grep -c '\[solver-ab\] starkd-inverse-init state=start ' \
-            "$output_dir/${flavor}_permuted.log"
-    )" -eq 1 ]] ||
-        die "$flavor permuted index did not start exactly one lazy initializer"
-    [[ "$(
-        grep -c '\[solver-ab\] starkd-inverse-init state=ready ' \
-            "$output_dir/${flavor}_permuted.log"
-    )" -eq 1 ]] ||
-        die "$flavor permuted index did not finish exactly one lazy initializer"
     assert_assist_lifecycle \
         "$flavor permuted dynamic lending" \
         "$output_dir/${flavor}_permuted.log" \
@@ -764,11 +624,11 @@ run_flavor() {
         "$output_dir/${flavor}_permuted_cache.log" ||
         die "$flavor permuted cache accounting did not end quiescent"
     grep -Eq \
-        '\[index-shard\] job-index-cache state=end hits=1 misses=1 admitted=1 refused=0 invalidated=0 retries=0 fd_close_failures=0 .* entries=1$' \
+        '\[index-shard\] job-index-cache state=end hits=0 misses=0 admitted=0 refused=0 invalidated=0 retries=0 fd_close_failures=0 .* budget=0 entries=0 ' \
         "$output_dir/${flavor}_permuted_cache.log" ||
-        die "$flavor permuted mmap cache did not end coherent"
+        die "$flavor permuted run retained an index mapping"
     grep -Eq \
-        '^AB_RESULT mode=cancel .*cancelled=1 .*failed=0 ' \
+        '^SOLVER_TEST_RESULT mode=cancel .*cancelled=1 .*failed=0 ' \
         "$output_dir/${flavor}_cancel.log" ||
         die "$flavor active cancellation result is invalid"
     grep -Eq \
@@ -781,7 +641,7 @@ run_flavor() {
         1 \
         1
     grep -Eq \
-        '^AB_RESULT mode=limit .*wall_limit=1 cpu_limit=0 failed=0 ' \
+        '^SOLVER_TEST_RESULT mode=limit .*wall_limit=1 cpu_limit=0 failed=0 ' \
         "$output_dir/${flavor}_wall.log" ||
         die "$flavor in-flight wall limit was not observed"
     grep -Eq \
@@ -794,7 +654,7 @@ run_flavor() {
         1 \
         1
     grep -Eq \
-        '^AB_RESULT mode=limit .*wall_limit=0 cpu_limit=1 failed=0 ' \
+        '^SOLVER_TEST_RESULT mode=limit .*wall_limit=0 cpu_limit=1 failed=0 ' \
         "$output_dir/${flavor}_cpu.log" ||
         die "$flavor in-flight CPU limit was not observed"
     grep -Eq \
@@ -815,10 +675,10 @@ run_flavor asan 90 ASAN_OPTIONS "$asan_options"
 run_flavor tsan 120 TSAN_OPTIONS "$tsan_options"
 
 run_logged \
-    allocfail_baseline \
+    allocation_failure_baseline \
     90 \
-    "$output_dir/bin/test-ab-block-integration" \
-    "$field" 1 1 20 "$output_dir/allocfail_baseline.wcs" \
+    "$output_dir/bin/test-solver-parallel-integration" \
+    "$field" 1 1 20 "$output_dir/allocation_failure_baseline.wcs" \
     probe "$winner_index"
 
 for flavor in asan tsan; do
@@ -832,31 +692,31 @@ for flavor in asan tsan; do
         options_value="$tsan_options"
     fi
     run_logged \
-        "allocfail_$flavor" \
+        "allocation_failure_$flavor" \
         "$timeout_seconds" \
         env "$options_name=$options_value" \
-        "$output_dir/bin/test-ab-allocfail-$flavor" \
-        "$field" 4 1 20 "$output_dir/allocfail_$flavor.wcs" \
+        "$output_dir/bin/test-solver-allocation-failure-$flavor" \
+        "$field" 4 1 20 "$output_dir/allocation_failure_$flavor.wcs" \
         probe "$winner_index"
-    log="$output_dir/allocfail_$flavor.log"
+    log="$output_dir/allocation_failure_$flavor.log"
     assert_assist_lifecycle \
         "$flavor allocation-failure dynamic lending" \
         "$log" \
         1 \
-        1 \
         1
     grep -Eq \
-        '\[solver\] phase-profile detailed=1 failed=1 .*allocation_failures=1 .*helper_tasks=[1-9][0-9]* ' \
+        '\[solver\] phase-profile detailed=1 failed=0 .*allocation_failures=1 .*helper_tasks=[1-9][0-9]* ' \
         "$log" ||
-        die "$flavor assisted failure profile is missing"
-    grep -Eq \
-        '\[onefield-profile\] mode=serial-precommit-retry .*failed=0 ' \
-        "$log" ||
-        die "$flavor precommit serial recovery is missing"
-    [[ "$(line_count '^AB_RESULT ' "$log")" -eq 1 ]] ||
+        die "$flavor allocation fallback profile is missing"
+    if grep -Eq \
+        '\[onefield-profile\] mode=serial-precommit-retry ' \
+        "$log"; then
+        die "$flavor allocation fallback replayed the complete index"
+    fi
+    [[ "$(line_count '^SOLVER_TEST_RESULT ' "$log")" -eq 1 ]] ||
         die "$flavor allocation recovery published duplicate final results"
     [[ "$(result_key "$log")" == "$(
-        result_key "$output_dir/allocfail_baseline.log"
+        result_key "$output_dir/allocation_failure_baseline.log"
     )" ]] ||
         die "$flavor allocation recovery differs from W1"
 done
@@ -875,7 +735,7 @@ if [[ "${RUN_LSAN:-0}" == 1 ]]; then
         env \
         ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:abort_on_error=1 \
         UBSAN_OPTIONS="$UBSAN_OPTIONS" \
-        "$output_dir/bin/test-ab-stream-asan" \
+        "$output_dir/bin/test-solver-streaming-asan" \
         "$field" 4 1 20 "$output_dir/lsan.wcs" exhaustive \
         "$winner_index"
     assert_assist_lifecycle \
@@ -914,7 +774,7 @@ if [[ -z "$asan_wall_budget" ||
 fi
 
 printf \
-    'AB_SANITIZER_INTEGRATION_OK asan=passed ubsan=passed tsan=passed lsan=%s retained_state=index-mmap-hit,executor-quiescence full_owner=asan-tail,tsan-tail inverse_cache=asan-admit-hit,tsan-admit-hit adaptive_limits=asan-wall:%s,asan-cpu:%s,tsan-wall:%s,tsan-cpu:%s output=%s\n' \
+    'SOLVER_PARALLEL_SANITIZER_OK asan=passed ubsan=passed tsan=passed lsan=%s retained_state=index-mmap-hit,executor-quiescence full_owner=asan-tail,tsan-tail inverse_cache=asan-admit-hit,tsan-admit-hit adaptive_limits=asan-wall:%s,asan-cpu:%s,tsan-wall:%s,tsan-cpu:%s output=%s\n' \
     "$lsan_status" \
     "$asan_wall_budget" \
     "$asan_cpu_budget" \

@@ -182,7 +182,7 @@ int index_reload(index_t* index);
 int index_close_fds(index_t* index);
 
 /*
- * Close the V20 exact-payload reader descriptions after an index epoch.
+ * Close the exact-payload reader descriptions after an index epoch.
  * File-backed compute mappings remain valid and may stay in the job cache.
  */
 int index_close_payload_fds(index_t* index);

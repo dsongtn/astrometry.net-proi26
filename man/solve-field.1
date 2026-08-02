@@ -190,7 +190,7 @@ Elapsed astrometry-engine deadline, independent of worker count. The job value
 may reduce but not exceed the backend wall limit.
 .TP
 \fB\-\-p\-workers\fR \fIauto|count\fR
-Set the number of parallel solver workers.  \fBauto\fR uses up to four CPUs
+Set the number of parallel solver workers.  \fBauto\fR uses the CPUs
 available through process affinity.  A count of 1 uses the native
 serial solver.  Zero, negative counts, and counts larger than the available
 CPU count are errors.

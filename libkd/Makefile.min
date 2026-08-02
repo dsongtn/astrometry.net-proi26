@@ -8,6 +8,7 @@ include ../util/makefile.common
 INTERNALS := \
 	kdint_ddd.o \
 	kdint_fff.o \
+	kdint_lll.o \
 	kdint_ddu.o \
 	kdint_duu.o \
 	kdint_dds.o \
@@ -26,7 +27,11 @@ QFITSO := ../qfits-an/anqfits.o ../qfits-an/qfits_tools.o \
 
 UTILO := ../util/ioutils.o ../util/os-features.o \
 	../util/mathutil.o ../util/fitsioutils.o \
-	../util/fitsbin.o ../util/bl.o ../util/an-endian.o \
+	../util/fitsbin.o ../util/fitsbin_mmap.o \
+	../util/fitsbin_payload_source.o \
+	../util/fitsbin_payload_plan.o \
+	../util/fitsbin_payload_service.o \
+	../util/bl.o ../util/an-endian.o \
 	../util/fitsfile.o ../util/log.o \
 	../util/errors.o ../util/tic.o
 

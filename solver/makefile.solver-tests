@@ -1,0 +1,267 @@
+# This file is part of the Astrometry.net suite.
+# Licensed under a 3-clause BSD style license - see LICENSE
+#
+# Focused solver regression and validation targets.
+
+SOLVER_TEST_HEADERS := engine_internal.h engine_private.h \
+	index_shard_internal.h index_shard_private.h index_shard_config.h \
+	onefield_internal.h solver_codekd_internal.h \
+	solver_field_geometry_internal.h solver_inline_internal.h \
+	solver_hypothesis_internal.h solver_profile_internal.h \
+	verify_internal.h verify_prepared_internal.h \
+	../util/fitsbin_internal.h ../util/starkd_internal.h \
+	../include/astrometry/index_shard.h \
+	../include/astrometry/onefield.h \
+	../include/astrometry/solver.h \
+	../include/astrometry/fitsbin.h \
+	../include/astrometry/starkd.h
+
+SOLVER_TEST_VARIANT_ENGINE_OBJS := $(ENGINE_CORE_OBJS) $(ONEFIELD_OBJS) \
+	$(INDEX_SHARD_OBJS) $(SOLVER_CORE_OBJS) $(SOLVER_CODEKD_OBJS) \
+	$(VERIFY_OBJS)
+SOLVER_TEST_VARIANT_BASE_OBJS := \
+	$(filter-out $(SOLVER_TEST_VARIANT_ENGINE_OBJS),$(ENGINE_OBJS))
+SOLVER_TEST_SANITIZER_ENGINE_STEMS := $(basename $(SOLVER_TEST_VARIANT_ENGINE_OBJS))
+SOLVER_TEST_SANITIZER_UTIL_STEMS := fitsbin fitsbin_mmap \
+	fitsbin_payload_source fitsbin_payload_plan fitsbin_payload_service \
+	starkd starkd_payload
+
+STREAMING_TEST_LIB := libastrometry-test-streaming.a
+STREAMING_TEST_OBJS := \
+	$(filter-out solver_hypothesis.o,$(ENGINE_OBJS)) \
+	solver_hypothesis_test_streaming.o
+
+ALLOCATION_FAILURE_TEST_LIB := libastrometry-test-allocation-failure.a
+ALLOCATION_FAILURE_TEST_OBJS := \
+	$(filter-out solver_codekd_delivery.o,$(ENGINE_OBJS)) \
+	solver_codekd_delivery_test_allocation_failure.o
+
+GEOMETRY_FALLBACK_TEST_LIB := libastrometry-test-geometry-fallback.a
+GEOMETRY_FALLBACK_TEST_OBJS := \
+	$(filter-out solver_field_geometry.o,$(ENGINE_OBJS)) \
+	solver_field_geometry_test_fallback.o
+
+SOLVER_TEST_SANITIZER_FLAGS := -O1 -fno-omit-frame-pointer \
+	-fsanitize=address,undefined
+STREAMING_ASAN_LIB := libastrometry-test-streaming-asan.a
+STREAMING_ASAN_ENGINE_OBJS := \
+	$(addsuffix _test_streaming_asan.o,$(SOLVER_TEST_SANITIZER_ENGINE_STEMS))
+STREAMING_ASAN_UTIL_OBJS := \
+	$(addsuffix _test_streaming_asan.o,$(SOLVER_TEST_SANITIZER_UTIL_STEMS))
+STREAMING_ASAN_OBJS := $(SOLVER_TEST_VARIANT_BASE_OBJS) \
+	$(STREAMING_ASAN_ENGINE_OBJS) $(STREAMING_ASAN_UTIL_OBJS)
+
+ALLOCATION_FAILURE_ASAN_LIB := libastrometry-test-allocation-failure-asan.a
+ALLOCATION_FAILURE_ASAN_ENGINE_OBJS := \
+	$(addsuffix _test_allocation_failure_asan.o,$(SOLVER_TEST_SANITIZER_ENGINE_STEMS))
+ALLOCATION_FAILURE_ASAN_UTIL_OBJS := \
+	$(addsuffix _test_allocation_failure_asan.o,$(SOLVER_TEST_SANITIZER_UTIL_STEMS))
+ALLOCATION_FAILURE_ASAN_OBJS := $(SOLVER_TEST_VARIANT_BASE_OBJS) \
+	$(ALLOCATION_FAILURE_ASAN_ENGINE_OBJS) $(ALLOCATION_FAILURE_ASAN_UTIL_OBJS)
+
+SOLVER_TEST_TSAN_FLAGS := -O1 -fno-omit-frame-pointer -fsanitize=thread
+STREAMING_TSAN_LIB := libastrometry-test-streaming-tsan.a
+STREAMING_TSAN_ENGINE_OBJS := \
+	$(addsuffix _test_streaming_tsan.o,$(SOLVER_TEST_SANITIZER_ENGINE_STEMS))
+STREAMING_TSAN_UTIL_OBJS := \
+	$(addsuffix _test_streaming_tsan.o,$(SOLVER_TEST_SANITIZER_UTIL_STEMS))
+STREAMING_TSAN_OBJS := $(SOLVER_TEST_VARIANT_BASE_OBJS) \
+	$(STREAMING_TSAN_ENGINE_OBJS) $(STREAMING_TSAN_UTIL_OBJS)
+
+ALLOCATION_FAILURE_TSAN_LIB := libastrometry-test-allocation-failure-tsan.a
+ALLOCATION_FAILURE_TSAN_ENGINE_OBJS := \
+	$(addsuffix _test_allocation_failure_tsan.o,$(SOLVER_TEST_SANITIZER_ENGINE_STEMS))
+ALLOCATION_FAILURE_TSAN_UTIL_OBJS := \
+	$(addsuffix _test_allocation_failure_tsan.o,$(SOLVER_TEST_SANITIZER_UTIL_STEMS))
+ALLOCATION_FAILURE_TSAN_OBJS := $(SOLVER_TEST_VARIANT_BASE_OBJS) \
+	$(ALLOCATION_FAILURE_TSAN_ENGINE_OBJS) $(ALLOCATION_FAILURE_TSAN_UTIL_OBJS)
+
+$(STREAMING_TEST_LIB): $(STREAMING_TEST_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(STREAMING_TEST_OBJS)
+	$(RANLIB) $@
+
+$(ALLOCATION_FAILURE_TEST_LIB): $(ALLOCATION_FAILURE_TEST_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(ALLOCATION_FAILURE_TEST_OBJS)
+	$(RANLIB) $@
+
+$(GEOMETRY_FALLBACK_TEST_LIB): $(GEOMETRY_FALLBACK_TEST_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(GEOMETRY_FALLBACK_TEST_OBJS)
+	$(RANLIB) $@
+
+$(STREAMING_ASAN_LIB): $(STREAMING_ASAN_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(STREAMING_ASAN_OBJS)
+	$(RANLIB) $@
+
+$(ALLOCATION_FAILURE_ASAN_LIB): $(ALLOCATION_FAILURE_ASAN_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(ALLOCATION_FAILURE_ASAN_OBJS)
+	$(RANLIB) $@
+
+$(STREAMING_TSAN_LIB): $(STREAMING_TSAN_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(STREAMING_TSAN_OBJS)
+	$(RANLIB) $@
+
+$(ALLOCATION_FAILURE_TSAN_LIB): $(ALLOCATION_FAILURE_TSAN_OBJS)
+	-rm -f $@
+	$(AR) rc $@ $(ALLOCATION_FAILURE_TSAN_OBJS)
+	$(RANLIB) $@
+
+solver_hypothesis_test_streaming.o: solver_hypothesis.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-DSOLVER_AB_CANDIDATE_LIMIT_BYTES=512U -o $@ -c $<
+
+solver_codekd_delivery_test_allocation_failure.o: solver_codekd_delivery.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-DSOLVER_CODEKD_TEST_FORCE_PACKET_ALLOC_FAILURE=1 -o $@ -c $<
+
+solver_field_geometry_test_fallback.o: solver_field_geometry.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-DSOLVER_FIELD_GEOMETRY_BUDGET_BYTES=1ULL -o $@ -c $<
+
+solver_hypothesis_test_streaming_asan.o: SOLVER_TEST_VARIANT_DEFINES = \
+	-DSOLVER_AB_CANDIDATE_LIMIT_BYTES=512U
+$(STREAMING_ASAN_ENGINE_OBJS): %_test_streaming_asan.o: %.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) $(SOLVER_TEST_SANITIZER_FLAGS) \
+		$(SOLVER_TEST_VARIANT_DEFINES) -o $@ -c $<
+
+$(STREAMING_ASAN_UTIL_OBJS): %_test_streaming_asan.o: ../util/%.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) $(SOLVER_TEST_SANITIZER_FLAGS) \
+		-o $@ -c $<
+
+solver_codekd_delivery_test_allocation_failure_asan.o: SOLVER_TEST_VARIANT_DEFINES = \
+	-DSOLVER_CODEKD_TEST_FORCE_PACKET_ALLOC_FAILURE=1
+$(ALLOCATION_FAILURE_ASAN_ENGINE_OBJS): %_test_allocation_failure_asan.o: %.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) $(SOLVER_TEST_SANITIZER_FLAGS) \
+		$(SOLVER_TEST_VARIANT_DEFINES) -o $@ -c $<
+
+$(ALLOCATION_FAILURE_ASAN_UTIL_OBJS): %_test_allocation_failure_asan.o: ../util/%.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) $(SOLVER_TEST_SANITIZER_FLAGS) \
+		-o $@ -c $<
+
+solver_hypothesis_test_streaming_tsan.o: SOLVER_TEST_VARIANT_DEFINES = \
+	-DSOLVER_AB_CANDIDATE_LIMIT_BYTES=512U
+$(STREAMING_TSAN_ENGINE_OBJS): %_test_streaming_tsan.o: %.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) $(SOLVER_TEST_TSAN_FLAGS) \
+		$(SOLVER_TEST_VARIANT_DEFINES) -o $@ -c $<
+
+$(STREAMING_TSAN_UTIL_OBJS): %_test_streaming_tsan.o: ../util/%.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) $(SOLVER_TEST_TSAN_FLAGS) \
+		-o $@ -c $<
+
+solver_codekd_delivery_test_allocation_failure_tsan.o: SOLVER_TEST_VARIANT_DEFINES = \
+	-DSOLVER_CODEKD_TEST_FORCE_PACKET_ALLOC_FAILURE=1
+$(ALLOCATION_FAILURE_TSAN_ENGINE_OBJS): %_test_allocation_failure_tsan.o: %.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) $(SOLVER_TEST_TSAN_FLAGS) \
+		$(SOLVER_TEST_VARIANT_DEFINES) -o $@ -c $<
+
+$(ALLOCATION_FAILURE_TSAN_UTIL_OBJS): %_test_allocation_failure_tsan.o: ../util/%.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) $(SOLVER_TEST_TSAN_FLAGS) \
+		-o $@ -c $<
+
+test-engine-passes: test-engine-passes.o $(SLIB)
+test-verify-theta-tail: test-verify-theta-tail.o
+	$(CC) $(LDFLAGS) -o $@ $^
+test-index-shard-config: test-index-shard-config.o index_shard_config.o
+test-index-shard-staged: test-index-shard-staged.o \
+		index_shard_staged_test_support.o $(SLIB)
+test-solver-parallel-integration: test-solver-parallel-integration.o $(SLIB)
+test-solver-streaming-integration: test-solver-parallel-integration.o \
+		$(STREAMING_TEST_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+test-solver-streaming-asan: test_solver_parallel_integration_asan.o \
+		$(STREAMING_ASAN_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) $(SOLVER_TEST_SANITIZER_FLAGS) \
+		-Wl,-Map,$@.map -o $@ $^ $(LDLIBS)
+test-solver-streaming-tsan: test_solver_parallel_integration_tsan.o \
+		$(STREAMING_TSAN_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) $(SOLVER_TEST_TSAN_FLAGS) \
+		-Wl,-Map,$@.map -o $@ $^ $(LDLIBS)
+test-solver-allocation-failure: test-solver-parallel-integration.o \
+		$(ALLOCATION_FAILURE_TEST_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+test-solver-allocation-failure-asan: test_solver_parallel_integration_asan.o \
+		$(ALLOCATION_FAILURE_ASAN_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) $(SOLVER_TEST_SANITIZER_FLAGS) \
+		-Wl,-Map,$@.map -o $@ $^ $(LDLIBS)
+test-solver-allocation-failure-tsan: test_solver_parallel_integration_tsan.o \
+		$(ALLOCATION_FAILURE_TSAN_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) $(SOLVER_TEST_TSAN_FLAGS) \
+		-Wl,-Map,$@.map -o $@ $^ $(LDLIBS)
+test-solver-geometry-fallback: test-solver-parallel-integration.o \
+		$(GEOMETRY_FALLBACK_TEST_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+test_solver_parallel_integration_asan.o: test-solver-parallel-integration.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) $(SOLVER_TEST_SANITIZER_FLAGS) \
+		-o $@ -c $<
+
+test_solver_parallel_integration_tsan.o: test-solver-parallel-integration.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) $(SOLVER_TEST_TSAN_FLAGS) \
+		-o $@ -c $<
+
+test-engine-passes.o: test-engine-passes.c engine_internal.h
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -o $@ -c $<
+test-verify-theta-tail.o: test-verify-theta-tail.c verify_theta_tail.h
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -o $@ -c $<
+index_shard_staged_test_support.o: index_shard_staged_test_support.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-DTESTING_INDEX_SHARD_STAGED=1 -o $@ -c $<
+
+solver_test.o: solver.c $(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-DTESTING=1 -DTESTING_TRYALLCODES=1 -o $@ -c $<
+solver_test_2.o: solver.c $(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-DTESTING=1 -DTESTING_TRYPERMUTATIONS=1 -o $@ -c $<
+
+test-solver-geometry.o test-solver-regressions.o test-solver-codekd.o \
+		solver_codekd_test_support.o: %.o: %.c $(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -DTESTING=1 -o $@ -c $<
+
+SOLVER_TEST_VARIANT_OBJS := solver_hypothesis_test_streaming.o \
+	solver_codekd_delivery_test_allocation_failure.o \
+	solver_field_geometry_test_fallback.o \
+	$(STREAMING_ASAN_ENGINE_OBJS) $(STREAMING_ASAN_UTIL_OBJS) \
+	$(ALLOCATION_FAILURE_ASAN_ENGINE_OBJS) $(ALLOCATION_FAILURE_ASAN_UTIL_OBJS) \
+	$(STREAMING_TSAN_ENGINE_OBJS) $(STREAMING_TSAN_UTIL_OBJS) \
+	$(ALLOCATION_FAILURE_TSAN_ENGINE_OBJS) $(ALLOCATION_FAILURE_TSAN_UTIL_OBJS)
+
+NODEP_OBJS += solver_test.o solver_test_2.o $(SOLVER_TEST_VARIANT_OBJS) \
+	test_solver_parallel_integration_asan.o test_solver_parallel_integration_tsan.o \
+	index_shard_staged_test_support.o test-verify-theta-tail.o
+ALL_OBJ += test-solver.o test-solver-2.o test-solver-geometry.o \
+	test-solver-regressions.o test-solver-codekd.o \
+	solver_codekd_test_support.o test-engine-passes.o \
+	test-index-shard-config.o test-index-shard-staged.o \
+	test-solver-parallel-integration.o test-verify-theta-tail.o
+ALL_EXECS += test-index-shard-config test-solver-parallel-integration \
+	test-index-shard-staged test-engine-passes \
+	test-verify-theta-tail test-solver-streaming-integration \
+	test-solver-streaming-asan test-solver-streaming-tsan \
+	test-solver-allocation-failure test-solver-allocation-failure-asan \
+	test-solver-allocation-failure-tsan test-solver-geometry-fallback
+GENERATED_FILES += $(STREAMING_TEST_LIB) $(STREAMING_ASAN_LIB) \
+	$(STREAMING_TSAN_LIB) $(ALLOCATION_FAILURE_TEST_LIB) \
+	$(ALLOCATION_FAILURE_ASAN_LIB) $(ALLOCATION_FAILURE_TSAN_LIB) \
+	$(GEOMETRY_FALLBACK_TEST_LIB) test-solver-streaming-asan.map \
+	test-solver-streaming-tsan.map test-solver-allocation-failure-asan.map \
+	test-solver-allocation-failure-tsan.map

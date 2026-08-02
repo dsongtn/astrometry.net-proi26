@@ -13,6 +13,7 @@ libkd_srcs = [
     'kdtree_fits_io.c',
     'kdint_ddd.c',
     'kdint_fff.c',
+    'kdint_lll.c',
     'kdint_ddu.c',
     'kdint_duu.c',
     'kdint_dds.c',
@@ -20,7 +21,21 @@ libkd_srcs = [
     ]
 util_srcs = [
     'ioutils.c', 'bl.c', 'mathutil.c', 'fitsioutils.c', 'fitsbin.c',
+    'fitsbin_mmap.c', 'fitsbin_payload_source.c',
+    'fitsbin_payload_plan.c', 'fitsbin_payload_service.c',
     'an-endian.c', 'fitsfile.c', 'log.c', 'errors.c', 'tic.c',
+    ]
+fitsbin_deps = [
+    'fitsbin_internal.h',
+    ]
+fitsbin_public_deps = [
+    os.path.join('include', 'astrometry', 'fitsbin.h'),
+    ]
+libkd_deps = [
+    'kdtree_internal.c',
+    'kdtree_internal_fits.c',
+    'kdtree_internal_common.h',
+    'kdtree_prefetch_internal.h',
     ]
 
 qfits_srcs = [
@@ -38,6 +53,16 @@ srcs = ([os.path.join('libkd',x) for x in libkd_srcs] +
 ext = Extension('astrometry.libkd.spherematch_c',
                 sources = srcs,
                 include_dirs = [numpy_inc] + inc,
+                define_macros = [
+                    ('_GNU_SOURCE', None),
+                    ('_LARGEFILE_SOURCE', None),
+                    ('_FILE_OFFSET_BITS', '64'),
+                    ],
+                depends = (
+                    [os.path.join('util', x) for x in fitsbin_deps] +
+                    fitsbin_public_deps +
+                    [os.path.join('libkd', x) for x in libkd_deps]
+                    ),
                 )
 
 setup(name='libkd',
@@ -55,4 +80,3 @@ setup(name='libkd',
       package_dir={'astrometry':''},
       data_files=[('tests', ['libkd/test_spherematch.py']),],
     )
-

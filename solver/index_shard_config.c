@@ -129,27 +129,60 @@ int index_shard_config_effective_workers(int configured_workers,
   return workers;
 }
 
+int index_shard_config_exact_demand_pass(
+    int detached_completion,
+    int payload_io_width,
+    int mapped_population_supported,
+    int random_mmap_advice,
+    size_t filename_indexes,
+    size_t loaded_indexes,
+    int full_cohort_resident) {
+  if ((detached_completion != 0 && detached_completion != 1) ||
+      (mapped_population_supported != 0 &&
+       mapped_population_supported != 1) ||
+      (random_mmap_advice != 0 && random_mmap_advice != 1) ||
+      (full_cohort_resident != 0 && full_cohort_resident != 1)) {
+    return 0;
+  }
+  return detached_completion &&
+      payload_io_width > 0 &&
+      mapped_population_supported &&
+      random_mmap_advice &&
+      filename_indexes > 0U &&
+      loaded_indexes == 0U &&
+      !full_cohort_resident;
+}
+
 int index_shard_config_plan_widths(
     int worker_count,
     int payload_io_width,
     int detached_completion,
+    int exact_demand,
     index_shard_width_plan_t *plan) {
   size_t workers;
   size_t producers;
   size_t helpers;
 
-  if (!plan || worker_count < 1 || payload_io_width < 0) {
+  if (!plan || worker_count < 1 || payload_io_width < 0 ||
+      (detached_completion != 0 && detached_completion != 1) ||
+      (detached_completion && payload_io_width < 1) ||
+      (exact_demand != 0 && exact_demand != 1) ||
+      (exact_demand &&
+       (!detached_completion || payload_io_width < 1))) {
     return -1;
   }
   workers = (size_t)worker_count;
   if (detached_completion) {
-    size_t io_width = payload_io_width > 0
-        ? (size_t)payload_io_width : 1U;
-    size_t delivery_window = io_width > SIZE_MAX / 2U
-        ? SIZE_MAX : io_width * 2U;
-
-    producers = workers < delivery_window
-        ? workers : delivery_window;
+    /*
+     * A cold exact-demand owner can publish several page tickets. Limit
+     * simultaneous cold mappings to the live delivery width and leave the
+     * remaining compute workers eligible for already-published staged work.
+     * Resident and loaded-index passes retain the full outer width.
+     */
+    producers = exact_demand &&
+        (size_t)payload_io_width < workers
+        ? (size_t)payload_io_width
+        : workers;
     helpers = workers - producers;
   } else {
     helpers = workers > 1U ? 1U : 0U;

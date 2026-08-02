@@ -15,6 +15,8 @@ QFITS_LIB_FILE := libqfits.a
 all: $(QFITS_LIB_FILE)
 .PHONY: all
 
+TESTS := test_anqfits_header
+
 BASEDIR := ..
 COMMON := $(BASEDIR)/util
 
@@ -38,6 +40,19 @@ $(QFITS_LIB_FILE): $(OBJS)
 	$(AR) rc $@ $^
 	$(RANLIB) $@
 
+test_anqfits_header: test_anqfits_header.o $(QFITS_LIB_FILE) $(ANBASE_SLIB)
+	$(CC) -o $@ $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS)
+
+$(ANBASE_SLIB):
+	$(MAKE) -C $(ANBASE_DIR) libanbase.a
+
+tests: $(TESTS)
+.PHONY: tests
+
+check: tests
+	./test_anqfits_header
+.PHONY: check
+
 install: $(QFITS_LIB_FILE) $(HEADERS)
 	@echo Installing in base directory '$(INSTALL_DIR)'
 	mkdir -p '$(INCLUDE_INSTALL_DIR)'
@@ -52,13 +67,13 @@ install: $(QFITS_LIB_FILE) $(HEADERS)
 	done
 .PHONY: install
 
-DEP_OBJ := $(OBJS)
+DEP_OBJ := $(OBJS) test_anqfits_header.o
 
 ifneq ($(MAKECMDGOALS),clean)
 include $(COMMON)/makefile.deps
 endif
 
 clean:
-	rm -f $(QFITS_LIB_FILE) $(OBJS) *.dep *~ deps
+	rm -f $(QFITS_LIB_FILE) $(OBJS) $(TESTS) test_anqfits_header.o \
+		*.dep *~ deps
 .PHONY: clean
-

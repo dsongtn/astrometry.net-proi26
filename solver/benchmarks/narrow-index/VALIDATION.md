@@ -24,14 +24,14 @@ After the clean build, run both bundled gates and provide the mandatory
 genuinely permuted StarKD fixture to each:
 
 ```sh
-solver/check-ab-block-integration.sh \
+solver/check-solver-parallel-integration.sh \
   demo/apod4.xyls \
   solver/index-9918.fits \
   demo/index-4119.fits \
   /absolute/path/to/permuted-sweep.fits
 
-AB_VALIDATION_OUTPUT_DIR=/absolute/path/to/empty-sanitizer-results \
-solver/check-ab-sanitizer-integration.sh \
+SOLVER_TEST_OUTPUT_DIR=/absolute/path/to/empty-sanitizer-results \
+solver/check-solver-parallel-sanitizers.sh \
   demo/apod4.xyls \
   solver/index-9918.fits \
   demo/index-4119.fits \

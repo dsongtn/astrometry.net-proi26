@@ -52,13 +52,14 @@ ANUTILS_DEPS :=
 
 ifndef NO_QFITS
 ANFILES_OBJ += multiindex.o index.o index_residency.o indexset.o \
-	codekd.o starkd.o rdlist.o xylist.o \
+	codekd.o starkd.o starkd_payload.o rdlist.o xylist.o \
 	starxy.o qidxfile.o quadfile.o scamp.o scamp-catalog.o \
 	tabsort.o wcs-xy2rd.o wcs-rd2xy.o matchfile.o
 ANFILES_DEPS += $(QFITS_LIB)
 
-ANUTILS_OBJ += fitsioutils.o sip_qfits.o fitstable.o fitsbin.o fitsfile.o \
-	tic.o
+ANUTILS_OBJ += fitsioutils.o sip_qfits.o fitstable.o fitsbin.o \
+	fitsbin_mmap.o fitsbin_payload_source.o fitsbin_payload_plan.o \
+	fitsbin_payload_service.o fitsfile.o tic.o
 ANUTILS_DEPS += $(QFITS_LIB)
 endif
 
@@ -171,11 +172,11 @@ an-pnmtofits: an-pnmtofits.o $(ANUTILS_SLIB)
 	$(CC) -o $@ $(LDFLAGS) $^ $(NETPBM_LIB) $(LDLIBS)
 ALL_OBJ += an-pnmtofits.o
 
-_util$(PYTHON_SO_EXT): util.i lanczos.i $(ANFILES_SLIB)
+_util$(PYTHON_SO_EXT): util.i lanczos.i setup.py $(ANFILES_SLIB)
 	LDFLAGS="$(LDFLAGS)" LDLIBS="$(LDLIBS)" SLIB="$(ANFILES_SLIB)" \
 	INC="$(ANFILES_INC)" CFLAGS="$(CFLAGS)" \
 	$(PYTHON) setup.py build_ext -v --inplace --build-temp .
-util.py: util.i lanczos.i
+util.py: util.i lanczos.i setup.py
 	LDFLAGS="$(LDFLAGS)" LDLIBS="$(LDLIBS)" SLIB="$(ANFILES_SLIB)" \
 	INC="$(ANFILES_INC)" CFLAGS="$(CFLAGS)" \
 	$(PYTHON) setup.py build_ext -v --inplace --build-temp .
@@ -358,18 +359,23 @@ ALL_TEST_FILES = test_bl test_bt test_endian test_fitstable test_xylist \
 
 # test_quadfile -- takes a long time!
 
-ALL_TEST_EXTRA_OBJS =
+FITSBIN_PAYLOAD_TEST_OBJS := test_fitsbin_payload_common.o \
+	test_fitsbin_payload_sync.o test_fitsbin_payload_async.o \
+	test_fitsbin_payload_mapped.o test_fitsbin_payload_ticket.o
+ALL_TEST_EXTRA_OBJS = $(FITSBIN_PAYLOAD_TEST_OBJS)
+ALL_OBJ += $(FITSBIN_PAYLOAD_TEST_OBJS)
 ALL_TEST_LIBS = $(ANFILES_SLIB)
-ALL_TEST_EXTRA_LDFLAGS = -Wl,--wrap=pread64
+ALL_TEST_EXTRA_LDFLAGS = -Wl,--wrap=pread64 -Wl,--wrap=readahead
 
 include $(COMMON)/makefile.tests
 
 test_fitsbin_payload_io: test_fitsbin_payload_io-main.o \
-	test_fitsbin_payload_io.o $(COMMON)/cutest.o $(ALL_TEST_LIBS)
+	test_fitsbin_payload_io.o $(FITSBIN_PAYLOAD_TEST_OBJS) \
+	$(COMMON)/cutest.o $(ALL_TEST_LIBS)
 	$(CC) -o $@ $(CFLAGS) $(LDFLAGS) \
-		-Wl,--wrap=pread64 $^ $(LDLIBS)
+		-Wl,--wrap=pread64 -Wl,--wrap=readahead $^ $(LDLIBS)
 
-DEP_OBJ += $(ALL_TEST_FILES_O)
+DEP_OBJ += $(ALL_TEST_FILES_O) $(FITSBIN_PAYLOAD_TEST_OBJS)
 
 tests: $(ALL_TEST_FILES)
 .PHONY: tests

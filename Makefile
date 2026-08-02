@@ -299,6 +299,9 @@ LIBKD_RELEASE_SUBDIRS := qfits-an libkd doc \
 	CREDITS LICENSE __init__.py setup-libkd.py Makefile \
 	util/ioutils.c util/mathutil.c util/fitsioutils.c \
 	util/fitsbin.c util/an-endian.c util/fitsfile.c util/log.c util/errors.c \
+	util/fitsbin_mmap.c util/fitsbin_payload_source.c \
+	util/fitsbin_payload_plan.c util/fitsbin_payload_service.c \
+	util/fitsbin_internal.h \
 	util/tic.c util/bl.c util/bl-nl.c \
 	util/__init__.py util/starutil_numpy.py util/makefile.common \
 	util/makefile.anbase util/makefile.deps \
@@ -431,4 +434,3 @@ report.txt: Makefile
 
 
 .SUFFIXES:            # Delete the default suffixes
-

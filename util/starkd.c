@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "starkd.h"
+#include "starkd_internal.h"
 #include "kdtree.h"
 #include "kdtree_fits_io.h"
 #include "starutil.h"
@@ -415,7 +416,7 @@ anbool startree_has_tagalong(startree_t* s) {
     return (startree_get_tagalong(s) != NULL);
 }
 
-static int Ndata(const startree_t* s) {
+int startree_data_count_internal(const startree_t* s) {
     return s->tree->ndata;
 }
 
@@ -423,8 +424,8 @@ int startree_check_inverse_perm(startree_t* s) {
     // ensure that each value appears exactly once.
     int i, N;
     uint8_t* counts;
-    N = Ndata(s);
-    counts = calloc(Ndata(s), sizeof(uint8_t));
+    N = startree_data_count_internal(s);
+    counts = calloc(startree_data_count_internal(s), sizeof(uint8_t));
     for (i=0; i<N; i++) {
         assert(s->inverse_perm[i] >= 0);
         assert(s->inverse_perm[i] < N);
@@ -450,20 +451,20 @@ void startree_compute_inverse_perm(startree_t* s) {
     if (!s || s->inverse_perm) {
         return;
     }
-    if (!s->tree || Ndata(s) <= 0) {
+    if (!s->tree || startree_data_count_internal(s) <= 0) {
         return;
     }
-    if ((size_t)Ndata(s) >
+    if ((size_t)startree_data_count_internal(s) >
             SIZE_MAX / sizeof(*s->tree->perm) ||
-        (size_t)Ndata(s) >
+        (size_t)startree_data_count_internal(s) >
             SIZE_MAX / sizeof(*inverse_perm)) {
         fprintf(stderr, "Star kdtree inverse permutation is too large.\n");
         return;
     }
     permutation_bytes =
-        (size_t)Ndata(s) * sizeof(*s->tree->perm);
+        (size_t)startree_data_count_internal(s) * sizeof(*s->tree->perm);
     inverse_bytes =
-        (size_t)Ndata(s) * sizeof(*inverse_perm);
+        (size_t)startree_data_count_internal(s) * sizeof(*inverse_perm);
 
     if (s->inverse_prepare_callback) {
         callback_prepared = TRUE;
@@ -507,7 +508,7 @@ void startree_compute_inverse_perm(startree_t* s) {
 #ifndef NDEBUG
     {
         int i;
-        for (i=0; i<Ndata(s); i++)
+        for (i=0; i<startree_data_count_internal(s); i++)
             inverse_perm[i] = -1;
     }
 #endif
@@ -515,7 +516,7 @@ void startree_compute_inverse_perm(startree_t* s) {
 #ifndef NDEBUG
     {
         int i;
-        for (i=0; i<Ndata(s); i++)
+        for (i=0; i<startree_data_count_internal(s); i++)
             assert(inverse_perm[i] != -1);
     }
 #endif
@@ -577,7 +578,7 @@ int startree_borrow_inverse_perm(startree_t* s,
                                  int* inverse_perm,
                                  int count) {
     if (!s || !s->tree || !inverse_perm ||
-        count != Ndata(s) || s->inverse_perm) {
+        count != startree_data_count_internal(s) || s->inverse_perm) {
         return -1;
     }
     s->inverse_perm = inverse_perm;
@@ -671,12 +672,12 @@ void startree_set_jitter(startree_t* s, double jitter_arcsec) {
 }
 
 int startree_get_sweep(const startree_t* s, int ind) {
-    if (ind < 0 || ind >= Ndata(s) || !s->sweep)
+    if (ind < 0 || ind >= startree_data_count_internal(s) || !s->sweep)
         return -1;
     return s->sweep[ind];
 }
 
-static int startree_data_index(startree_t* s, int starid) {
+int startree_data_index_internal(startree_t* s, int starid) {
     if (s->tree->perm && !s->inverse_perm) {
         startree_compute_inverse_perm(s);
         if (!s->inverse_perm) {
@@ -684,9 +685,9 @@ static int startree_data_index(startree_t* s, int starid) {
         }
     }
 
-    if (starid < 0 || starid >= Ndata(s)) {
+    if (starid < 0 || starid >= startree_data_count_internal(s)) {
         fprintf(stderr, "Invalid star ID %i; expected [0, %i).\n",
-                starid, Ndata(s));
+                starid, startree_data_count_internal(s));
         assert(0);
         return -1;
     }
@@ -698,347 +699,8 @@ static int startree_data_index(startree_t* s, int starid) {
     return starid;
 }
 
-int startree_prepare_stars(startree_t* s,
-                            const unsigned int* starids,
-                            int nstars) {
-    fitsbin_prefetch_range_t ranges[160];
-    fitsbin_t* fb;
-    size_t row_size;
-    size_t byte_budget;
-    size_t per_range_budget;
-    long detected_page_size;
-    int i;
-
-    if (!s || !s->tree || !starids || nstars <= 0 ||
-        !s->tree->io || !s->tree->io_is_fitsbin ||
-        !s->tree->data.any || Ndata(s) <= 0) {
-        return 0;
-    }
-    if ((size_t)nstars > sizeof(ranges) / sizeof(ranges[0])) {
-        errno = E2BIG;
-        return -1;
-    }
-    detected_page_size = sysconf(_SC_PAGESIZE);
-    if (detected_page_size <= 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    fb = s->tree->io;
-    row_size = kdtree_sizeof_data(s->tree) / (size_t)Ndata(s);
-    if (!row_size || (size_t)detected_page_size >
-        (SIZE_MAX - row_size) / 2U) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    per_range_budget = row_size +
-        2U * (size_t)detected_page_size;
-    if ((size_t)nstars > SIZE_MAX / per_range_budget) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    byte_budget = (size_t)nstars * per_range_budget;
-
-    for (i = 0; i < nstars; i++) {
-        int data_index;
-
-        if (starids[i] >= (unsigned int)Ndata(s)) {
-            errno = EINVAL;
-            return -1;
-        }
-        data_index = startree_data_index(s, (int)starids[i]);
-        if (data_index < 0) {
-            return -1;
-        }
-        ranges[i].data = kdtree_get_data(s->tree, data_index);
-        ranges[i].size = row_size;
-    }
-    return fitsbin_prefetch_ranges(
-        fb,
-        ranges,
-        (size_t)nstars,
-        byte_budget);
-}
-
-int startree_prefetch_stars(startree_t* s,
-                            const unsigned int* starids,
-                            int nstars) {
-    int status = startree_prepare_stars(
-        s, starids, nstars);
-
-    return status < 0 ? -1 : 0;
-}
-
-int startree_prefetch_stars_submit(
-    startree_t* s,
-    const unsigned int* starids,
-    int nstars,
-    fitsbin_payload_io_ticket_t** ticket) {
-    fitsbin_prefetch_range_t ranges[160];
-    fitsbin_t* fb;
-    size_t row_size;
-    size_t byte_budget;
-    size_t per_range_budget;
-    long detected_page_size;
-    int i;
-
-    if (!ticket) {
-        errno = EINVAL;
-        return -1;
-    }
-    *ticket = NULL;
-    if (!s || !s->tree || !starids || nstars <= 0 ||
-        !s->tree->io || !s->tree->io_is_fitsbin ||
-        !s->tree->data.any || Ndata(s) <= 0) {
-        return 0;
-    }
-    if ((size_t)nstars > sizeof(ranges) / sizeof(ranges[0])) {
-        errno = E2BIG;
-        return -1;
-    }
-    detected_page_size = sysconf(_SC_PAGESIZE);
-    if (detected_page_size <= 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    row_size = kdtree_sizeof_data(s->tree) / (size_t)Ndata(s);
-    if (!row_size || (size_t)detected_page_size >
-        (SIZE_MAX - row_size) / 2U) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    per_range_budget = row_size +
-        2U * (size_t)detected_page_size;
-    if ((size_t)nstars > SIZE_MAX / per_range_budget) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    byte_budget = (size_t)nstars * per_range_budget;
-    fb = s->tree->io;
-
-    for (i = 0; i < nstars; i++) {
-        int data_index;
-
-        if (starids[i] >= (unsigned int)Ndata(s)) {
-            errno = EINVAL;
-            return -1;
-        }
-        data_index = startree_data_index(s, (int)starids[i]);
-        if (data_index < 0) {
-            return -1;
-        }
-        ranges[i].data = kdtree_get_data(s->tree, data_index);
-        ranges[i].size = row_size;
-    }
-    return fitsbin_prefetch_ranges_submit(
-        fb,
-        ranges,
-        (size_t)nstars,
-        byte_budget,
-        ticket);
-}
-
-int startree_prefetch_stars_ready_submit(
-    const startree_t* s,
-    const unsigned int* starids,
-    int nstars,
-    fitsbin_payload_io_ticket_t** ticket) {
-    fitsbin_prefetch_range_t
-        ranges[FITSBIN_MMAP_PREFETCH_RANGE_LIMIT];
-    fitsbin_t* fb;
-    size_t row_size;
-    size_t byte_budget;
-    size_t per_range_budget;
-    long detected_page_size;
-    int ndata;
-    int i;
-
-    if (!ticket) {
-        errno = EINVAL;
-        return -1;
-    }
-    *ticket = NULL;
-    if (!s || !s->tree || !starids || nstars <= 0 ||
-        !s->tree->io || !s->tree->io_is_fitsbin ||
-        !s->tree->data.any) {
-        return 0;
-    }
-    ndata = Ndata(s);
-    if (ndata <= 0) {
-        return 0;
-    }
-    if ((size_t)nstars > sizeof(ranges) / sizeof(ranges[0])) {
-        errno = E2BIG;
-        return -1;
-    }
-    if (s->tree->perm && !s->inverse_perm) {
-        errno = EAGAIN;
-        return 0;
-    }
-    detected_page_size = sysconf(_SC_PAGESIZE);
-    if (detected_page_size <= 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    row_size = kdtree_sizeof_data(s->tree) / (size_t)ndata;
-    if (!row_size || (size_t)detected_page_size >
-        (SIZE_MAX - row_size) / 2U) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    per_range_budget = row_size +
-        2U * (size_t)detected_page_size;
-    if ((size_t)nstars > SIZE_MAX / per_range_budget) {
-        errno = EOVERFLOW;
-        return -1;
-    }
-    byte_budget = (size_t)nstars * per_range_budget;
-    fb = s->tree->io;
-
-    for (i = 0; i < nstars; i++) {
-        unsigned int starid = starids[i];
-        int data_index;
-
-        if (starid >= (unsigned int)ndata) {
-            errno = EINVAL;
-            return -1;
-        }
-        data_index = s->inverse_perm
-            ? s->inverse_perm[starid]
-            : (int)starid;
-        if (data_index < 0 || data_index >= ndata) {
-            errno = EINVAL;
-            return -1;
-        }
-        ranges[i].data = kdtree_get_data(s->tree, data_index);
-        ranges[i].size = row_size;
-    }
-    return fitsbin_prefetch_ranges_submit(
-        fb,
-        ranges,
-        (size_t)nstars,
-        byte_budget,
-        ticket);
-}
-
-int startree_get_ready(
-    const startree_t* s,
-    int starid,
-    double* posn) {
-    int data_index;
-    int ndata;
-
-    if (!s || !s->tree || !posn) {
-        errno = EINVAL;
-        return -1;
-    }
-    ndata = Ndata(s);
-    if (starid < 0 || starid >= ndata) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (s->tree->perm && !s->inverse_perm) {
-        errno = EAGAIN;
-        return -1;
-    }
-    data_index = s->inverse_perm
-        ? s->inverse_perm[starid]
-        : starid;
-    if (data_index < 0 || data_index >= ndata) {
-        errno = EINVAL;
-        return -1;
-    }
-    kdtree_copy_data_double(s->tree, data_index, 1, posn);
-    return 0;
-}
-
-#define STARTREE_MAPPED_ADVICE_RANGE_LIMIT 256U
-
-int startree_advise_rows(startree_t* s,
-                         const unsigned int* starids,
-                         int nstars) {
-    fitsbin_prefetch_range_t
-        ranges[STARTREE_MAPPED_ADVICE_RANGE_LIMIT];
-    fitsbin_t* fb;
-    size_t accepted;
-    size_t byte_budget;
-    size_t per_range_budget;
-    size_t row_size;
-    long detected_page_size;
-    int advised;
-    int ndata;
-    size_t i;
-
-    if (!s || !s->tree || !starids || nstars <= 0 ||
-        !s->tree->io || !s->tree->io_is_fitsbin ||
-        !s->tree->data.any) {
-        return 0;
-    }
-    ndata = Ndata(s);
-    if (ndata <= 0) {
-        return 0;
-    }
-
-    /*
-     * Advice must not turn into a compulsory full PERM sweep. The normal
-     * data lookup remains responsible for constructing the inverse mapping
-     * when it is genuinely needed.
-     */
-    if (s->tree->perm && !s->inverse_perm) {
-        return 0;
-    }
-    row_size =
-        kdtree_sizeof_data(s->tree) / (size_t)ndata;
-    if (!row_size) {
-        return 0;
-    }
-    accepted = MIN(
-        (size_t)nstars,
-        (size_t)STARTREE_MAPPED_ADVICE_RANGE_LIMIT);
-    detected_page_size = sysconf(_SC_PAGESIZE);
-    if (detected_page_size <= 0 ||
-        (size_t)detected_page_size >
-            (SIZE_MAX - row_size) / 2U) {
-        return 0;
-    }
-    per_range_budget = row_size +
-        2U * (size_t)detected_page_size;
-    if (accepted > SIZE_MAX / per_range_budget) {
-        return 0;
-    }
-    byte_budget = accepted * per_range_budget;
-    fb = s->tree->io;
-
-    /*
-     * Populate only a fixed canonical lookahead. Later rows retain the base
-     * mapping policy and are consumed by the original loop on demand.
-     */
-    for (i = 0U; i < accepted; i++) {
-        unsigned int starid = starids[i];
-        int data_index;
-
-        if (starid >= (unsigned int)ndata) {
-            return -1;
-        }
-        data_index = s->inverse_perm
-            ? s->inverse_perm[starid]
-            : (int)starid;
-        if (data_index < 0 || data_index >= ndata) {
-            return -1;
-        }
-        ranges[i].data =
-            kdtree_get_data(s->tree, data_index);
-        ranges[i].size = row_size;
-    }
-    advised = fitsbin_advise_mapped_ranges(
-        fb,
-        ranges,
-        accepted,
-        byte_budget);
-    return advised;
-}
-
 int startree_get(startree_t* s, int starid, double* posn) {
-    int data_index = startree_data_index(s, starid);
+    int data_index = startree_data_index_internal(s, starid);
 
     if (data_index < 0) {
         return -1;

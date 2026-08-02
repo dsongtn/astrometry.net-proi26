@@ -9,7 +9,7 @@
 #include "verify.h"
 
 /*
- * real_verify_star_lists() stops immediately after the star that
+ * verify_internal_star_lists() stops immediately after the star that
  * crosses a bailout or stop-looking threshold. The remaining theta
  * entries have never been written and must receive their semantic
  * sentinel before any full-array validation or permutation pass

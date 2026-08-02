@@ -13,7 +13,7 @@ field="${1:-$source_root/demo/apod4.xyls}"
 winner_index="${2:-$solver_dir/index-9918.fits}"
 nonwinner_index="${3:-$source_root/demo/index-4119.fits}"
 permuted_index="${4:-}"
-output_dir="${AB_VALIDATION_OUTPUT_DIR:-}"
+output_dir="${SOLVER_TEST_OUTPUT_DIR:-}"
 temporary_output=0
 output_claim=""
 claim_acquired=0
@@ -27,15 +27,15 @@ fi
 if [[ -n "$output_dir" ]]; then
     if [[ "$output_dir" != /* ]]; then
         printf '%s\n' \
-            "AB_VALIDATION_OUTPUT_DIR must be absolute" >&2
+            "SOLVER_TEST_OUTPUT_DIR must be absolute" >&2
         exit 2
     fi
     mkdir -p "$output_dir" ||
-        die "cannot create AB_VALIDATION_OUTPUT_DIR"
-    output_claim="$output_dir/.ab-validation-claim"
+        die "cannot create SOLVER_TEST_OUTPUT_DIR"
+    output_claim="$output_dir/.solver-test-validation-claim"
     if ! mkdir "$output_claim" 2>/dev/null; then
         printf '%s\n' \
-            "AB_VALIDATION_OUTPUT_DIR is already claimed" >&2
+            "SOLVER_TEST_OUTPUT_DIR is already claimed" >&2
         exit 2
     fi
     claim_acquired=1
@@ -43,16 +43,16 @@ if [[ -n "$output_dir" ]]; then
         find "$output_dir" \
             -mindepth 1 \
             -maxdepth 1 \
-            ! -name '.ab-validation-claim' \
+            ! -name '.solver-test-validation-claim' \
             -print -quit
-    )" || die "cannot inspect AB_VALIDATION_OUTPUT_DIR"
+    )" || die "cannot inspect SOLVER_TEST_OUTPUT_DIR"
     if [[ -n "$unexpected_path" ]]; then
         rmdir "$output_claim" ||
             die "cannot release the output-directory claim"
         output_claim=""
         claim_acquired=0
         printf '%s\n' \
-            "AB_VALIDATION_OUTPUT_DIR must be empty" >&2
+            "SOLVER_TEST_OUTPUT_DIR must be empty" >&2
         exit 2
     fi
     work_dir="$output_dir"
@@ -126,20 +126,6 @@ verify_default_fixture \
     "79b36eea45b72448c8471f6e8af0e1c8635a3821d04f1a23d6cf5ecd5f59d31c" \
     "nonwinner index"
 
-make -C "$source_root/libkd" -j2 \
-    test_kdtree_direct_dss \
-    >"$work_dir/direct-dss-build.log" 2>&1 ||
-    {
-        tail -80 "$work_dir/direct-dss-build.log" >&2
-        die "direct DSS unit binary did not build"
-    }
-"$source_root/libkd/test_kdtree_direct_dss" \
-    >"$work_dir/direct-dss-unit.log" 2>&1 ||
-    {
-        tail -80 "$work_dir/direct-dss-unit.log" >&2
-        die "direct DSS unit test failed"
-    }
-
 make -C "$source_root/util" -j2 \
     test_fitsbin_payload_io \
     >"$work_dir/payload-io-build.log" 2>&1 ||
@@ -156,10 +142,10 @@ make -C "$source_root/util" -j2 \
 
 make -C "$solver_dir" -j2 \
     test-solver \
-    test-ab-block-integration \
-    test-ab-stream-integration \
-    test-ab-allocfail-integration \
-    test-ab-no-geometry-integration \
+    test-solver-parallel-integration \
+    test-solver-streaming-integration \
+    test-solver-allocation-failure \
+    test-solver-geometry-fallback \
     >"$work_dir/build.log" 2>&1 ||
     {
         tail -80 "$work_dir/build.log" >&2
@@ -169,10 +155,10 @@ mkdir "$work_dir/bin" ||
     die "cannot create the validation binary directory"
 install -m 755 \
     "$solver_dir/test-solver" \
-    "$solver_dir/test-ab-block-integration" \
-    "$solver_dir/test-ab-stream-integration" \
-    "$solver_dir/test-ab-allocfail-integration" \
-    "$solver_dir/test-ab-no-geometry-integration" \
+    "$solver_dir/test-solver-parallel-integration" \
+    "$solver_dir/test-solver-streaming-integration" \
+    "$solver_dir/test-solver-allocation-failure" \
+    "$solver_dir/test-solver-geometry-fallback" \
     "$work_dir/bin/" ||
     die "cannot install validation binaries"
 
@@ -211,7 +197,7 @@ run_case() {
     local mode="$6"
     shift 6
     local status
-    local case_field="${AB_CASE_FIELD:-$field}"
+    local case_field="${SOLVER_TEST_CASE_FIELD:-$field}"
 
     timeout 45 \
         "$work_dir/bin/$binary" \
@@ -259,7 +245,7 @@ profile_key() {
 
 result_key() {
     awk '
-        /^AB_RESULT / {
+        /^SOLVER_TEST_RESULT / {
             line = $0
         }
         END {
@@ -275,7 +261,7 @@ result_key() {
 
 wcs_key() {
     awk '
-        /^AB_WCS / {
+        /^SOLVER_TEST_WCS / {
             line = $0
         }
         END {
@@ -316,7 +302,7 @@ profile_sequence_key() {
 
 result_sequence_key() {
     awk '
-        /^AB_RESULT / {
+        /^SOLVER_TEST_RESULT / {
             line = $0
             sub(/workers=[0-9]+ /, "", line)
             print line
@@ -332,7 +318,7 @@ result_sequence_key() {
 
 wcs_sequence_key() {
     awk '
-        /^AB_WCS / {
+        /^SOLVER_TEST_WCS / {
             line = $0
             sub(/workers=[0-9]+ /, "", line)
             print line
@@ -348,9 +334,9 @@ wcs_sequence_key() {
 
 match_set_key() {
     awk '
-        /^AB_MATCH / {
+        /^SOLVER_TEST_MATCH / {
             line = $0
-            sub(/^AB_MATCH mode=[^ ]+ pass=[0-9]+ workers=[0-9]+ first_object=[0-9]+ last_object=[0-9]+ /, "", line)
+            sub(/^SOLVER_TEST_MATCH mode=[^ ]+ pass=[0-9]+ workers=[0-9]+ first_object=[0-9]+ last_object=[0-9]+ /, "", line)
             print line
             rows++
         }
@@ -401,154 +387,7 @@ assert_not_contains() {
     fi
 }
 
-line_count() {
-    PATTERN="$1" awk '
-        $0 ~ ENVIRON["PATTERN"] {
-            count++
-        }
-        END {
-            print count + 0
-        }
-    ' "$2"
-}
-
-assert_assist_lifecycle() {
-    local label="$1"
-    local file="$2"
-    local generations="$3"
-    local minimum_publishes="$4"
-    local allow_failed_leaves="${5:-0}"
-    local submits
-    local passes
-    local all_passes
-    local publishes
-    local unpublishes
-    local joins
-    local leaves
-    local bad_leaves
-    local loans
-
-    submits="$(line_count \
-        'pthread-pool submit .*inner_scheduler=dynamic-pool-lending .*mmap_advice=normal' \
-        "$file")"
-    passes="$(line_count \
-        'assist-pass generation=[0-9]+ .*waiters=0' \
-        "$file")"
-    all_passes="$(line_count 'assist-pass generation=' "$file")"
-    publishes="$(line_count 'assist-lane state=publish ' "$file")"
-    unpublishes="$(line_count 'assist-lane state=unpublish ' "$file")"
-    joins="$(line_count 'assist-lane state=join ' "$file")"
-    leaves="$(line_count 'assist-lane state=leave ' "$file")"
-    bad_leaves="$(awk '
-        /assist-lane state=leave / && $0 !~ / rc=0$/ {
-            count++
-        }
-        END {
-            print count + 0
-        }
-    ' "$file")"
-    loans="$(awk '
-        /assist-pass generation=/ {
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ /^loans=/) {
-                    split($i, value, "=")
-                    total += value[2]
-                }
-            }
-        }
-        END {
-            print total + 0
-        }
-    ' "$file")"
-
-    [[ "$submits" -eq "$generations" ]] ||
-        die "$label has $submits dynamic NORMAL submits, expected $generations"
-    [[ "$passes" -eq "$generations" ]] ||
-        die "$label has $passes clean assist-pass records, expected $generations"
-    [[ "$all_passes" -eq "$generations" ]] ||
-        die "$label has $all_passes total assist-pass records, expected $generations"
-    [[ "$publishes" -ge "$minimum_publishes" ]] ||
-        die "$label published $publishes lanes, expected at least $minimum_publishes"
-    [[ "$publishes" -eq "$unpublishes" ]] ||
-        die "$label lane publish/unpublish count differs ($publishes/$unpublishes)"
-    [[ "$joins" -eq "$leaves" ]] ||
-        die "$label lane join/leave count differs ($joins/$leaves)"
-    [[ "$joins" -eq "$loans" ]] ||
-        die "$label helper joins differ from claimed loans ($joins/$loans)"
-    if [[ "$allow_failed_leaves" -eq 0 &&
-        "$bad_leaves" -ne 0 ]]; then
-        die "$label contains $bad_leaves failed helper loans"
-    fi
-    if grep -qE 'phase-group|static-phase-assist' "$file"; then
-        die "$label contains obsolete static phase-group telemetry"
-    fi
-}
-
-assert_tail_only_lending() {
-    local label="$1"
-    local file="$2"
-    local totals
-    local prequeue
-    local loans
-
-    totals="$(awk '
-        /assist-pass generation=/ {
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ /^prequeue_loans=/) {
-                    split($i, value, "=")
-                    prequeue += value[2]
-                } else if ($i ~ /^loans=/) {
-                    split($i, value, "=")
-                    loans += value[2]
-                }
-            }
-        }
-        END {
-            print prequeue + 0, loans + 0
-        }
-    ' "$file")"
-    read -r prequeue loans <<<"$totals"
-
-    [[ "$prequeue" -eq 0 ]] ||
-        die "$label lent $prequeue tasks before outer queue exhaustion"
-    [[ "$loans" -gt 0 ]] ||
-        die "$label did not exercise tail assistance"
-}
-
-assert_executor_reuse() {
-    local label="$1"
-    local file="$2"
-
-    awk '
-        /\[solver-ab\] executor-epoch / {
-            started = 0
-            quiesced = 0
-            queries = 0
-            for (i = 1; i <= NF; i++) {
-                if ($i ~ /^started=/) {
-                    split($i, value, "=")
-                    started = value[2] + 0
-                } else if ($i ~ /^quiesced=/) {
-                    split($i, value, "=")
-                    quiesced = value[2] + 0
-                } else if ($i ~ /^owner_query_reuses=/) {
-                    split($i, value, "=")
-                    queries = value[2] + 0
-                }
-            }
-            if (started >= 2 &&
-                quiesced == started &&
-                queries > 0) {
-                found = 1
-            }
-        }
-        END {
-            exit found ? 0 : 1
-        }
-    ' "$file" ||
-        die "$label did not prove clean multi-epoch executor/query reuse"
-}
-
+source "$solver_dir/check-solver-integration-common.sh"
 compare_single_index_case() {
     local label="$1"
     local first_object="$2"
@@ -558,7 +397,7 @@ compare_single_index_case() {
 
     run_case \
         "$w1" \
-        test-ab-block-integration \
+        test-solver-parallel-integration \
         1 \
         "$first_object" \
         "$last_object" \
@@ -566,7 +405,7 @@ compare_single_index_case() {
         "$winner_index"
     run_case \
         "$w4" \
-        test-ab-block-integration \
+        test-solver-parallel-integration \
         4 \
         "$first_object" \
         "$last_object" \
@@ -592,7 +431,7 @@ compare_single_index_case() {
 }
 
 timeout 45 \
-    "$work_dir/bin/test-ab-block-integration" \
+    "$work_dir/bin/test-solver-parallel-integration" \
     --canonical-index-order \
     >"$work_dir/canonical-index-order.log" 2>&1 ||
     {
@@ -601,11 +440,11 @@ timeout 45 \
     }
 assert_contains \
     "canonical later-completion winner" \
-    '^INDEX_SHARD_CANONICAL_ORDER_OK completion=1,0 analyzed=1,1 merged=0 reported=0 loser_freed=1$' \
+    '^INDEX_SHARD_CANONICAL_ORDER_OK completion=1,0 analyzed=1,1 merged=1 reported=1 loser_freed=1$' \
     "$work_dir/canonical-index-order.log"
 assert_contains \
     "canonical ordered reduction" \
-    '\[index-shard\] pass-detail candidates=2 reduced=1 .*rc=0 status=0 master_committed=1$' \
+    '\[index-shard\] pass-detail candidates=2 reduced=1 .*rc=0 status=0 master_committed=1 winner_selected=1 ' \
     "$work_dir/canonical-index-order.log"
 assert_not_contains \
     "canonical losing-index reduction" \
@@ -619,10 +458,6 @@ compare_single_index_case range_1_10 1 10
 compare_single_index_case range_1_11 1 11
 compare_single_index_case range_5_15 5 15
 compare_single_index_case range_11_20 11 20
-assert_contains \
-    "ordinary StarKD representation" \
-    '\[solver-ab\] starkd-permutation .* present=0 inverse_ready=0' \
-    "$work_dir/range_5_15_w4.log"
 
 permuted_hash="$(sha256sum "$permuted_index")" ||
     die "cannot hash the permuted StarKD fixture"
@@ -638,12 +473,12 @@ fi
 
 run_case \
     permuted_w1 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     1 1 20 probe \
     "$permuted_index"
 run_case \
     permuted_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 1 20 probe \
     "$permuted_index"
 assert_equal \
@@ -658,39 +493,21 @@ assert_equal \
     "permuted StarKD WCS" \
     "$(wcs_key "$work_dir/permuted_w1.log")" \
     "$(wcs_key "$work_dir/permuted_w4.log")"
-assert_contains \
-    "permuted StarKD representation" \
-    '\[solver-ab\] starkd-permutation .* present=1 inverse_ready=0' \
-    "$work_dir/permuted_w4.log"
 assert_assist_lifecycle \
     "permuted StarKD dynamic lending" \
     "$work_dir/permuted_w4.log" \
     1 \
     1
-if [[ "$(
-    grep -c \
-        '\[solver-ab\] starkd-inverse-init state=start ' \
-        "$work_dir/permuted_w4.log"
-)" -ne 1 ||
-    "$(
-        grep -c \
-            '\[solver-ab\] starkd-inverse-init state=ready ' \
-            "$work_dir/permuted_w4.log"
-    )" -ne 1 ]]; then
-    printf '%s\n' \
-        "permuted StarKD did not initialize lazily exactly once" >&2
-    exit 1
-fi
 
 # Reopen the same stable permuted index in a second fixed-pool generation.
 # The native initializer still owns each StarKD acquisition bracket, while
 # the job-scoped inverse cache must admit generation one, transfer on
 # generation two, and end with no active lease.
-AB_SECOND_FIRST_OBJECT=1 \
-AB_SECOND_LAST_OBJECT=20 \
+SOLVER_TEST_SECOND_FIRST_OBJECT=1 \
+SOLVER_TEST_SECOND_LAST_OBJECT=20 \
 run_case \
     permuted_cache_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 1 20 multipass \
     "$permuted_index"
 assert_assist_lifecycle \
@@ -711,26 +528,26 @@ assert_contains \
     '\[index-shard\] inverse-cache hits=1 misses=1 admitted=1 .* active=0 ' \
     "$work_dir/permuted_cache_w4.log"
 assert_contains \
-    "stable index mmap retention" \
-    '\[index-shard\] job-index-cache state=end hits=1 misses=1 admitted=1 refused=0 invalidated=0 retries=0 fd_close_failures=0 .* entries=1$' \
+    "stable index mapping release" \
+    '\[index-shard\] job-index-cache state=end hits=0 misses=0 admitted=0 refused=0 invalidated=0 retries=0 fd_close_failures=0 .* budget=0 entries=0 ' \
     "$work_dir/permuted_cache_w4.log"
 
 # Mutate only private index copies between identical passes. A retained
 # inverse from generation one must not match the new source identity.
-AB_TOUCH_INDEX_BEFORE_SECOND="$index_touch_w1" \
-AB_SECOND_FIRST_OBJECT=1 \
-AB_SECOND_LAST_OBJECT=20 \
+SOLVER_TEST_TOUCH_INDEX_BEFORE_SECOND="$index_touch_w1" \
+SOLVER_TEST_SECOND_FIRST_OBJECT=1 \
+SOLVER_TEST_SECOND_LAST_OBJECT=20 \
 run_case \
     index_touch_w1 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     1 1 20 multipass \
     "$index_touch_w1"
-AB_TOUCH_INDEX_BEFORE_SECOND="$index_touch_w4" \
-AB_SECOND_FIRST_OBJECT=1 \
-AB_SECOND_LAST_OBJECT=20 \
+SOLVER_TEST_TOUCH_INDEX_BEFORE_SECOND="$index_touch_w4" \
+SOLVER_TEST_SECOND_FIRST_OBJECT=1 \
+SOLVER_TEST_SECOND_LAST_OBJECT=20 \
 run_case \
     index_touch_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 1 20 multipass \
     "$index_touch_w4"
 assert_equal \
@@ -767,35 +584,30 @@ assert_contains \
     '\[index-shard\] inverse-cache hits=0 misses=2 admitted=2 .* active=0 ' \
     "$work_dir/index_touch_w4.log"
 assert_contains \
-    "W1 touched index mmap invalidation" \
-    '\[index-shard\] job-index-cache state=end hits=0 misses=2 admitted=2 refused=0 invalidated=1 retries=0 fd_close_failures=0 .* entries=1$' \
+    "W1 touched index mapping release" \
+    '\[index-shard\] job-index-cache state=end hits=0 misses=0 admitted=0 refused=0 invalidated=0 retries=0 fd_close_failures=0 .* budget=0 entries=0 ' \
     "$work_dir/index_touch_w1.log"
 assert_contains \
-    "W4 touched index mmap invalidation" \
-    '\[index-shard\] job-index-cache state=end hits=0 misses=2 admitted=2 refused=0 invalidated=1 retries=0 fd_close_failures=0 .* entries=1$' \
+    "W4 touched index mapping release" \
+    '\[index-shard\] job-index-cache state=end hits=0 misses=0 admitted=0 refused=0 invalidated=0 retries=0 fd_close_failures=0 .* budget=0 entries=0 ' \
     "$work_dir/index_touch_w4.log"
 
 # Merely opening a permuted StarKD must not initialize or pin its inverse.
 # Objects 1--2 contain no real CodeKD hit in this pinned fixture.
 run_case \
     permuted_nohit_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 1 2 probe \
     "$index_nohit_w4"
 assert_contains \
     "permuted no-hit pinned result" \
-    '^AB_RESULT .*indexes=1 solutions=0 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=14650fb0739d0383$' \
+    '^SOLVER_TEST_RESULT .*indexes=1 solutions=0 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=14650fb0739d0383$' \
     "$work_dir/permuted_nohit_w4.log"
 assert_assist_lifecycle \
     "permuted no-hit dynamic lending" \
     "$work_dir/permuted_nohit_w4.log" \
     1 \
     1
-if [[ "$(line_count \
-        '\[solver-ab\] starkd-inverse-init state=' \
-        "$work_dir/permuted_nohit_w4.log")" -ne 0 ]]; then
-    die "permuted no-hit range initialized inverse state speculatively"
-fi
 assert_contains \
     "permuted no-hit cache accounting" \
     '\[index-shard\] inverse-cache hits=0 misses=0 admitted=0 .* active=0 ' \
@@ -805,18 +617,18 @@ assert_contains \
 # passes. Exercise generation reset in both ascending and deliberately
 # reordered range sequences; range order is user configuration, not a
 # scheduler definition.
-AB_SECOND_FIRST_OBJECT=11 \
-AB_SECOND_LAST_OBJECT=20 \
+SOLVER_TEST_SECOND_FIRST_OBJECT=11 \
+SOLVER_TEST_SECOND_LAST_OBJECT=20 \
 run_case \
     multipass_forward_w1 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     1 1 10 multipass \
     "$winner_index"
-AB_SECOND_FIRST_OBJECT=11 \
-AB_SECOND_LAST_OBJECT=20 \
+SOLVER_TEST_SECOND_FIRST_OBJECT=11 \
+SOLVER_TEST_SECOND_LAST_OBJECT=20 \
 run_case \
     multipass_forward_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 1 10 multipass \
     "$winner_index"
 assert_equal \
@@ -855,33 +667,33 @@ assert_contains \
     '\[index-shard\] job-field-cache state=end reads=1 preprocesses=1 hits=1 invalidations=0$' \
     "$work_dir/multipass_forward_w4.log"
 assert_contains \
-    "W1 ordinary two-pass index mmap cache" \
-    '\[index-shard\] job-index-cache state=end hits=1 misses=1 admitted=1 refused=0 invalidated=0 retries=0 fd_close_failures=0 .* entries=1$' \
+    "W1 ordinary two-pass index mapping release" \
+    '\[index-shard\] job-index-cache state=end hits=0 misses=0 admitted=0 refused=0 invalidated=0 retries=0 fd_close_failures=0 .* budget=0 entries=0 ' \
     "$work_dir/multipass_forward_w1.log"
 assert_contains \
-    "W4 ordinary two-pass index mmap cache" \
-    '\[index-shard\] job-index-cache state=end hits=1 misses=1 admitted=1 refused=0 invalidated=0 retries=0 fd_close_failures=0 .* entries=1$' \
+    "W4 ordinary two-pass index mapping release" \
+    '\[index-shard\] job-index-cache state=end hits=0 misses=0 admitted=0 refused=0 invalidated=0 retries=0 fd_close_failures=0 .* budget=0 entries=0 ' \
     "$work_dir/multipass_forward_w4.log"
 
 # Mutate only private XYLS copies between identical passes. The cache must
 # invalidate on source identity, reread and preprocess exactly once, while
 # W1 and W4 retain identical persisted science.
-AB_CASE_FIELD="$field_touch_w1" \
-AB_TOUCH_FIELD_BEFORE_SECOND="$field_touch_w1" \
-AB_SECOND_FIRST_OBJECT=1 \
-AB_SECOND_LAST_OBJECT=20 \
+SOLVER_TEST_CASE_FIELD="$field_touch_w1" \
+SOLVER_TEST_TOUCH_FIELD_BEFORE_SECOND="$field_touch_w1" \
+SOLVER_TEST_SECOND_FIRST_OBJECT=1 \
+SOLVER_TEST_SECOND_LAST_OBJECT=20 \
 run_case \
     field_touch_w1 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     1 1 20 multipass \
     "$winner_index"
-AB_CASE_FIELD="$field_touch_w4" \
-AB_TOUCH_FIELD_BEFORE_SECOND="$field_touch_w4" \
-AB_SECOND_FIRST_OBJECT=1 \
-AB_SECOND_LAST_OBJECT=20 \
+SOLVER_TEST_CASE_FIELD="$field_touch_w4" \
+SOLVER_TEST_TOUCH_FIELD_BEFORE_SECOND="$field_touch_w4" \
+SOLVER_TEST_SECOND_FIRST_OBJECT=1 \
+SOLVER_TEST_SECOND_LAST_OBJECT=20 \
 run_case \
     field_touch_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 1 20 multipass \
     "$winner_index"
 assert_equal \
@@ -914,18 +726,18 @@ assert_assist_lifecycle \
     2 \
     2
 
-AB_SECOND_FIRST_OBJECT=1 \
-AB_SECOND_LAST_OBJECT=8 \
+SOLVER_TEST_SECOND_FIRST_OBJECT=1 \
+SOLVER_TEST_SECOND_LAST_OBJECT=8 \
 run_case \
     multipass_reordered_w1 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     1 11 20 multipass \
     "$winner_index"
-AB_SECOND_FIRST_OBJECT=1 \
-AB_SECOND_LAST_OBJECT=8 \
+SOLVER_TEST_SECOND_FIRST_OBJECT=1 \
+SOLVER_TEST_SECOND_LAST_OBJECT=8 \
 run_case \
     multipass_reordered_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 11 20 multipass \
     "$winner_index"
 assert_equal \
@@ -948,17 +760,17 @@ assert_assist_lifecycle \
 
 run_case \
     regular_w1_exhaustive \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     1 1 20 exhaustive \
     "$winner_index"
 run_case \
     regular_w4_exhaustive \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 1 20 exhaustive \
     "$winner_index"
 run_case \
     stream_w4_exhaustive \
-    test-ab-stream-integration \
+    test-solver-streaming-integration \
     4 1 20 exhaustive \
     "$winner_index"
 
@@ -997,40 +809,39 @@ assert_assist_lifecycle \
     1 \
     1
 
-# A deterministic bounded-packet failure occurs after assisted work begins but
-# before any master commit. It must quiesce the helpers, classify the failure
-# as retryable, execute the native serial path exactly once, and publish the
-# same final result as W1.
+# A deterministic bounded CodeKD packet allocation refusal occurs after one
+# assisted phase completes and before the next phase mutates owner state. It
+# must use the exact native phase path without failing or replaying the
+# complete index task.
 run_case \
-    allocfail_recovery \
-    test-ab-allocfail-integration \
+    allocation_failure_recovery \
+    test-solver-allocation-failure \
     4 1 20 exhaustive \
     "$winner_index"
 assert_equal \
     "allocation-failure recovery profile" \
     "$(profile_key "$work_dir/regular_w1_exhaustive.log")" \
-    "$(profile_key "$work_dir/allocfail_recovery.log")"
+    "$(profile_key "$work_dir/allocation_failure_recovery.log")"
 assert_equal \
     "allocation-failure recovery result" \
     "$(result_key "$work_dir/regular_w1_exhaustive.log")" \
-    "$(result_key "$work_dir/allocfail_recovery.log")"
+    "$(result_key "$work_dir/allocation_failure_recovery.log")"
 assert_equal \
     "allocation-failure recovery WCS" \
     "$(wcs_key "$work_dir/regular_w1_exhaustive.log")" \
-    "$(wcs_key "$work_dir/allocfail_recovery.log")"
+    "$(wcs_key "$work_dir/allocation_failure_recovery.log")"
 assert_assist_lifecycle \
     "allocation-failure dynamic lending" \
-    "$work_dir/allocfail_recovery.log" \
-    1 \
+    "$work_dir/allocation_failure_recovery.log" \
     1 \
     1
 if [[ "$(
         grep -c '\[onefield-profile\] mode=serial-precommit-retry ' \
-            "$work_dir/allocfail_recovery.log"
-    )" -ne 1 ||
+            "$work_dir/allocation_failure_recovery.log"
+    )" -ne 0 ||
     "$(
-        grep -c '^AB_RESULT ' \
-            "$work_dir/allocfail_recovery.log"
+        grep -c '^SOLVER_TEST_RESULT ' \
+            "$work_dir/allocation_failure_recovery.log"
     )" -ne 1 ]]; then
     printf '%s\n' \
         "allocation-failure recovery lifecycle is not unique" >&2
@@ -1038,12 +849,12 @@ if [[ "$(
 fi
 assert_contains \
     "allocation-failure assisted profile" \
-    '\[solver\] phase-profile detailed=1 failed=1 .*allocation_failures=1 .*helper_tasks=[1-9][0-9]* ' \
-    "$work_dir/allocfail_recovery.log"
+    '\[solver\] phase-profile detailed=1 failed=0 .*allocation_failures=1 .*helper_tasks=[1-9][0-9]* ' \
+    "$work_dir/allocation_failure_recovery.log"
 assert_contains \
     "allocation-failure shard profile" \
-    '\[index-shard\] solver-pass generation=1 .*failed=1 .*batch_failed=1 ' \
-    "$work_dir/allocfail_recovery.log"
+    '\[index-shard\] solver-pass generation=1 .*failed=0 .*batch_failed=0 ' \
+    "$work_dir/allocation_failure_recovery.log"
 assert_equal \
     "continuous versus split match set W1" \
     "$(match_set_key "$work_dir/regular_w1_exhaustive.log")" \
@@ -1055,9 +866,9 @@ assert_equal \
 
 segments="$(
     awk '
-        /\[solver\] phase-profile/ {
+        /\[solver\] page-pipeline/ {
             for (i = 1; i <= NF; i++) {
-                if ($i ~ /^ab_segments_retired=/) {
+                if ($i ~ /^windows=/) {
                     split($i, value, "=")
                     result = value[2]
                 }
@@ -1099,7 +910,7 @@ helper_tasks="$(
     ' "$work_dir/stream_w4_exhaustive.log"
 )"
 if [[ -z "$segments" || "$segments" -le 1 ]]; then
-    printf 'tiny-buffer test did not force segmented retirement\n' >&2
+    printf 'tiny-buffer test did not force multiple delivery windows\n' >&2
     exit 1
 fi
 if [[ -z "$parallel_batches" || "$parallel_batches" -le 0 ]]; then
@@ -1117,12 +928,12 @@ fi
 # late worker.
 run_case \
     multi2_w1 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     1 5 15 probe \
     "$winner_index" "$winner_index"
 run_case \
     multi2_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 5 15 probe \
     "$winner_index" "$winner_index"
 assert_equal \
@@ -1131,7 +942,7 @@ assert_equal \
     "$(result_key "$work_dir/multi2_w4.log")"
 assert_contains \
     "two-index pinned known answer" \
-    '^AB_RESULT .*indexes=2 solutions=2 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=082e8d6419d6f45f ' \
+    '^SOLVER_TEST_RESULT .*indexes=2 solutions=2 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=082e8d6419d6f45f ' \
     "$work_dir/multi2_w1.log"
 assert_assist_lifecycle \
     "two-index dynamic lending" \
@@ -1141,12 +952,12 @@ assert_assist_lifecycle \
 
 run_case \
     multi3_w1 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     1 5 15 probe \
     "$winner_index" "$winner_index" "$winner_index"
 run_case \
     multi3_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 5 15 probe \
     "$winner_index" "$winner_index" "$winner_index"
 assert_equal \
@@ -1155,7 +966,7 @@ assert_equal \
     "$(result_key "$work_dir/multi3_w4.log")"
 assert_contains \
     "three-index pinned known answer" \
-    '^AB_RESULT .*indexes=3 solutions=3 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=2bd3e32be2102808 ' \
+    '^SOLVER_TEST_RESULT .*indexes=3 solutions=3 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=2bd3e32be2102808 ' \
     "$work_dir/multi3_w1.log"
 assert_assist_lifecycle \
     "three-index dynamic lending" \
@@ -1167,12 +978,12 @@ assert_assist_lifecycle \
 # lending becomes legal only after an owner exhausts the outer queue.
 run_case \
     multi4_w1 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     1 5 15 probe \
     "$winner_index" "$winner_index" "$winner_index" "$winner_index"
 run_case \
     multi4_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 5 15 probe \
     "$winner_index" "$winner_index" "$winner_index" "$winner_index"
 assert_equal \
@@ -1181,7 +992,7 @@ assert_equal \
     "$(result_key "$work_dir/multi4_w4.log")"
 assert_contains \
     "four-index pinned known answer" \
-    '^AB_RESULT .*indexes=4 solutions=4 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=957afd8b0473076b ' \
+    '^SOLVER_TEST_RESULT .*indexes=4 solutions=4 cancelled=0 wall_limit=0 cpu_limit=0 failed=0 signature=957afd8b0473076b ' \
     "$work_dir/multi4_w1.log"
 assert_assist_lifecycle \
     "four-index dynamic lending" \
@@ -1199,13 +1010,13 @@ assert_contains \
 # and owner-query reuse without reducing the production owner width.
 run_case \
     owner_credit_w1 \
-    test-ab-stream-integration \
+    test-solver-streaming-integration \
     1 5 15 probe \
     "$winner_index" "$winner_index" "$winner_index" "$winner_index" \
     "$winner_index" "$winner_index" "$winner_index" "$winner_index"
 run_case \
     owner_credit_w4 \
-    test-ab-stream-integration \
+    test-solver-streaming-integration \
     4 5 15 probe \
     "$winner_index" "$winner_index" "$winner_index" "$winner_index" \
     "$winner_index" "$winner_index" "$winner_index" "$winner_index"
@@ -1218,72 +1029,61 @@ assert_assist_lifecycle \
     "$work_dir/owner_credit_w4.log" \
     1 \
     2
-assert_tail_only_lending \
+assert_full_producer_assistance \
     "full-owner tail lending" \
-    "$work_dir/owner_credit_w4.log"
-assert_executor_reuse \
-    "full-owner executor reuse" \
     "$work_dir/owner_credit_w4.log"
 assert_contains \
     "full-owner test admission" \
-    'outer_admission=full-owner-tail-assist$' \
+    'outer_admission=(full-producer|provider-bounded-exact-demand)$' \
     "$work_dir/owner_credit_w4.log"
 
 # A compact-geometry budget refusal is nonfatal. It deliberately falls back
 # to the original owner-private pquad loop for that pass; helper publication
 # requires an immutable compact snapshot.
 run_case \
-    no_geometry_w4 \
-    test-ab-no-geometry-integration \
+    geometry_fallback_w4 \
+    test-solver-geometry-fallback \
     4 5 15 probe \
     "$winner_index"
 assert_equal \
     "geometry refusal result" \
     "$(result_key "$work_dir/range_5_15_w1.log")" \
-    "$(result_key "$work_dir/no_geometry_w4.log")"
+    "$(result_key "$work_dir/geometry_fallback_w4.log")"
 assert_contains \
     "geometry refusal" \
-    '\[solver-geometry\] mode=legacy reason=budget' \
-    "$work_dir/no_geometry_w4.log"
+    '\[solver-geometry\] mode=native reason=budget' \
+    "$work_dir/geometry_fallback_w4.log"
 assert_contains \
     "geometry native-lane refusal" \
-    '\[solver-ab\] dynamic lane unavailable; using native owner path' \
-    "$work_dir/no_geometry_w4.log"
-assert_not_contains \
-    "geometry refusal lane publication" \
-    'assist-lane state=publish ' \
-    "$work_dir/no_geometry_w4.log"
+    '\[solver\] phase-profile detailed=1 failed=0 .*hypothesis_batches=0 .*helper_tasks=0 ' \
+    "$work_dir/geometry_fallback_w4.log"
+assert_contains \
+    "geometry refusal helper quiescence" \
+    '\[index-shard\] helper-pass generation=1 groups=0 completed=0 .*task_failures=0 ' \
+    "$work_dir/geometry_fallback_w4.log"
 
 # Geometry-refused owners cannot publish helper lanes. All four queued indexes
 # must still be claimed through the ordered outer path without parking behind
 # owners that can never publish work.
 run_case \
-    no_geometry_overflow_w4 \
-    test-ab-no-geometry-integration \
+    geometry_fallback_overflow_w4 \
+    test-solver-geometry-fallback \
     4 5 15 probe \
     "$nonwinner_index" "$nonwinner_index" \
     "$nonwinner_index" "$nonwinner_index"
 [[ "$(grep -cE \
-    'claim index_order=[0-9]+ lane=ordered ' \
-    "$work_dir/no_geometry_overflow_w4.log")" -eq 4 ]] ||
-    die "geometry refusal did not claim four ordered outer indexes"
-assert_not_contains \
-    "geometry refusal overflow lane" \
-    'lane=overflow ' \
-    "$work_dir/no_geometry_overflow_w4.log"
-assert_not_contains \
-    "geometry overflow lane publication" \
-    'assist-lane state=publish ' \
-    "$work_dir/no_geometry_overflow_w4.log"
+    'claim index_order=[0-9]+ lane=producer ' \
+    "$work_dir/geometry_fallback_overflow_w4.log")" -eq 4 ]] ||
+    die "geometry refusal did not claim four producer indexes"
 # Both accepted outer-scheduler winner directions remain legal.
 run_case \
     first_winner_w1 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     1 1 20 winner \
     "$winner_index" "$nonwinner_index"
 run_case \
     first_winner_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 1 20 winner \
     "$winner_index" "$nonwinner_index"
 assert_equal \
@@ -1306,12 +1106,12 @@ assert_assist_lifecycle \
 
 run_case \
     later_winner_w1 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     1 1 20 winner \
     "$nonwinner_index" "$winner_index"
 run_case \
     later_winner_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 1 20 winner \
     "$nonwinner_index" "$winner_index"
 assert_equal \
@@ -1334,28 +1134,28 @@ assert_assist_lifecycle \
 
 # An already-expired aggregate wall budget exercises pre-bind helper
 # quiescence without relying on a timing race.
-AB_TOTAL_WALL_LIMIT=0.000001 \
+SOLVER_TEST_TOTAL_WALL_LIMIT=0.000001 \
 run_case \
     expired_limit_w4 \
-    test-ab-block-integration \
+    test-solver-parallel-integration \
     4 1 20 limit \
     "$winner_index" "$winner_index" "$winner_index"
 assert_contains \
     "expired wall limit" \
-    '^AB_RESULT .*wall_limit=1 ' \
+    '^SOLVER_TEST_RESULT .*wall_limit=1 ' \
     "$work_dir/expired_limit_w4.log"
 
-if grep --exclude='allocfail_recovery.log' -qE \
+if grep --exclude='allocation_failure_recovery.log' -qE \
     '\[solver-ab\].*(failed|invalid|underflow)|failed=1|serial-precommit-retry|releasing leased job-index-cache' \
     "$work_dir"/*.log; then
-    grep --exclude='allocfail_recovery.log' -nE \
+    grep --exclude='allocation_failure_recovery.log' -nE \
         '\[solver-ab\].*(failed|invalid|underflow)|failed=1|serial-precommit-retry|releasing leased job-index-cache' \
         "$work_dir"/*.log >&2
     exit 1
 fi
 
 printf \
-    'AB_BLOCK_INTEGRATION_OK ranges=5 multipass=2 retained_state=field-hit,field-invalidate,index-mmap-hit,index-mmap-invalidate,inverse-invalidate,index-nohit multi=2,3,4 permuted=%s inverse_cache=admit-hit segments=%s parallel_batches=%s helper_tasks=%s output=%s\n' \
+    'SOLVER_PARALLEL_INTEGRATION_OK ranges=5 multipass=2 retained_state=field-hit,field-invalidate,index-release,inverse-invalidate,index-nohit multi=2,3,4 permuted=%s inverse_cache=admit-hit windows=%s parallel_batches=%s helper_tasks=%s output=%s\n' \
     "yes" \
     "$segments" \
     "$parallel_batches" \

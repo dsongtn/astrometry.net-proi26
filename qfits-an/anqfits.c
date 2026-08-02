@@ -13,7 +13,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <stdint.h>
 #include <sys/mman.h>
 
 #include "anqfits.h"
@@ -739,31 +743,185 @@ static int parse_header_block(const char* buf, qfits_header* hdr, int* found_it)
     return 0;
 }
 
-static size_t get_data_bytes(const qfits_header* hdr) {
-    int naxis;
+static int size_multiply(
+    size_t left,
+    size_t right,
+    size_t* result) {
+    if (!result || (left && right > SIZE_MAX / left)) {
+        return -1;
+    }
+    *result = left * right;
+    return 0;
+}
+
+static int get_header_integer(
+    const qfits_header* hdr,
+    const char* key,
+    int required,
+    intmax_t default_value,
+    intmax_t* value_out) {
+    const char* text;
+    char* end;
+    intmax_t value;
+
+    if (!hdr || !key || !value_out) {
+        return -1;
+    }
+    text = qfits_header_getstr(hdr, key);
+    if (!text) {
+        if (required) {
+            return -1;
+        }
+        *value_out = default_value;
+        return 0;
+    }
+    errno = 0;
+    value = strtoimax(text, &end, 10);
+    if (errno == ERANGE || end == text) {
+        return -1;
+    }
+    while (*end && isspace((unsigned char)*end)) {
+        end++;
+    }
+    if (*end) {
+        return -1;
+    }
+    *value_out = value;
+    return 0;
+}
+
+static int get_data_bytes(
+    const qfits_header* hdr,
+    int allow_random_groups,
+    size_t* data_bytes_out) {
+    intmax_t bitpix;
+    intmax_t gcount;
+    intmax_t naxis;
+    intmax_t pcount;
     size_t data_bytes;
     size_t npix;
+    size_t bytes_per_pixel;
+    size_t group_count;
+    size_t parameter_count;
+    int groups;
+    int axis_count;
     int i;
-    data_bytes = abs(qfits_header_getint(hdr, "BITPIX", 0) / 8);
-    naxis = qfits_header_getint(hdr, "NAXIS", 0);
-    data_bytes *= qfits_header_getint(hdr, "GCOUNT", 1);
+
+    if (!hdr || !data_bytes_out) {
+        return -1;
+    }
+    *data_bytes_out = 0;
+    if (get_header_integer(hdr, "BITPIX", 1, 0, &bitpix) ||
+        get_header_integer(hdr, "GCOUNT", 0, 1, &gcount) ||
+        get_header_integer(hdr, "NAXIS", 1, 0, &naxis) ||
+        get_header_integer(hdr, "PCOUNT", 0, 0, &pcount)) {
+        return -1;
+    }
+    if (bitpix != 8 && bitpix != 16 && bitpix != 32 && bitpix != 64 &&
+        bitpix != -32 && bitpix != -64) {
+        return -1;
+    }
+    if (gcount < 1 || (uintmax_t)gcount > (uintmax_t)SIZE_MAX ||
+        pcount < 0 || (uintmax_t)pcount > (uintmax_t)SIZE_MAX ||
+        naxis < 0 || naxis > 999) {
+        return -1;
+    }
+    groups = qfits_header_getboolean(hdr, "GROUPS", 0);
+    if (groups && (!allow_random_groups || naxis < 2)) {
+        return -1;
+    }
+    bytes_per_pixel = (size_t)(bitpix < 0 ? -bitpix : bitpix) / 8U;
+    group_count = (size_t)gcount;
+    parameter_count = (size_t)pcount;
+    axis_count = (int)naxis;
     npix = 1;
-    if (!naxis)
+    if (!axis_count) {
         npix = 0;
-    for (i=0; i<naxis; i++) {
+    }
+    for (i=0; i<axis_count; i++) {
         char key[32];
-        int nax;
-        sprintf(key, "NAXIS%i", i+1);
-        nax = qfits_header_getint(hdr, key, 0);
-        if (i == 0 && nax == 0) {
-            // random groups signature; skip naxis1
-        } else {
-            npix *= (size_t)nax;
+        intmax_t nax;
+
+        snprintf(key, sizeof(key), "NAXIS%i", i+1);
+        if (get_header_integer(hdr, key, 1, 0, &nax) ||
+            nax < 0 || (uintmax_t)nax > (uintmax_t)SIZE_MAX) {
+            return -1;
+        }
+        if (i == 0 && groups) {
+            if (nax != 0) {
+                return -1;
+            }
+        } else if (size_multiply(npix, (size_t)nax, &npix)) {
+            return -1;
         }
     }
-    npix += qfits_header_getint(hdr, "PCOUNT", 0);
-    data_bytes *= npix;
-    return data_bytes;
+    if (parameter_count > SIZE_MAX - npix) {
+        return -1;
+    }
+    npix += parameter_count;
+    if (size_multiply(bytes_per_pixel, group_count, &data_bytes) ||
+        size_multiply(data_bytes, npix, &data_bytes)) {
+        return -1;
+    }
+    *data_bytes_out = data_bytes;
+    return 0;
+}
+
+static int get_padded_data_extent(
+    size_t data_bytes,
+    size_t* block_count_out,
+    size_t* byte_count_out) {
+    size_t block_count;
+
+    if (!block_count_out || !byte_count_out) {
+        return -1;
+    }
+    block_count = data_bytes / FITS_BLOCK_SIZE;
+    if (data_bytes % FITS_BLOCK_SIZE) {
+        if (block_count == SIZE_MAX) {
+            return -1;
+        }
+        block_count++;
+    }
+    if (block_count > SIZE_MAX / FITS_BLOCK_SIZE) {
+        return -1;
+    }
+    *block_count_out = block_count;
+    *byte_count_out = block_count * (size_t)FITS_BLOCK_SIZE;
+    return 0;
+}
+
+static int grow_extensions(
+    anqfits_t* qf,
+    int* capacity) {
+    anqfits_ext_t* grown;
+    int old_capacity;
+    int new_capacity;
+
+    if (!qf || !qf->exts || !capacity || *capacity <= 0 ||
+        *capacity > INT_MAX / 2) {
+        return -1;
+    }
+    old_capacity = *capacity;
+    new_capacity = old_capacity * 2;
+    if ((size_t)new_capacity >
+        SIZE_MAX / sizeof(anqfits_ext_t)) {
+        return -1;
+    }
+    grown = realloc(
+        qf->exts,
+        (size_t)new_capacity * sizeof(anqfits_ext_t));
+    if (!grown) {
+        return -1;
+    }
+    memset(
+        grown + old_capacity,
+        0,
+        (size_t)(new_capacity - old_capacity) *
+            sizeof(anqfits_ext_t));
+    qf->exts = grown;
+    *capacity = new_capacity;
+    return 0;
 }
 
 anqfits_t* anqfits_open(const char* filename) {
@@ -785,6 +943,7 @@ anqfits_t* anqfits_open_hdu(const char* filename, int hdu) {
     int seeked;
     int firsttime;
     int i;
+    off_t file_blocks;
 
     // initial maximum number of extensions: we grow automatically
     int ext_capacity = 1024;
@@ -795,6 +954,9 @@ anqfits_t* anqfits_open_hdu(const char* filename, int hdu) {
     if (stat(filename, &sta)!=0) {
         qdebug(printf("anqfits: cannot stat file %s: %s\n",
                       filename, strerror(errno)););
+        goto bailout;
+    }
+    if (sta.st_size < 0) {
         goto bailout;
     }
 
@@ -852,16 +1014,52 @@ anqfits_t* anqfits_open_hdu(const char* filename, int hdu) {
     assert(found_it);
 
     xtend = qfits_header_getboolean(hdr, "EXTEND", 0);
-    data_bytes = get_data_bytes(hdr);
+    if (get_data_bytes(hdr, 1, &data_bytes)) {
+        qfits_error("anqfits: invalid primary data size in file %s",
+                    filename);
+        goto bailout;
+    }
+    if (!xtend && data_bytes > 0) {
+        size_t data_blocks;
+        size_t extent_size;
+        off_t current;
+        off_t extent;
+
+        if (get_padded_data_extent(
+                data_bytes, &data_blocks, &extent_size) ||
+            data_blocks > SIZE_MAX - n_blocks) {
+            qfits_error("anqfits: primary data extent overflow in file %s",
+                        filename);
+            goto bailout;
+        }
+        extent = (off_t)extent_size;
+        current = ftello(fin);
+        if (extent < 0 || (size_t)extent != extent_size || current < 0 ||
+            sta.st_size < current || extent > sta.st_size - current) {
+            qfits_error("anqfits: invalid primary data extent in file %s",
+                        filename);
+            goto bailout;
+        }
+    }
 
     debug("primary header: data_bytes %zu\n", data_bytes);
 
     qf = calloc(1, sizeof(anqfits_t));
-    qf->filename = strdup(filename);
-    qf->exts = calloc(ext_capacity, sizeof(anqfits_ext_t));
-    assert(qf->exts);
-    if (!qf->exts)
+    if (!qf) {
         goto bailout;
+    }
+    qf->filename = strdup(filename);
+    if (!qf->filename) {
+        goto bailout;
+    }
+    qf->exts = calloc(ext_capacity, sizeof(anqfits_ext_t));
+    if (!qf->exts) {
+        goto bailout;
+    }
+
+    if (n_blocks > INT_MAX) {
+        goto bailout;
+    }
 
     // Set first HDU offsets
     qf->exts[0].hdr_start = 0;
@@ -892,10 +1090,25 @@ anqfits_t* anqfits_open_hdu(const char* filename, int hdu) {
              */
             if (data_bytes > 0) {
                 /* Skip as many blocks as there are declared pixels */
-                size_t off;
-                skip_blocks = qfits_blocks_needed(data_bytes);
-                off = skip_blocks;
-                off *= (size_t)FITS_BLOCK_SIZE;
+                size_t off_size;
+                off_t current;
+                off_t off;
+
+                if (get_padded_data_extent(
+                        data_bytes, &skip_blocks, &off_size) ||
+                    skip_blocks > SIZE_MAX - n_blocks) {
+                    qfits_error("anqfits: data offset overflow in file %s",
+                                filename);
+                    goto bailout;
+                }
+                off = (off_t)off_size;
+                current = ftello(fin);
+                if (off < 0 || (size_t)off != off_size || current < 0 ||
+                    sta.st_size < current || off > sta.st_size - current) {
+                    qfits_error("anqfits: invalid data extent in file %s",
+                                filename);
+                    goto bailout;
+                }
                 seeked = fseeko(fin, off, SEEK_CUR);
                 if (seeked == -1) {
                     qfits_error("anqfits: failed to fseeko in file %s: %s",
@@ -903,8 +1116,9 @@ anqfits_t* anqfits_open_hdu(const char* filename, int hdu) {
                     goto bailout;
                 }
 
-                debug("hdu %i, data_bytes %zu, skip_blocks %zu, off %zu, n_blocks %zu\n",
-                      qf->Nexts-1, data_bytes, skip_blocks, off, n_blocks);
+                debug("hdu %i, data_bytes %zu, skip_blocks %zu, off %lld, n_blocks %zu\n",
+                      qf->Nexts-1, data_bytes, skip_blocks,
+                      (long long)off, n_blocks);
                 /* Increase counter of current seen blocks. */
                 n_blocks += skip_blocks;
                 data_bytes = 0;
@@ -925,6 +1139,16 @@ anqfits_t* anqfits_open_hdu(const char* filename, int hdu) {
                     debug("Found XTENSION\n");
                     /* Got an extension */
                     found_it = 1;
+                    if (qf->Nexts >= ext_capacity &&
+                        grow_extensions(qf, &ext_capacity)) {
+                        qfits_error(
+                            "anqfits: cannot grow extension table for %s",
+                            filename);
+                        goto bailout;
+                    }
+                    if (n_blocks - 1U > INT_MAX) {
+                        goto bailout;
+                    }
                     qf->exts[qf->Nexts].hdr_start = n_blocks-1;
                 } else {
                     qfits_warning("Failed to find XTENSION in the FITS block following the previous data block -- whaddup?  Filename %s, block %zi, hdu %i",
@@ -946,10 +1170,9 @@ anqfits_t* anqfits_open_hdu(const char* filename, int hdu) {
             while (!found_it && !end_of_file) {
                 if (!firsttime) {
                     if (fread(buf, 1, FITS_BLOCK_SIZE, fin) != FITS_BLOCK_SIZE) {
-                        qdebug(printf("anqfits: XTENSION without END in %s\n",
-                                      filename););
-                        end_of_file = 1;
-                        break;
+                        qfits_error("anqfits: XTENSION without END in %s",
+                                    filename);
+                        goto bailout;
                     }
                 }
                 firsttime = 0;
@@ -963,21 +1186,21 @@ anqfits_t* anqfits_open_hdu(const char* filename, int hdu) {
                       found_it ? "yes":"no");
             }
             if (found_it) {
-                data_bytes = get_data_bytes(hdr);
+                if (get_data_bytes(hdr, 0, &data_bytes)) {
+                    qfits_error(
+                        "anqfits: invalid extension data size in file %s",
+                        filename);
+                    goto bailout;
+                }
                 debug("This data block will have %zu bytes\n", data_bytes);
 
+                if (n_blocks > INT_MAX) {
+                    goto bailout;
+                }
                 qf->exts[qf->Nexts].data_start = n_blocks;
                 qf->exts[qf->Nexts].header = hdr;
                 hdr = NULL;
                 qf->Nexts++;
-                if (qf->Nexts >= ext_capacity) {
-                    ext_capacity *= 2;
-                    qf->exts = realloc(qf->exts,
-                                       ext_capacity * sizeof(anqfits_ext_t));
-                    assert(qf->exts);
-                    if (!qf->exts)
-                        goto bailout;
-                }
             }
         }
     }
@@ -990,24 +1213,60 @@ anqfits_t* anqfits_open_hdu(const char* filename, int hdu) {
     /* Close file */
     fclose(fin);
     fin = NULL;
+    file_blocks = sta.st_size / (off_t)FITS_BLOCK_SIZE;
 
     // realloc
-    qf->exts = realloc(qf->exts, qf->Nexts * sizeof(anqfits_ext_t));
-    assert(qf->exts);
-    if (!qf->exts)
-        goto bailout;
+    if (qf->Nexts > 0 &&
+        (size_t)qf->Nexts <= SIZE_MAX / sizeof(anqfits_ext_t)) {
+        anqfits_ext_t* shrunk = realloc(
+            qf->exts,
+            (size_t)qf->Nexts * sizeof(anqfits_ext_t));
+
+        if (shrunk) {
+            qf->exts = shrunk;
+        }
+    }
 
     for (i=0; i<qf->Nexts; i++) {
-        qf->exts[i].hdr_size = qf->exts[i].data_start - qf->exts[i].hdr_start;
+        int header_blocks;
+        off_t data_blocks;
+
+        if (qf->exts[i].data_start < qf->exts[i].hdr_start) {
+            qfits_error("anqfits: invalid header offsets in file %s",
+                        filename);
+            goto bailout;
+        }
+        header_blocks = qf->exts[i].data_start -
+            qf->exts[i].hdr_start;
+        qf->exts[i].hdr_size = header_blocks;
         if (i == qf->Nexts-1) {
             debug("st_size %zu, /block_size = %zu\n",
                   (size_t)sta.st_size,
                   (size_t)(sta.st_size / (size_t)FITS_BLOCK_SIZE));
-            qf->exts[i].data_size = ((sta.st_size/FITS_BLOCK_SIZE) -
-                                     qf->exts[i].data_start);
-        } else
-            qf->exts[i].data_size = (qf->exts[i+1].hdr_start -
-                                     qf->exts[i].data_start);
+            if (file_blocks < (off_t)qf->exts[i].data_start) {
+                qfits_error("anqfits: invalid final data offset in file %s",
+                            filename);
+                goto bailout;
+            }
+            data_blocks = file_blocks -
+                (off_t)qf->exts[i].data_start;
+        } else {
+            if (qf->exts[i+1].hdr_start <
+                qf->exts[i].data_start) {
+                qfits_error("anqfits: invalid extension offsets in file %s",
+                            filename);
+                goto bailout;
+            }
+            data_blocks = (off_t)qf->exts[i+1].hdr_start -
+                (off_t)qf->exts[i].data_start;
+        }
+        if (data_blocks < 0 ||
+            (uintmax_t)data_blocks > (uintmax_t)INT_MAX) {
+            qfits_error("anqfits: data span is too large in file %s",
+                        filename);
+            goto bailout;
+        }
+        qf->exts[i].data_size = (int)data_blocks;
         debug("  Ext %i: header size %i, data size %i; hdr=%p\n",
               i, qf->exts[i].hdr_size, qf->exts[i].data_size,
               qf->exts[i].header);
@@ -1016,7 +1275,7 @@ anqfits_t* anqfits_open_hdu(const char* filename, int hdu) {
               qf->exts[i].hdr_start, qf->exts[i].hdr_size,
               qf->exts[i].data_start, qf->exts[i].data_size);
     }
-    qf->filesize = sta.st_size / FITS_BLOCK_SIZE;
+    qf->filesize = file_blocks;
 
     return qf;
 
@@ -1026,9 +1285,7 @@ anqfits_t* anqfits_open_hdu(const char* filename, int hdu) {
     if (fin)
         fclose(fin);
     if (qf) {
-        free(qf->filename);
-        free(qf->exts);
-        free(qf);
+        anqfits_close(qf);
     }
     return NULL;
 }

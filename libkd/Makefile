@@ -146,7 +146,7 @@ install-spherematch: spherematch_c$(PYTHON_SO_EXT)
 
 ### TESTS are great
 
-ALL_TEST_FILES = test_libkd test_libkd_io test_kdtree_direct_dss test_dualtree_nn
+ALL_TEST_FILES = test_libkd test_libkd_io test_dualtree_nn
 ALL_TEST_EXTRA_OBJS =
 ALL_TEST_LIBS = $(SLIB)
 
@@ -154,7 +154,6 @@ include $(COMMON)/makefile.tests
 
 test_libkd: $(SLIB)
 test_libkd_io: $(SLIB)
-test_kdtree_direct_dss: $(SLIB)
 test_dualtree_nn: $(SLIB)
 
 DEP_OBJ += $(ALL_TEST_FILES_O) $(ALL_TEST_FILES_MAIN_O)

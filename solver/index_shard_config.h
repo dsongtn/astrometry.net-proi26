@@ -51,14 +51,29 @@ int index_shard_config_effective_workers(int configured_workers,
                                          size_t nindexes);
 
 /*
- * Bound simultaneous cold outer owners by detached delivery capacity.
- * Surplus compute threads remain available to execute staged work.
- * Without detached completion, retain the conservative fixed-helper policy.
+ * Return nonzero only when one pass can use detached exact-demand delivery
+ * for filename-owned, nonresident RANDOM mappings.
+ */
+int index_shard_config_exact_demand_pass(
+    int detached_completion,
+    int payload_io_width,
+    int mapped_population_supported,
+    int random_mmap_advice,
+    size_t filename_indexes,
+    size_t loaded_indexes,
+    int full_cohort_resident);
+
+/*
+ * When exact_demand is nonzero, bound simultaneous cold outer owners by
+ * detached delivery capacity. Surplus compute threads remain available to
+ * execute staged work. Resident and loaded-index passes use the full outer
+ * width. Without detached completion, retain the fixed-helper policy.
  */
 int index_shard_config_plan_widths(
     int worker_count,
     int payload_io_width,
     int detached_completion,
+    int exact_demand,
     index_shard_width_plan_t *plan);
 
 #endif

@@ -307,7 +307,7 @@ static int print_match_records(
             return -1;
         }
         printf(
-            "AB_MATCH mode=%s pass=%i workers=%i "
+            "SOLVER_TEST_MATCH mode=%s pass=%i workers=%i "
             "first_object=%i last_object=%i "
             "digest=%016llx indexid=%i healpix=%i hpnside=%i "
             "parity=%i quad=%u max_field_object=%i\n",
@@ -340,7 +340,7 @@ static void print_result_record(
         result->best_valid ? &result->best : NULL;
 
     printf(
-        "AB_RESULT mode=%s pass=%i workers=%i "
+        "SOLVER_TEST_RESULT mode=%s pass=%i workers=%i "
         "first_object=%i last_object=%i "
         "indexes=%i solutions=%i cancelled=%i wall_limit=%i "
         "cpu_limit=%i failed=%i signature=%016llx",
@@ -391,7 +391,7 @@ static int print_wcs_record(
     if (!tan_read_header_file(wcs_path, &wcs)) {
         if (allow_missing) {
             printf(
-                "AB_WCS mode=%s pass=%i workers=%i "
+                "SOLVER_TEST_WCS mode=%s pass=%i workers=%i "
                 "first_object=%i last_object=%i none=1\n",
                 mode,
                 pass_number,
@@ -404,7 +404,7 @@ static int print_wcs_record(
         return -1;
     }
     printf(
-        "AB_WCS mode=%s pass=%i workers=%i "
+        "SOLVER_TEST_WCS mode=%s pass=%i workers=%i "
         "first_object=%i last_object=%i "
         "crval=%.17g,%.17g crpix=%.17g,%.17g "
         "cd=%.17g,%.17g,%.17g,%.17g\n",
@@ -904,19 +904,19 @@ int main(int argc, char** argv) {
         fprintf(stderr, "unknown mode: %s\n", mode);
         return 2;
     }
-    cancel_file = getenv("AB_CANCEL_FILE");
+    cancel_file = getenv("SOLVER_TEST_CANCEL_FILE");
     if (!strcmp(mode, "cancel") &&
         (!cancel_file || !cancel_file[0])) {
         fprintf(
             stderr,
-            "cancel mode requires AB_CANCEL_FILE\n");
+            "cancel mode requires SOLVER_TEST_CANCEL_FILE\n");
         return 2;
     }
     wall_limit_status = parse_positive_double_env(
-        "AB_TOTAL_WALL_LIMIT",
+        "SOLVER_TEST_TOTAL_WALL_LIMIT",
         &total_wall_limit);
     cpu_limit_status = parse_positive_double_env(
-        "AB_TOTAL_CPU_LIMIT",
+        "SOLVER_TEST_TOTAL_CPU_LIMIT",
         &total_cpu_limit);
     if (wall_limit_status < 0 || cpu_limit_status < 0) {
         return 2;
@@ -926,18 +926,18 @@ int main(int argc, char** argv) {
         !cpu_limit_status) {
         fprintf(
             stderr,
-            "limit mode requires AB_TOTAL_WALL_LIMIT or "
-            "AB_TOTAL_CPU_LIMIT\n");
+            "limit mode requires SOLVER_TEST_TOTAL_WALL_LIMIT or "
+            "SOLVER_TEST_TOTAL_CPU_LIMIT\n");
         return 2;
     }
     if (!strcmp(mode, "multipass")) {
         if (parse_positive_int(
-                getenv("AB_SECOND_FIRST_OBJECT"),
-                "AB_SECOND_FIRST_OBJECT",
+                getenv("SOLVER_TEST_SECOND_FIRST_OBJECT"),
+                "SOLVER_TEST_SECOND_FIRST_OBJECT",
                 &second_first_object) ||
             parse_positive_int(
-                getenv("AB_SECOND_LAST_OBJECT"),
-                "AB_SECOND_LAST_OBJECT",
+                getenv("SOLVER_TEST_SECOND_LAST_OBJECT"),
+                "SOLVER_TEST_SECOND_LAST_OBJECT",
                 &second_last_object) ||
             second_last_object < second_first_object) {
             fprintf(
@@ -1027,9 +1027,9 @@ int main(int argc, char** argv) {
          pass_number++) {
         if (pass_number == 2) {
             if (touch_before_second_pass(
-                    "AB_TOUCH_FIELD_BEFORE_SECOND") ||
+                    "SOLVER_TEST_TOUCH_FIELD_BEFORE_SECOND") ||
                 touch_before_second_pass(
-                    "AB_TOUCH_INDEX_BEFORE_SECOND")) {
+                    "SOLVER_TEST_TOUCH_INDEX_BEFORE_SECOND")) {
                 result = 1;
                 goto cleanup;
             }

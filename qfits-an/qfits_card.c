@@ -235,16 +235,20 @@ char* qfits_getkey_r(const char* line, char* key)
     memset(key, 0, 81);
     /* General case: look for the first equal sign */
     i=0;
-    while (line[i]!='=' && i<80) i++;
+    while (i < FITS_LINESZ && line[i] != '=') {
+        i++;
+    }
     if (i>=80) {
         qfits_error("qfits_getkey: cannot find equal sign in line: \"%.80s\"", line);
         return NULL;
     }
     i--;
     /* Equal sign found, now backtrack on blanks */
-    while (line[i]==' ' && i>=0) i--;
+    while (i >= 0 && line[i] == ' ') {
+        i--;
+    }
     if (i<0) {
-        qfits_error("qfits_getkey: error backtracking on blanks in line: \"%s\"\n", line);
+        qfits_error("qfits_getkey: error backtracking on blanks in line: \"%.80s\"\n", line);
         return NULL;
     }
     i++;
@@ -252,7 +256,7 @@ char* qfits_getkey_r(const char* line, char* key)
     /* Copy relevant characters into output buffer */
     strncpy(key, line, i);
     /* Null-terminate the string */
-    key[i+1] = '\0';
+    key[i] = '\0';
     return key;
 }
 

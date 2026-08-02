@@ -135,13 +135,20 @@ struct fitsbin_chunk_t {
     // The mmap'ed size.
     size_t mapsize;
 
+    /*
+     * Recent bounded-delivery sequence for each exact VMA page. These
+     * entries contain no payload data and expire after one service window.
+     */
+    unsigned int* payload_page_sequences;
+
     // Access-pattern class used when applying mmap advice.
     fitsbin_mmap_region_t mmap_region;
 
     /*
      * Exact file interval occupied by the table payload.  Unlike map/mapsize,
-     * this excludes mmap alignment and FITS padding. V20 uses it to translate
-     * proven mapped addresses into bounded page intervals and test reads.
+     * this excludes mmap alignment and FITS padding. The payload provider uses
+     * it to translate proven mapped addresses into bounded page intervals and
+     * test reads.
      */
     off_t data_file_offset;
     size_t data_file_size;
@@ -314,6 +321,13 @@ typedef enum fitsbin_payload_io_priority {
     FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
     FITSBIN_PAYLOAD_IO_PRIORITY_SPECULATIVE
 } fitsbin_payload_io_priority_t;
+
+typedef enum fitsbin_payload_io_submit_status {
+    FITSBIN_PAYLOAD_IO_SUBMIT_ERROR = -1,
+    FITSBIN_PAYLOAD_IO_SUBMIT_UNAVAILABLE = 0,
+    FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED = 1,
+    FITSBIN_PAYLOAD_IO_SUBMIT_READY = 2
+} fitsbin_payload_io_submit_status_t;
 
 typedef struct fitsbin_payload_io_stats {
     unsigned long long read_calls;
@@ -515,9 +529,13 @@ int fitsbin_prefetch_ranges(
  * fitsbin_configure_index_mmap(). The ticket copies validated page-aligned
  * spans but borrows the fitsbin owner and its mappings.
  *
- * Return 1 when queued, zero when the optional service or bounded capacity is
- * unavailable, and -1 for an invalid or failed preparation. The caller must
- * keep every source mapping live through blocking or polled collection before
+ * Return FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED with a ticket when queued,
+ * FITSBIN_PAYLOAD_IO_SUBMIT_READY without a ticket when the exact live-mapping
+ * completion record already covers every requested page, zero when the
+ * optional service or bounded capacity is unavailable, and -1 for an invalid
+ * or failed preparation. READY does not pin pages; the native mapped read
+ * remains authoritative if the kernel has reclaimed one. The caller must keep
+ * every source mapping live through blocking or polled collection before
  * closing the source fitsbin. A fully resident source returns zero without
  * creating a ticket. On a zero return caused by the service, errno
  * distinguishes ENODEV, transient admission refusal EAGAIN, and permanent
@@ -572,6 +590,32 @@ int fitsbin_payload_io_ticket_cancel_and_wait(
 int fitsbin_payload_io_ticket_poll(
     fitsbin_t* fb,
     fitsbin_payload_io_ticket_t* ticket,
+    int* result_out);
+
+/*
+ * Poll a ticket and, when terminal, atomically transfer its result and destroy
+ * its storage before returning success. A zero return leaves *ticket_io
+ * unchanged. A positive return sets *ticket_io to NULL and stores the
+ * provider result in *result_out. A negative return is an ownership or API
+ * integrity error and leaves *ticket_io unchanged; it is not a retryable
+ * capacity refusal. This is the preferred operation for a scheduler that must
+ * not release its source lease before ticket ownership is gone.
+ */
+int fitsbin_payload_io_ticket_poll_and_destroy(
+    fitsbin_t* fb,
+    fitsbin_payload_io_ticket_t** ticket_io,
+    int* result_out);
+
+/*
+ * Take exclusive owner responsibility for one ticket. A registered waiter is
+ * drained through its final result accounting; otherwise pending work is
+ * cancelled and drained. Then destroy the ticket and set *ticket_io to NULL.
+ * Return one after terminal transfer and minus one for invalid ownership. The
+ * source must remain live until this function returns.
+ */
+int fitsbin_payload_io_ticket_drain_and_destroy(
+    fitsbin_t* fb,
+    fitsbin_payload_io_ticket_t** ticket_io,
     int* result_out);
 
 /*

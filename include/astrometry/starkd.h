@@ -222,7 +222,9 @@ int startree_prepare_stars(startree_t* s,
 /*
  * Submit a complete bounded set of StarKD coordinate rows to the payload
  * loader. The returned ticket must be waited or cancelled before the tree is
- * closed. Refusal leaves the original mapped lookup authoritative.
+ * closed. FITSBIN_PAYLOAD_IO_SUBMIT_READY returns without a ticket when the
+ * exact live-mapping completion record already covers every requested page.
+ * Refusal leaves the original mapped lookup authoritative.
  */
 int startree_prefetch_stars_submit(
     startree_t* s,
@@ -233,7 +235,8 @@ int startree_prefetch_stars_submit(
 /*
  * Submit exact StarKD rows only when canonical IDs already have an immutable
  * data-index mapping. Unlike startree_prefetch_stars_submit(), this helper
- * never constructs or publishes the lazy inverse permutation.
+ * never constructs or publishes the lazy inverse permutation. It uses the
+ * same queued-versus-immediate-ready return contract.
  */
 int startree_prefetch_stars_ready_submit(
     const startree_t* s,

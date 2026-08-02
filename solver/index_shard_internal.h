@@ -141,9 +141,6 @@ anbool index_shard_trace_enabled(void);
 /* True only while the calling thread is executing a shard worker task. */
 anbool index_shard_worker_context_active(void);
 
-/* Focused unit seam for exact prepared-index ownership transfer. */
-int onefield_job_index_cache_test_handoff_state(void);
-
 /*
  * Lock-free cooperative-stop check for hot solver boundaries.
  * This is meaningful only while the calling thread owns a shard task.
@@ -380,6 +377,8 @@ typedef struct index_shard_staged_ops {
   index_shard_staged_cancel_fn cancel;
   index_shard_staged_execute_fn execute;
   index_shard_staged_execute_fn owner;
+  /* Safe to collect a notified terminal ticket on its delivery lane. */
+  anbool terminal_poll_inline_safe;
 } index_shard_staged_ops_t;
 
 typedef struct index_shard_staged_task {
@@ -476,15 +475,5 @@ index_shard_solve(onefield_t *bp,
                   solver_t *base_sp,
                   size_t nindexes,
                   const index_shard_hooks_t *hooks);
-
-/*
- * Apply reducer-owned traversal deltas atomically. A signed counter boundary
- * is a deterministic execution failure; no counter is partially updated.
- */
-int solver_ab_checked_counter_delta(
-    solver_t* solver,
-    unsigned long long numtries,
-    unsigned long long cxdx,
-    unsigned long long meanx);
 
 #endif

@@ -14,11 +14,7 @@
 #include "permutedsort.h"
 #include "quad-utils.h"
 #include "log.h"
-
-/* Emitted only by solver_test_2.o for bounded verification storage. */
-int solver_test_verification_packet_bounds(void);
-int solver_test_candidate_nonresident_zero_submit_falls_back(void);
-int solver_test_candidate_rolling_windows(void);
+#include "solver_codekd_test_private.h"
 
 static int compare_n(const void* v1, const void* v2, int N) {
     const int* u1 = v1;

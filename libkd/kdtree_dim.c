@@ -12,7 +12,6 @@
 #include "kdtree.h"
 #include "kdtree_internal.h"
 #include "kdtree_prefetch_internal.h"
-#include "kdtree_product_internal.h"
 
 KD_DECLARE(kdtree_build_2, kdtree_t*, (kdtree_t* kd, void *data, int N, int D, int Nleaf, int treetype, unsigned int options, double* minval, double* maxval));
 
@@ -53,32 +52,6 @@ kdtree_qres_t* KDFUNC(kdtree_rangesearch_options_reuse)
     return kd->fun.rangesearch(kd, res, pt, maxd2, options);
 }
 
-KD_DECLARE(kdtree_rangesearch_options_reuse_product,
-           kdtree_qres_t*,
-           (const kdtree_t *kd,
-            kdtree_qres_t *res,
-            const void *pt,
-            double maxd2,
-            int options,
-            const kdtree_task_executor_t *executor));
-
-kdtree_qres_t* KDFUNC(kdtree_rangesearch_options_reuse_product)
-     (const kdtree_t *kd,
-      kdtree_qres_t *res,
-      const void *pt,
-      double maxd2,
-      int options,
-      const kdtree_task_executor_t *executor) {
-    if (!kd)
-        return NULL;
-
-    KD_DISPATCH(kdtree_rangesearch_options_reuse_product,
-                kd->treetype,
-                res=,
-                (kd, res, pt, maxd2, options, executor));
-
-    return res;
-}
 
 KD_DECLARE(kdtree_rangesearch_prefetch_prepare,
            int,
