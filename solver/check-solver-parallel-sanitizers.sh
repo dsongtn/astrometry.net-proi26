@@ -209,16 +209,18 @@ assert_map() {
 }
 
 assert_map \
-    asan streaming test-solver-streaming-asan libastrometry-test-streaming-asan \
+    asan test_streaming test-solver-streaming-asan \
+    libastrometry-test-streaming-asan \
     solver_hypothesis
 assert_map \
-    tsan streaming test-solver-streaming-tsan libastrometry-test-streaming-tsan \
+    tsan test_streaming test-solver-streaming-tsan \
+    libastrometry-test-streaming-tsan \
     solver_hypothesis
 assert_map \
-    asan allocation_failure test-solver-allocation-failure-asan \
+    asan test_allocation_failure test-solver-allocation-failure-asan \
     libastrometry-test-allocation-failure-asan solver_codekd_delivery
 assert_map \
-    tsan allocation_failure test-solver-allocation-failure-tsan \
+    tsan test_allocation_failure test-solver-allocation-failure-tsan \
     libastrometry-test-allocation-failure-tsan solver_codekd_delivery
 
 run_logged() {

@@ -355,8 +355,11 @@ typedef struct fitsbin_payload_io_stats {
 void fitsbin_payload_io_configure_workers(int worker_count);
 
 /*
- * Start or stop the bounded payload loader. The service is advisory: callers
- * retain their original synchronous path when startup or submission fails.
+ * Start or stop the bounded payload loader. The requested positive width is
+ * bounded by the service job ceiling. Starting a live service succeeds
+ * without resizing it; fitsbin_payload_io_service_width() reports the actual
+ * live width. The service is advisory: callers retain their original
+ * synchronous path when startup or submission fails.
  */
 int fitsbin_payload_io_service_start(int lane_count);
 void fitsbin_payload_io_service_stop(void);
@@ -526,8 +529,9 @@ int fitsbin_prefetch_ranges(
 /*
  * Submit one complete current-index mapped-page population to the bounded
  * loader. The source must first be initialized by
- * fitsbin_configure_index_mmap(). The ticket copies validated page-aligned
- * spans but borrows the fitsbin owner and its mappings.
+ * fitsbin_configure_index_mmap(). The ticket copies the logical ranges and
+ * refreshes its validated page-aligned spans on the I/O lane. It borrows the
+ * fitsbin owner and its mappings.
  *
  * Return FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED with a ticket when queued,
  * FITSBIN_PAYLOAD_IO_SUBMIT_READY without a ticket when the exact live-mapping
@@ -555,7 +559,8 @@ int fitsbin_prefetch_ranges_submit(
  * reach must remain alive and exclusively owned by the ticket until terminal
  * collection. An empty successful plan collects as a positive logical result
  * and does not increment mapped-warm counters. Refusal and failure leave the
- * native mapped path authoritative.
+ * native mapped path authoritative. A fully resident source returns zero
+ * without creating a ticket or invoking the planner.
  */
 int fitsbin_prefetch_ranges_planned_submit(
     fitsbin_t* fb,

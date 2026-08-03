@@ -36,6 +36,12 @@
 #include "solver_inline_internal.h"
 #include "solver_hypothesis_internal.h"
 #include "../libkd/kdtree_prefetch_internal.h"
+
+static anbool solver_codekd_owner_plan_cancelled(void* opaque) {
+    (void)opaque;
+    return index_shard_worker_stop_requested();
+}
+
 /*
  * Return zero when the bounded output arena is ready, one for an exact native
  * fallback, and minus one for an invalid packet request.
@@ -197,74 +203,44 @@ solver_codekd_packet_generate_descriptors(
     return INDEX_SHARD_HELPER_TASK_OK;
 }
 
-static int solver_codekd_packet_mark_plan_owner_replay(
-    solver_codekd_search_packet_t* packet,
-    solver_codekd_page_plan_reason_t reason) {
-    size_t descriptor_index;
-
-    if (!packet || !packet->plan_complete ||
-        packet->plan_first >= packet->plan_end ||
-        packet->plan_end > packet->count) {
-        return -1;
-    }
-    for (descriptor_index = packet->plan_first;
-         descriptor_index < packet->plan_end;
-         descriptor_index++) {
-        if (packet->slots[descriptor_index].state !=
-            SOLVER_CODEKD_RESULT_UNUSED) {
-            return -1;
-        }
-        packet->slots[descriptor_index].state =
-            SOLVER_CODEKD_RESULT_OWNER_REPLAY;
-    }
-    solver_codekd_page_plan_record_refusal(packet, reason);
-    packet->plan_complete = FALSE;
-    packet->plan_first = 0U;
-    packet->plan_end = 0U;
-    packet->plan_range_count = 0U;
-    packet->plan_logical_bytes = 0U;
-    packet->delivery_source = NULL;
-    packet->state = SOLVER_CODEKD_PACKET_DESCRIPTORS_READY;
-    return 0;
-}
-
 /*
- * A permanent pre-submission refusal invalidates the current sealed plan and
- * makes another plan attempt uneconomic. Preserve the exact logical work by
- * replaying the planned prefix and every still-unplanned descriptor at owner
- * retirement.
+ * A permanent delivery refusal makes another plan attempt uneconomic.
+ * Preserve every unfinished logical descriptor through exact owner replay.
  */
 static int solver_codekd_packet_mark_outstanding_owner_replay(
     solver_codekd_search_packet_t* packet,
     solver_codekd_page_plan_reason_t reason) {
     size_t descriptor_index;
 
-    if (!packet || !packet->plan_complete ||
-        packet->state != SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE ||
-        packet->plan_first >= packet->plan_end ||
-        packet->plan_end > packet->next_descriptor ||
-        packet->next_descriptor > packet->count) {
+    if (!packet || !packet->slots || packet->delivery_ticket ||
+        packet->next_descriptor > packet->count ||
+        (packet->state != SOLVER_CODEKD_PACKET_DESCRIPTORS_READY &&
+         packet->state !=
+             SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED &&
+         packet->state !=
+             SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE)) {
         return -1;
     }
-    for (descriptor_index = packet->plan_first;
-         descriptor_index < packet->plan_end;
-         descriptor_index++) {
-        if (packet->slots[descriptor_index].state !=
-            SOLVER_CODEKD_RESULT_UNUSED) {
-            return -1;
-        }
+    if (packet->state == SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE &&
+        (!packet->plan_complete ||
+         packet->plan_first >= packet->plan_end ||
+         packet->plan_end > packet->next_descriptor)) {
+        return -1;
     }
-    for (descriptor_index = packet->plan_end;
+    for (descriptor_index = 0U;
          descriptor_index < packet->count;
          descriptor_index++) {
-        if (packet->slots[descriptor_index].state !=
-                SOLVER_CODEKD_RESULT_UNUSED &&
-            packet->slots[descriptor_index].state !=
-                SOLVER_CODEKD_RESULT_OWNER_REPLAY) {
+        solver_codekd_result_state_t state =
+            packet->slots[descriptor_index].state;
+
+        if (state != SOLVER_CODEKD_RESULT_UNUSED &&
+            state != SOLVER_CODEKD_RESULT_READY &&
+            state != SOLVER_CODEKD_RESULT_OWNER_REPLAY &&
+            state != SOLVER_CODEKD_RESULT_QUERY_FAILED) {
             return -1;
         }
     }
-    for (descriptor_index = packet->plan_first;
+    for (descriptor_index = 0U;
          descriptor_index < packet->count;
          descriptor_index++) {
         if (packet->slots[descriptor_index].state ==
@@ -284,12 +260,15 @@ static int solver_codekd_packet_mark_outstanding_owner_replay(
     packet->plan_range_count = 0U;
     packet->plan_logical_bytes = 0U;
     packet->delivery_source = NULL;
-    packet->state = SOLVER_CODEKD_PACKET_DESCRIPTORS_READY;
+    packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
     return 0;
 }
 
-/* Return one when submitted, zero on bounded capacity, and minus one when
- * the complete packet must use exact owner replay. */
+/*
+ * Return two when resident planning makes the packet compute-ready, one when
+ * submitted, zero on bounded capacity, and minus one when the unfinished
+ * packet must use exact owner replay.
+ */
 int solver_codekd_packet_submit_pages(
     solver_codekd_search_packet_t* packet) {
     fitsbin_t* source;
@@ -298,14 +277,9 @@ int solver_codekd_packet_submit_pages(
     if (!packet || !packet->tree || !packet->tree->io ||
         !packet->tree->io_is_fitsbin || !packet->page_workspace ||
         packet->delivery_source || packet->delivery_ticket ||
-        packet->state != SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE ||
-        !packet->plan_complete ||
-        packet->plan_first >= packet->plan_end ||
-        packet->plan_end > packet->next_descriptor ||
-        packet->next_descriptor > packet->count ||
-        !packet->plan_range_count ||
-        packet->plan_range_count >
-            packet->page_workspace->sealed_range_capacity) {
+        packet->state != SOLVER_CODEKD_PACKET_DESCRIPTORS_READY ||
+        packet->next_descriptor >= packet->count ||
+        packet->plan_complete || packet->plan_range_count) {
         return -1;
     }
     if (index_shard_worker_stop_requested()) {
@@ -316,25 +290,56 @@ int solver_codekd_packet_submit_pages(
     }
     source = (fitsbin_t*)packet->tree->io;
     packet->delivery_source = source;
+    packet->state = SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED;
     errno = 0;
-    submit_status = fitsbin_prefetch_ranges_submit(
+    submit_status = fitsbin_prefetch_ranges_planned_submit(
         source,
-        packet->page_workspace->sealed_ranges,
-        packet->plan_range_count,
+        solver_codekd_packet_plan_codekd_pages,
+        packet,
         SOLVER_CODEKD_DELIVERY_BUDGET_BYTES,
         &packet->delivery_ticket);
-    if (submit_status == FITSBIN_PAYLOAD_IO_SUBMIT_READY &&
-        !packet->delivery_ticket) {
-        packet->delivery_source = NULL;
-        packet->state = SOLVER_CODEKD_PACKET_COMPUTE_READY;
-        return 2;
-    }
     if (submit_status > 0 && packet->delivery_ticket) {
         return 1;
     }
     packet->delivery_ticket = NULL;
     packet->delivery_source = NULL;
+    if (!submit_status && !errno &&
+        fitsbin_payload_is_fully_resident(source)) {
+        int plan_status =
+            solver_codekd_search_packet_prepare_next_plan(
+                packet,
+                solver_codekd_owner_plan_cancelled,
+                NULL);
+
+        if (plan_status == 1 &&
+            packet->state ==
+                SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE &&
+            packet->plan_complete &&
+            packet->plan_first < packet->plan_end &&
+            packet->plan_end <= packet->next_descriptor &&
+            packet->next_descriptor <= packet->count &&
+            packet->plan_range_count &&
+            packet->page_workspace &&
+            packet->plan_range_count <=
+                packet->page_workspace->sealed_range_capacity) {
+            packet->state = SOLVER_CODEKD_PACKET_COMPUTE_READY;
+            return 2;
+        }
+        if (!plan_status &&
+            packet->state == SOLVER_CODEKD_PACKET_RESULTS_READY &&
+            !packet->plan_complete &&
+            packet->next_descriptor == packet->count) {
+            return -1;
+        }
+        if (plan_status == 2 &&
+            packet->state == SOLVER_CODEKD_PACKET_STOPPED) {
+            return -1;
+        }
+        packet->state = SOLVER_CODEKD_PACKET_FAILED;
+        return -1;
+    }
     if (!submit_status && errno == EAGAIN) {
+        packet->state = SOLVER_CODEKD_PACKET_DESCRIPTORS_READY;
         return 0;
     }
     if (index_shard_worker_stop_requested()) {
@@ -343,7 +348,8 @@ int solver_codekd_packet_submit_pages(
             packet, SOLVER_CODEKD_PAGE_PLAN_CANCELLED);
         return -1;
     }
-    if (solver_codekd_packet_mark_outstanding_owner_replay(
+    if ((submit_status > 0 && !packet->delivery_ticket) ||
+        solver_codekd_packet_mark_outstanding_owner_replay(
             packet,
             submit_status < 0
                 ? SOLVER_CODEKD_PAGE_PLAN_SERVICE_ERROR
@@ -1135,10 +1141,9 @@ int solver_codekd_packet_collect_pages(
         return -1;
     }
     /*
-     * Verification planned-ticket output is owned by the I/O lane until
-     * terminal publication. Poll's payload_io mutex edge makes those state
-     * writes visible here. Initial CodeKD tickets use an immutable sealed
-     * plan, so their packet remains PAGE_PLAN_COMPLETE while queued.
+     * Planned-ticket output is owned by the I/O lane until terminal
+     * publication. Poll's payload_io mutex edge makes those state writes
+     * visible here.
      */
     io_state = packet->state;
     assert(!packet->delivery_ticket);
@@ -1247,16 +1252,17 @@ int solver_codekd_packet_collect_pages(
         packet->state = SOLVER_CODEKD_PACKET_COMPUTE_READY;
         return 1;
     }
-    if (ticket_result < 0 && packet->plan_complete &&
-        packet->state == SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE) {
-        if (solver_codekd_packet_mark_plan_owner_replay(
+    if (ticket_result < 0 &&
+        (packet->state ==
+             SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED ||
+         packet->state ==
+             SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE)) {
+        if (solver_codekd_packet_mark_outstanding_owner_replay(
                 packet, SOLVER_CODEKD_PAGE_PLAN_SERVICE_ERROR)) {
             packet->state = SOLVER_CODEKD_PACKET_FAILED;
             return -1;
         }
-        return packet->state == SOLVER_CODEKD_PACKET_RESULTS_READY
-            ? 3
-            : 2;
+        return 3;
     }
     packet->delivery_source = NULL;
     packet->state = SOLVER_CODEKD_PACKET_FAILED;

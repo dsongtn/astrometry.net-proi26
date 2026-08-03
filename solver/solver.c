@@ -1018,6 +1018,7 @@ static int solver_ab_descriptor_execute_phase(
     size_t staged_capacity;
     size_t compute_width;
     size_t participants;
+    size_t packet_capacity;
     size_t expansion;
     size_t max_task_combinations;
     anbool assisted = FALSE;
@@ -1053,6 +1054,11 @@ static int solver_ab_descriptor_execute_phase(
     if (!participants) {
         return 0;
     }
+    packet_capacity = participants;
+    if (SOLVER_CODEKD_LOOKAHEAD_WAVES > 1U &&
+        participants <= staged_capacity / 2U) {
+        packet_capacity = participants * 2U;
+    }
     expansion = solver_ab_descriptor_expansion(
         dimquads,
         solver->parity);
@@ -1068,10 +1074,17 @@ static int solver_ab_descriptor_execute_phase(
     }
 
     workspace = solver_ab_descriptor_workspace_get();
-    if (!workspace ||
-        solver_ab_descriptor_workspace_reserve_outputs(
-            workspace, participants)) {
+    if (!workspace) {
         return 0;
+    }
+    if (solver_ab_descriptor_workspace_reserve_outputs(
+            workspace, packet_capacity)) {
+        if (packet_capacity == participants ||
+            solver_ab_descriptor_workspace_reserve_outputs(
+                workspace, participants)) {
+            return 0;
+        }
+        packet_capacity = participants;
     }
     planner = &workspace->planner;
     planner->snapshot.codetol = solver->codetol;
@@ -1101,7 +1114,11 @@ static int solver_ab_descriptor_execute_phase(
         solver_ab_descriptor_release_pairs(workspace);
         return 0;
     }
-    wave = solver_codekd_packet_wave_create(participants);
+    wave = solver_codekd_packet_wave_create(packet_capacity);
+    if (!wave && packet_capacity > participants) {
+        packet_capacity = participants;
+        wave = solver_codekd_packet_wave_create(packet_capacity);
+    }
     if (!wave) {
         solver_ab_descriptor_release_pairs(workspace);
         return 0;
@@ -1113,20 +1130,18 @@ static int solver_ab_descriptor_execute_phase(
         index_shard_staged_task_t* tasks = wave->tasks;
         unsigned long long remaining =
             total_combinations - combination_cursor;
-        unsigned long long wave_capacity =
+        unsigned long long window_capacity =
             (unsigned long long)max_task_combinations *
             (unsigned long long)participants;
-        unsigned long long wave_combinations =
-            MIN(remaining, wave_capacity);
-        unsigned long long base;
-        unsigned long long remainder;
+        unsigned long long window_combinations[
+            SOLVER_CODEKD_MAX_LOOKAHEAD_WAVES] = { 0ULL };
+        size_t window_task_counts[
+            SOLVER_CODEKD_MAX_LOOKAHEAD_WAVES] = { 0U };
+        unsigned long long wave_combinations = 0ULL;
         unsigned long long task_cursor = combination_cursor;
-        size_t task_count =
-            solver_ab_descriptor_partition_count(
-                wave_combinations,
-                expansion,
-                max_task_combinations,
-                participants);
+        size_t task_count = 0U;
+        size_t window_count = 1U;
+        size_t window_index;
         size_t task_index;
         size_t candidate_budget_per_task;
         size_t prepared_packets = 0U;
@@ -1138,25 +1153,56 @@ static int solver_ab_descriptor_execute_phase(
         anbool wave_assisted = FALSE;
         unsigned long long reduced_before = reduced;
 
-        if (!task_count) {
+        window_combinations[0] = MIN(remaining, window_capacity);
+        window_task_counts[0] =
+            solver_ab_descriptor_partition_count(
+                window_combinations[0],
+                expansion,
+                max_task_combinations,
+                participants);
+        if (packet_capacity > participants &&
+            remaining > window_combinations[0]) {
+            window_combinations[1] = MIN(
+                remaining - window_combinations[0],
+                window_capacity);
+            window_task_counts[1] =
+                solver_ab_descriptor_partition_count(
+                    window_combinations[1],
+                    expansion,
+                    max_task_combinations,
+                    participants);
+            window_count = 2U;
+        }
+        for (window_index = 0U;
+             window_index < window_count;
+             window_index++) {
+            if (!window_task_counts[window_index] ||
+                window_task_counts[window_index] > packet_capacity ||
+                task_count > packet_capacity -
+                    window_task_counts[window_index]) {
+                result = -1;
+                goto fail;
+            }
+            task_count += window_task_counts[window_index];
+            wave_combinations +=
+                window_combinations[window_index];
+        }
+        if (!task_count || task_count > packet_capacity ||
+            !wave_combinations) {
             result = -1;
             goto fail;
         }
         candidate_budget_per_task =
             solver_verification_wave_memory_budget() / task_count;
-        base = wave_combinations /
-            (unsigned long long)task_count;
-        remainder = wave_combinations %
-            (unsigned long long)task_count;
         memset(
             inputs, 0,
-            participants * sizeof(*inputs));
+            packet_capacity * sizeof(*inputs));
         memset(
             packets, 0,
-            participants * sizeof(*packets));
+            packet_capacity * sizeof(*packets));
         memset(
             tasks, 0,
-            participants * sizeof(*tasks));
+            packet_capacity * sizeof(*tasks));
         memset(&run_stats, 0, sizeof(run_stats));
         memset(&retire_context, 0, sizeof(retire_context));
         retire_context.solver = solver;
@@ -1165,88 +1211,114 @@ static int solver_ab_descriptor_execute_phase(
         retire_context.reduced = &reduced;
         retire_context.next_sequence = combination_cursor;
 
-        for (task_index = 0U;
-             task_index < task_count;
-             task_index++) {
-            solver_ab_descriptor_task_input_t* descriptor_input =
-                &inputs[task_index].descriptor;
-            unsigned long long task_combinations =
-                base + (task_index < remainder ? 1U : 0U);
-            unsigned long long work_units;
+        task_index = 0U;
+        for (window_index = 0U;
+             window_index < window_count;
+             window_index++) {
+            unsigned long long base =
+                window_combinations[window_index] /
+                (unsigned long long)window_task_counts[window_index];
+            unsigned long long remainder =
+                window_combinations[window_index] %
+                (unsigned long long)window_task_counts[window_index];
+            size_t window_task_index;
 
-            if (!task_combinations ||
-                task_combinations > max_task_combinations) {
-                result = -1;
-                goto fail;
-            }
-            descriptor_input->field_geometry = field_geometry;
-            descriptor_input->pairs = pairs;
-            descriptor_input->pair_count = pair_count;
-            descriptor_input->combination_first = task_cursor;
-            task_cursor += task_combinations;
-            descriptor_input->combination_end = task_cursor;
-            descriptor_input->phase = phase;
-            descriptor_input->newpoint = newpoint;
-            descriptor_input->dimquads = dimquads;
-            descriptor_input->parity = solver->parity;
-            descriptor_input->cx_less_than_dx =
-                solver->index->cx_less_than_dx;
-            descriptor_input->meanx_less_than_half =
-                solver->index->meanx_less_than_half;
-            descriptor_input->cxdx_margin = solver->cxdx_margin;
-            inputs[task_index].tree = code_tree;
-            inputs[task_index].quads = solver->index->quads;
-            inputs[task_index].starkd = solver->index->starkd;
-            inputs[task_index].detailed = solver->profile.detailed;
-            inputs[task_index].use_radec = solver->use_radec;
-            inputs[task_index].field_minx = solver->field_minx;
-            inputs[task_index].field_maxx = solver->field_maxx;
-            inputs[task_index].field_miny = solver->field_miny;
-            inputs[task_index].field_maxy = solver->field_maxy;
-            inputs[task_index].abscale_low = solver->abscale_low;
-            inputs[task_index].abscale_high = solver->abscale_high;
-            inputs[task_index].funits_lower = solver->funits_lower;
-            inputs[task_index].funits_upper = solver->funits_upper;
-            if (solver->mo_template) {
-                memcpy(
-                    &inputs[task_index].verification.match_template,
-                    solver->mo_template,
-                    sizeof(*solver->mo_template));
-            }
-            inputs[task_index].verification.field = solver->vf;
-            inputs[task_index].verification.index_cutnside =
-                solver->index->cutnside;
-            inputs[task_index].verification.indexid =
-                solver->index->indexid;
-            inputs[task_index].verification.healpix =
-                solver->index->healpix;
-            inputs[task_index].verification.hpnside =
-                solver->index->hpnside;
-            inputs[task_index].verification.index_jitter =
-                solver->index->index_jitter;
-            inputs[task_index].verification.verify_pix =
-                solver->verify_pix;
-            inputs[task_index].verification.distractor_ratio =
-                solver->distractor_ratio;
-            inputs[task_index].verification.logratio_bail_threshold =
-                solver->logratio_bail_threshold;
-            inputs[task_index].verification.logaccept = MIN(
-                solver->logratio_tokeep,
-                solver->logratio_totune);
-            inputs[task_index].verification.logratio_stoplooking =
-                solver->logratio_stoplooking;
-            inputs[task_index].verification.distance_from_quad_bonus =
-                solver->distance_from_quad_bonus;
-            inputs[task_index].verification.enabled =
-                solver->vf && !verify_datalog_enabled();
+            for (window_task_index = 0U;
+                 window_task_index <
+                    window_task_counts[window_index];
+                 window_task_index++, task_index++) {
+                solver_ab_descriptor_task_input_t* descriptor_input =
+                    &inputs[task_index].descriptor;
+                unsigned long long task_combinations =
+                    base +
+                    (window_task_index < remainder ? 1U : 0U);
+                unsigned long long work_units;
 
-            work_units = task_combinations *
-                (unsigned long long)expansion;
-            tasks[task_index].input = &inputs[task_index];
-            tasks[task_index].input_bytes = sizeof(inputs[task_index]);
-            tasks[task_index].output = &packets[task_index];
-            tasks[task_index].output_bytes = sizeof(packets[task_index]);
-            tasks[task_index].work_units = work_units;
+                if (!task_combinations ||
+                    task_combinations > max_task_combinations) {
+                    result = -1;
+                    goto fail;
+                }
+                descriptor_input->field_geometry = field_geometry;
+                descriptor_input->pairs = pairs;
+                descriptor_input->pair_count = pair_count;
+                descriptor_input->combination_first = task_cursor;
+                task_cursor += task_combinations;
+                descriptor_input->combination_end = task_cursor;
+                descriptor_input->phase = phase;
+                descriptor_input->newpoint = newpoint;
+                descriptor_input->dimquads = dimquads;
+                descriptor_input->parity = solver->parity;
+                descriptor_input->cx_less_than_dx =
+                    solver->index->cx_less_than_dx;
+                descriptor_input->meanx_less_than_half =
+                    solver->index->meanx_less_than_half;
+                descriptor_input->cxdx_margin = solver->cxdx_margin;
+                inputs[task_index].tree = code_tree;
+                inputs[task_index].quads = solver->index->quads;
+                inputs[task_index].starkd = solver->index->starkd;
+                inputs[task_index].detailed =
+                    solver->profile.detailed;
+                inputs[task_index].use_radec = solver->use_radec;
+                inputs[task_index].field_minx = solver->field_minx;
+                inputs[task_index].field_maxx = solver->field_maxx;
+                inputs[task_index].field_miny = solver->field_miny;
+                inputs[task_index].field_maxy = solver->field_maxy;
+                inputs[task_index].abscale_low = solver->abscale_low;
+                inputs[task_index].abscale_high = solver->abscale_high;
+                inputs[task_index].funits_lower = solver->funits_lower;
+                inputs[task_index].funits_upper = solver->funits_upper;
+                if (solver->mo_template) {
+                    memcpy(
+                        &inputs[task_index]
+                            .verification.match_template,
+                        solver->mo_template,
+                        sizeof(*solver->mo_template));
+                }
+                inputs[task_index].verification.field = solver->vf;
+                inputs[task_index].verification.index_cutnside =
+                    solver->index->cutnside;
+                inputs[task_index].verification.indexid =
+                    solver->index->indexid;
+                inputs[task_index].verification.healpix =
+                    solver->index->healpix;
+                inputs[task_index].verification.hpnside =
+                    solver->index->hpnside;
+                inputs[task_index].verification.index_jitter =
+                    solver->index->index_jitter;
+                inputs[task_index].verification.verify_pix =
+                    solver->verify_pix;
+                inputs[task_index].verification.distractor_ratio =
+                    solver->distractor_ratio;
+                inputs[task_index]
+                    .verification.logratio_bail_threshold =
+                    solver->logratio_bail_threshold;
+                inputs[task_index].verification.logaccept = MIN(
+                    solver->logratio_tokeep,
+                    solver->logratio_totune);
+                inputs[task_index]
+                    .verification.logratio_stoplooking =
+                    solver->logratio_stoplooking;
+                inputs[task_index]
+                    .verification.distance_from_quad_bonus =
+                    solver->distance_from_quad_bonus;
+                inputs[task_index].verification.enabled =
+                    solver->vf && !verify_datalog_enabled();
+
+                work_units = task_combinations *
+                    (unsigned long long)expansion;
+                tasks[task_index].input = &inputs[task_index];
+                tasks[task_index].input_bytes =
+                    sizeof(inputs[task_index]);
+                tasks[task_index].output = &packets[task_index];
+                tasks[task_index].output_bytes =
+                    sizeof(packets[task_index]);
+                tasks[task_index].work_units = work_units;
+            }
+        }
+        if (task_index != task_count) {
+            result = -1;
+            goto fail;
         }
         if (task_cursor !=
             combination_cursor + wave_combinations) {
@@ -1254,38 +1326,95 @@ static int solver_ab_descriptor_execute_phase(
             goto fail;
         }
 
-        solver->profile.hypothesis_batches++;
-        solver->profile.task_ranges_planned += task_count;
-        solver->profile.task_ranges_submitted += task_count;
-        solver->profile.task_ranges_executed += task_count;
-        solver->profile.max_task_ranges = MAX(
-            solver->profile.max_task_ranges,
-            task_count);
-
         if (task_count) {
             int packet_prepare_status = 0;
+            anbool retried_normal_width = FALSE;
 
-            for (task_index = 0U;
-                 task_index < task_count;
-                 task_index++) {
-                packet_prepare_status =
-                    solver_codekd_search_packet_prepare(
-                        solver,
-                        &packets[task_index],
-                        &workspace->outputs[task_index],
-                        inputs[task_index].tree,
-                        inputs[task_index].quads,
-                        inputs[task_index].starkd,
-                        inputs[task_index].descriptor.dimquads,
-                        inputs[task_index].use_radec,
-                        candidate_budget_per_task,
-                        inputs[task_index].descriptor.combination_first,
-                        inputs[task_index].detailed);
-                if (packet_prepare_status) {
+            while (1) {
+                prepared_packets = 0U;
+                packet_prepare_status = 0;
+                for (task_index = 0U;
+                     task_index < task_count;
+                     task_index++) {
+                    packet_prepare_status =
+                        solver_codekd_search_packet_prepare(
+                            solver,
+                            &packets[task_index],
+                            &workspace->outputs[task_index],
+                            inputs[task_index].tree,
+                            inputs[task_index].quads,
+                            inputs[task_index].starkd,
+                            inputs[task_index].descriptor.dimquads,
+                            inputs[task_index].use_radec,
+                            candidate_budget_per_task,
+                            inputs[task_index]
+                                .descriptor.combination_first,
+                            inputs[task_index].detailed);
+                    if (packet_prepare_status) {
+                        break;
+                    }
+                    prepared_packets++;
+                }
+                if (packet_prepare_status <= 0 ||
+                    window_count == 1U ||
+                    retried_normal_width) {
                     break;
                 }
-                prepared_packets++;
+                solver->profile.allocation_failures++;
+                solver->profile.page_plan_allocation_refused++;
+                if (prepared_packets >= window_task_counts[0]) {
+                    for (task_index = window_task_counts[0];
+                         task_index < prepared_packets;
+                         task_index++) {
+                        if (solver_codekd_search_packet_cleanup(
+                                &packets[task_index])) {
+                            packet_cleanup_failed = TRUE;
+                        }
+                    }
+                    if (packet_cleanup_failed) {
+                        result = -1;
+                        goto fail;
+                    }
+                    prepared_packets = window_task_counts[0];
+                    window_count = 1U;
+                    task_count = window_task_counts[0];
+                    wave_combinations = window_combinations[0];
+                    task_cursor =
+                        combination_cursor + wave_combinations;
+                    packet_prepare_status = 0;
+                    break;
+                }
+                for (task_index = 0U;
+                     task_index < prepared_packets;
+                     task_index++) {
+                    if (solver_codekd_search_packet_cleanup(
+                            &packets[task_index])) {
+                        packet_cleanup_failed = TRUE;
+                    }
+                }
+                if (packet_cleanup_failed) {
+                    result = -1;
+                    goto fail;
+                }
+                window_count = 1U;
+                task_count = window_task_counts[0];
+                wave_combinations = window_combinations[0];
+                task_cursor =
+                    combination_cursor + wave_combinations;
+                candidate_budget_per_task =
+                    solver_verification_wave_memory_budget() /
+                    task_count;
+                retried_normal_width = TRUE;
             }
+
+            solver->profile.hypothesis_batches++;
+            solver->profile.task_ranges_planned += task_count;
+            solver->profile.task_ranges_submitted += task_count;
+            solver->profile.task_ranges_executed += task_count;
+            solver->profile.max_task_ranges = MAX(
+                solver->profile.max_task_ranges,
+                task_count);
+
             if (packet_prepare_status < 0) {
                 for (task_index = 0U;
                      task_index < prepared_packets;

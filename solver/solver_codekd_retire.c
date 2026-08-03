@@ -28,6 +28,38 @@
 #include "solver_inline_internal.h"
 #include "solver_hypothesis_internal.h"
 
+/*
+ * Continue owner retirement within an already captured physical topology
+ * prefix. Resetting the logical plan recomputes ownership bytes for every
+ * remaining query; the next query stage reuses captured records without
+ * submitting another payload ticket.
+ */
+int solver_codekd_packet_rearm_verification_owner(
+    solver_codekd_search_packet_t* packet) {
+    size_t topology_end;
+
+    if (!packet || !packet->candidate_records ||
+        !packet->verify_plan_complete ||
+        packet->candidate_window_offset != packet->verify_plan_end ||
+        packet->verify_plan_end > packet->verify_topology_end ||
+        packet->verify_topology_end > packet->candidate_window_count) {
+        return -1;
+    }
+    topology_end = packet->verify_topology_end;
+    solver_codekd_packet_reset_verify_plan(packet);
+    if (packet->candidate_window_offset < topology_end) {
+        packet->verify_plan_first = packet->candidate_window_offset;
+        packet->verify_plan_end = topology_end;
+        packet->verify_topology_end = topology_end;
+        packet->verify_plan_complete = TRUE;
+        packet->state =
+            SOLVER_CODEKD_PACKET_VERIFY_QUERY_COMPUTE_READY;
+    } else {
+        packet->state = SOLVER_CODEKD_PACKET_VERIFY_SUBMIT_READY;
+    }
+    return 0;
+}
+
 static index_shard_staged_retire_status_t
 solver_codekd_packet_retire_nonwindow_descriptor(
     solver_codekd_search_packet_t* packet,
@@ -400,9 +432,6 @@ solver_codekd_search_packet_retire_window(
                     packet->verify_plan_end &&
                 packet->candidate_window_offset <
                     packet->candidate_window_count) {
-                size_t topology_end =
-                    packet->verify_topology_end;
-
                 if (packet->retire_hit_offset ==
                     (size_t)slot->hit_count) {
                     context->solver->profile.hypotheses_reduced++;
@@ -411,19 +440,10 @@ solver_codekd_search_packet_retire_window(
                     packet->retire_hit_offset = 0U;
                     packet->retire_descriptor++;
                 }
-                solver_codekd_packet_reset_verify_plan(packet);
-                if (packet->candidate_window_offset <
-                    topology_end) {
-                    packet->verify_plan_first =
-                        packet->candidate_window_offset;
-                    packet->verify_plan_end = topology_end;
-                    packet->verify_topology_end = topology_end;
-                    packet->verify_plan_complete = TRUE;
-                    packet->state =
-                        SOLVER_CODEKD_PACKET_VERIFY_QUERY_COMPUTE_READY;
-                } else {
-                    packet->state =
-                        SOLVER_CODEKD_PACKET_VERIFY_SUBMIT_READY;
+                if (solver_codekd_packet_rearm_verification_owner(
+                        packet)) {
+                    packet->state = SOLVER_CODEKD_PACKET_FAILED;
+                    return INDEX_SHARD_STAGED_RETIRE_ERROR;
                 }
                 return INDEX_SHARD_STAGED_RETIRE_MORE;
             }

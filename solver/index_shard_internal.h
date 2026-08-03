@@ -336,7 +336,11 @@ typedef enum index_shard_staged_execute_status {
   INDEX_SHARD_STAGED_EXECUTE_ERROR = -1,
   INDEX_SHARD_STAGED_EXECUTE_OK = 0,
   INDEX_SHARD_STAGED_EXECUTE_STOPPED = 1,
-  INDEX_SHARD_STAGED_EXECUTE_MORE = 2
+  /* Re-enter prepare() because the next class is not yet known. */
+  INDEX_SHARD_STAGED_EXECUTE_MORE = 2,
+  INDEX_SHARD_STAGED_EXECUTE_SUBMIT_READY = 3,
+  INDEX_SHARD_STAGED_EXECUTE_COMPUTE_READY = 4,
+  INDEX_SHARD_STAGED_EXECUTE_OWNER_READY = 5
 } index_shard_staged_execute_status_t;
 
 typedef index_shard_staged_prepare_status_t

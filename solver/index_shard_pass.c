@@ -148,26 +148,41 @@ static int index_shard_pool_submit(
     return -1;
   }
   if (shared->helper_groups_active ||
+      shared->helper_ready_tasks ||
       shared->helper_preparations_active ||
       shared->helper_foreign_reservations ||
       shared->staged_groups_active ||
       shared->staged_tickets_active ||
       shared->staged_source_leases ||
+      shared->staged_prepare_ready ||
+      shared->staged_submit_ready ||
+      shared->staged_submit_waiting ||
+      shared->staged_submit_credit_ready ||
+      shared->staged_io_ready ||
       shared->staged_compute_ready ||
       shared->staged_reorder_ready ||
       shared->staged_compute_running_global ||
       shared->staged_submit_backpressure) {
     logerr("[index-shard] inner activity remained before pass "
-           "helper_groups=%zu preparations=%zu reservations=%zu "
+           "helper_groups=%zu helper_ready=%zu preparations=%zu "
+           "reservations=%zu "
            "staged_groups=%zu tickets=%zu leases=%zu "
-           "compute_ready=%zu reorder_ready=%zu "
+           "prepare_ready=%zu submit_ready=%zu submit_waiting=%zu "
+           "submit_credit=%zu io_ready=%zu compute_ready=%zu "
+           "reorder_ready=%zu "
            "compute_running=%zu submit_backpressure=%i\n",
            shared->helper_groups_active,
+           shared->helper_ready_tasks,
            shared->helper_preparations_active,
            shared->helper_foreign_reservations,
            shared->staged_groups_active,
            shared->staged_tickets_active,
            shared->staged_source_leases,
+           shared->staged_prepare_ready,
+           shared->staged_submit_ready,
+           shared->staged_submit_waiting,
+           shared->staged_submit_credit_ready,
+           shared->staged_io_ready,
            shared->staged_compute_ready,
            shared->staged_reorder_ready,
            shared->staged_compute_running_global,
@@ -194,12 +209,21 @@ static int index_shard_pool_submit(
   shared->helper_width =
       (size_t)worker_count - shared->producer_width;
   shared->queue_waiters = 0U;
+  shared->staged_owner_wake_cursor = 0U;
+  shared->staged_select_cursor = 0U;
+  shared->staged_submit_rearm_cursor = 0U;
   shared->helper_groups_active = 0U;
+  shared->helper_ready_tasks = 0U;
   shared->helper_preparations_active = 0U;
   shared->helper_foreign_reservations = 0U;
   shared->staged_groups_active = 0U;
   shared->staged_tickets_active = 0U;
   shared->staged_source_leases = 0U;
+  shared->staged_prepare_ready = 0U;
+  shared->staged_submit_ready = 0U;
+  shared->staged_submit_waiting = 0U;
+  shared->staged_submit_credit_ready = 0U;
+  shared->staged_io_ready = 0U;
   shared->staged_compute_ready = 0U;
   shared->staged_reorder_ready = 0U;
   shared->staged_compute_running_global = 0U;
@@ -537,10 +561,12 @@ index_shard_solve_impl(onefield_t *bp,
     status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
     helper_quiescence_valid = FALSE;
   }
-  if (pool->shared.helper_groups_active) {
-    logerr("[index-shard] helper groups remained active after "
-           "worker quiescence count=%zu\n",
-           pool->shared.helper_groups_active);
+  if (pool->shared.helper_groups_active ||
+      pool->shared.helper_ready_tasks) {
+    logerr("[index-shard] helper state remained active after "
+           "worker quiescence groups=%zu ready=%zu\n",
+           pool->shared.helper_groups_active,
+           pool->shared.helper_ready_tasks);
     rc = -1;
     status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
     helper_quiescence_valid = FALSE;
@@ -574,19 +600,33 @@ index_shard_solve_impl(onefield_t *bp,
   if (pool->shared.staged_groups_active ||
       pool->shared.staged_tickets_active ||
       pool->shared.staged_source_leases ||
+      pool->shared.staged_prepare_ready ||
+      pool->shared.staged_submit_ready ||
+      pool->shared.staged_submit_waiting ||
+      pool->shared.staged_submit_credit_ready ||
+      pool->shared.staged_io_ready ||
       pool->shared.staged_compute_ready ||
       pool->shared.staged_reorder_ready ||
-      pool->shared.staged_compute_running_global) {
+      pool->shared.staged_compute_running_global ||
+      pool->shared.staged_submit_backpressure) {
     logerr("[index-shard] staged activity remained after "
            "worker quiescence groups=%zu tickets=%zu leases=%zu "
-           "compute_ready=%zu reorder_ready=%zu "
-           "compute_running=%zu\n",
+           "prepare_ready=%zu submit_ready=%zu submit_waiting=%zu "
+           "submit_credit=%zu io_ready=%zu compute_ready=%zu "
+           "reorder_ready=%zu "
+           "compute_running=%zu submit_backpressure=%i\n",
            pool->shared.staged_groups_active,
            pool->shared.staged_tickets_active,
            pool->shared.staged_source_leases,
+           pool->shared.staged_prepare_ready,
+           pool->shared.staged_submit_ready,
+           pool->shared.staged_submit_waiting,
+           pool->shared.staged_submit_credit_ready,
+           pool->shared.staged_io_ready,
            pool->shared.staged_compute_ready,
            pool->shared.staged_reorder_ready,
-           pool->shared.staged_compute_running_global);
+           pool->shared.staged_compute_running_global,
+           pool->shared.staged_submit_backpressure);
     rc = -1;
     status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
     helper_quiescence_valid = FALSE;

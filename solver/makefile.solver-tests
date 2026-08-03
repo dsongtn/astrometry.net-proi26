@@ -179,7 +179,8 @@ test-verify-theta-tail: test-verify-theta-tail.o
 	$(CC) $(LDFLAGS) -o $@ $^
 test-index-shard-config: test-index-shard-config.o index_shard_config.o
 test-index-shard-staged: test-index-shard-staged.o \
-		index_shard_staged_test_support.o $(SLIB)
+		index_shard_staged_test_support.o \
+		index_shard_helper_ledger_test.o $(SLIB)
 test-solver-parallel-integration: test-solver-parallel-integration.o $(SLIB)
 test-solver-streaming-integration: test-solver-parallel-integration.o \
 		$(STREAMING_TEST_LIB) $(CATS_SLIB) $(ANFILES_SLIB)
@@ -226,6 +227,11 @@ index_shard_staged_test_support.o: index_shard_staged_test_support.c \
 	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
 		-DTESTING_INDEX_SHARD_STAGED=1 -o $@ -c $<
 
+index_shard_helper_ledger_test.o: index_shard_helper.c \
+		$(SOLVER_TEST_HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
+		-DTESTING_INDEX_SHARD_HELPER_LEDGER=1 -o $@ -c $<
+
 solver_test.o: solver.c $(SOLVER_TEST_HEADERS)
 	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) \
 		-DTESTING=1 -DTESTING_TRYALLCODES=1 -o $@ -c $<
@@ -237,7 +243,8 @@ test-solver-geometry.o test-solver-regressions.o test-solver-codekd.o \
 		solver_codekd_test_support.o: %.o: %.c $(SOLVER_TEST_HEADERS)
 	$(CC) $(CPPFLAGS) $(CFLAGS_DEBUG) -DTESTING=1 -o $@ -c $<
 
-SOLVER_TEST_VARIANT_OBJS := solver_hypothesis_test_streaming.o \
+SOLVER_TEST_VARIANT_OBJS := index_shard_helper_ledger_test.o \
+	solver_hypothesis_test_streaming.o \
 	solver_codekd_delivery_test_allocation_failure.o \
 	solver_field_geometry_test_fallback.o \
 	$(STREAMING_ASAN_ENGINE_OBJS) $(STREAMING_ASAN_UTIL_OBJS) \

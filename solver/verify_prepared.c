@@ -49,6 +49,11 @@ int verify_query_hit(const startree_t* skdt,
         return -1;
     }
     result->source = skdt;
+    result->source_nstars = startree_N(skdt);
+    if (result->source_nstars < 0) {
+        verify_destroy_index_query(result);
+        return -1;
+    }
     memcpy(result->center, center, sizeof(result->center));
     result->radius2 = radius2;
     startree_search_for(skdt, center, radius2,
@@ -301,17 +306,24 @@ void verify_destroy_index_query(verify_index_query_t* query) {
 }
 
 
-int verify_prepare_hit_from_query(const startree_t* skdt,
-                                  verify_index_query_t** query,
-                                  int index_cutnside,
-                                  const MatchObj* mo, const sip_t* sip,
-                                  const verify_field_t* vf,
-                                  double pix2, double distractors,
-                                  double fieldW, double fieldH,
-                                  double logbail, double logaccept,
-                                  double logstoplooking,
-                                  anbool do_gamma, anbool fake_match,
-                                  verify_prepared_hit_t** prepared) {
+static int verify_prepare_hit_from_query_internal(
+    const startree_t* skdt,
+    verify_index_query_t** query,
+    int index_cutnside,
+    const MatchObj* mo,
+    const sip_t* sip,
+    const verify_field_t* vf,
+    double pix2,
+    double distractors,
+    double fieldW,
+    double fieldH,
+    double logbail,
+    double logaccept,
+    double logstoplooking,
+    anbool do_gamma,
+    anbool fake_match,
+    anbool captured_only,
+    verify_prepared_hit_t** prepared) {
     verify_index_query_t* query_context;
     verify_prepared_hit_t* context;
     verify_t* v;
@@ -327,15 +339,15 @@ int verify_prepare_hit_from_query(const startree_t* skdt,
         return -1;
     }
     *prepared = NULL;
-    if (!query || !*query || !skdt || !mo || !vf ||
+    if (!query || !*query || (!captured_only && !skdt) || !mo || !vf ||
         (!mo->wcs_valid && !sip) ||
         !isfinite(logaccept) || !isfinite(logbail)) {
         return -1;
     }
     query_context = *query;
     fieldr2 = square(mo->radius);
-    if (!skdt->tree ||
-        query_context->source != skdt ||
+    if ((!captured_only &&
+         (!skdt->tree || query_context->source != skdt)) ||
         memcmp(query_context->center, mo->center,
                sizeof(query_context->center)) ||
         memcmp(&query_context->radius2, &fieldr2, sizeof(fieldr2)) ||
@@ -344,8 +356,9 @@ int verify_prepare_hit_from_query(const startree_t* skdt,
          (!query_context->refxyz || !query_context->refstarid)) ||
         (!query_context->nrall &&
          (query_context->refxyz || query_context->refstarid)) ||
+        query_context->source_nstars < 0 ||
         (query_context->nrall && !query_context->sweep &&
-         !skdt->sweep)) {
+         (captured_only || !skdt->sweep))) {
         return -1;
     }
     context = calloc(1, sizeof(*context));
@@ -403,7 +416,9 @@ int verify_prepare_hit_from_query(const startree_t* skdt,
     if (!sweep) {
         goto fail;
     }
-    nstars = startree_N(skdt);
+    nstars = captured_only
+        ? query_context->source_nstars
+        : startree_N(skdt);
     for (i = 0; i < v->NRall; i++) {
         int starid = v->refstarid[i];
 
@@ -412,8 +427,10 @@ int verify_prepare_hit_from_query(const startree_t* skdt,
         }
         if (query_context->sweep) {
             sweep[i] = query_context->sweep[i];
-        } else {
+        } else if (!captured_only) {
             sweep[i] = skdt->sweep[starid];
+        } else {
+            goto fail;
         }
     }
     permuted_sort(sweep, sizeof(int), compare_ints_asc,
@@ -499,6 +516,47 @@ fail:
     v->refstarid = NULL;
     verify_destroy_prepared_hit(context);
     return -1;
+}
+
+int verify_prepare_hit_from_query(const startree_t* skdt,
+                                  verify_index_query_t** query,
+                                  int index_cutnside,
+                                  const MatchObj* mo, const sip_t* sip,
+                                  const verify_field_t* vf,
+                                  double pix2, double distractors,
+                                  double fieldW, double fieldH,
+                                  double logbail, double logaccept,
+                                  double logstoplooking,
+                                  anbool do_gamma, anbool fake_match,
+                                  verify_prepared_hit_t** prepared) {
+    return verify_prepare_hit_from_query_internal(
+        skdt, query, index_cutnside, mo, sip, vf,
+        pix2, distractors, fieldW, fieldH,
+        logbail, logaccept, logstoplooking,
+        do_gamma, fake_match, FALSE, prepared);
+}
+
+int verify_prepare_captured_hit_from_query(
+    verify_index_query_t** query,
+    int index_cutnside,
+    const MatchObj* mo,
+    const sip_t* sip,
+    const verify_field_t* vf,
+    double pix2,
+    double distractors,
+    double fieldW,
+    double fieldH,
+    double logbail,
+    double logaccept,
+    double logstoplooking,
+    anbool do_gamma,
+    anbool fake_match,
+    verify_prepared_hit_t** prepared) {
+    return verify_prepare_hit_from_query_internal(
+        NULL, query, index_cutnside, mo, sip, vf,
+        pix2, distractors, fieldW, fieldH,
+        logbail, logaccept, logstoplooking,
+        do_gamma, fake_match, TRUE, prepared);
 }
 
 int verify_prepare_hit(const startree_t* skdt, int index_cutnside,

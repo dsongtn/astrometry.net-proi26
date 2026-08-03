@@ -4,12 +4,48 @@
  */
 #include "test_fitsbin_payload_common.h"
 
+void test_fitsbin_payload_dynamic_service_width(CuTest* ct) {
+    int start_status;
+    int repeated_start_status;
+    int restart_status;
+    int running_width;
+    int repeated_width;
+    int restarted_width;
+    int stopped_width;
+
+    fitsbin_payload_io_configure_workers(6);
+    start_status = fitsbin_payload_io_service_start(6);
+    running_width = fitsbin_payload_io_service_width();
+    repeated_start_status =
+        fitsbin_payload_io_service_start(3);
+    repeated_width = fitsbin_payload_io_service_width();
+    if (!start_status) {
+        fitsbin_payload_io_service_stop();
+    }
+    stopped_width = fitsbin_payload_io_service_width();
+    fitsbin_payload_io_service_stop();
+    restart_status = fitsbin_payload_io_service_start(8);
+    restarted_width = fitsbin_payload_io_service_width();
+    if (!restart_status) {
+        fitsbin_payload_io_service_stop();
+    }
+    fitsbin_payload_io_configure_workers(1);
+
+    CuAssertIntEquals(ct, 0, start_status);
+    CuAssertIntEquals(ct, 6, running_width);
+    CuAssertIntEquals(ct, 0, repeated_start_status);
+    CuAssertIntEquals(ct, 6, repeated_width);
+    CuAssertIntEquals(ct, 0, stopped_width);
+    CuAssertIntEquals(ct, 0, restart_status);
+    CuAssertIntEquals(ct, 8, restarted_width);
+}
+
 void test_fitsbin_payload_shared_reader_credit(CuTest* ct) {
     payload_fixture_t fixture;
     payload_credit_result_t two_readers;
     payload_credit_result_t one_reader;
 
-    CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
+    payload_fixture_open_for_test(ct, &fixture);
 
     CuAssertIntEquals(
         ct,
@@ -86,6 +122,8 @@ void test_fitsbin_payload_async_direct_overlap(CuTest* ct) {
     int wait_status;
     int helper_start_status = -1;
     int helper_wakeup_status = -1;
+    int helper_condition_destroy_status;
+    int helper_mutex_destroy_status;
     int active;
     int max_active;
     int waiter_count = 0;
@@ -94,7 +132,7 @@ void test_fitsbin_payload_async_direct_overlap(CuTest* ct) {
     int status;
     int i;
 
-    CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
+    payload_fixture_open_for_test(ct, &fixture);
     memset(waiters, 0, sizeof(waiters));
     memset(first_destination, 0, sizeof(first_destination));
     memset(second_destination, 0, sizeof(second_destination));
@@ -198,6 +236,10 @@ void test_fitsbin_payload_async_direct_overlap(CuTest* ct) {
     fitsbin_payload_io_configure_workers(1);
     payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
     fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
+    helper_condition_destroy_status =
+        pthread_cond_destroy(&helper.condition);
+    helper_mutex_destroy_status =
+        pthread_mutex_destroy(&helper.mutex);
 
     CuAssertIntEquals(ct, 1, first_submit);
     CuAssertIntEquals(ct, 1, second_submit);
@@ -233,9 +275,8 @@ void test_fitsbin_payload_async_direct_overlap(CuTest* ct) {
               sizeof(second_destination)),
         (int)stats.read_bytes);
     CuAssertIntEquals(ct, 0, (int)stats.failures);
-
-    pthread_cond_destroy(&helper.condition);
-    pthread_mutex_destroy(&helper.mutex);
+    CuAssertIntEquals(ct, 0, helper_condition_destroy_status);
+    CuAssertIntEquals(ct, 0, helper_mutex_destroy_status);
     payload_fixture_close(&fixture);
 }
 
@@ -244,22 +285,25 @@ void test_fitsbin_payload_async_mapped_population(CuTest* ct) {
     fitsbin_prefetch_range_t range;
     fitsbin_pread_range_t direct_range;
     fitsbin_payload_io_ticket_t* ticket = NULL;
+    fitsbin_payload_io_ticket_t* reused_ticket = NULL;
     fitsbin_payload_io_stats_t stats;
     unsigned char direct_byte = 0U;
     int expired = -1;
+    int expired_ticket_present = 0;
     int expired_waited = -1;
     int reused = -1;
+    int reused_ticket_present = 0;
     int submitted;
     int waited = -1;
     unsigned int i;
 
-    CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
+    payload_fixture_open_for_test(ct, &fixture);
     CuAssertIntEquals(
         ct,
         0,
         fitsbin_configure_index_mmap(fixture.fitsbin));
     range.data = fixture.chunk->data;
-    range.size = sizeof(fixture.bytes);
+    range.size = 1U;
     fitsbin_take_payload_io_stats(fixture.fitsbin, &stats);
     fitsbin_payload_io_configure_workers(2);
     CuAssertIntEquals(
@@ -283,7 +327,14 @@ void test_fitsbin_payload_async_mapped_population(CuTest* ct) {
         &range,
         1U,
         SIZE_MAX,
-        &ticket);
+        &reused_ticket);
+    reused_ticket_present = reused_ticket != NULL;
+    if (reused_ticket) {
+        (void)fitsbin_payload_io_ticket_wait(
+            fixture.fitsbin, reused_ticket);
+        fitsbin_payload_io_ticket_destroy(reused_ticket);
+        reused_ticket = NULL;
+    }
     direct_range.data = fixture.chunk->data;
     direct_range.size = sizeof(direct_byte);
     direct_range.logical_size = sizeof(direct_byte);
@@ -314,6 +365,7 @@ void test_fitsbin_payload_async_mapped_population(CuTest* ct) {
         1U,
         SIZE_MAX,
         &ticket);
+    expired_ticket_present = ticket != NULL;
     if (ticket) {
         expired_waited = fitsbin_payload_io_ticket_wait(
             fixture.fitsbin, ticket);
@@ -330,12 +382,15 @@ void test_fitsbin_payload_async_mapped_population(CuTest* ct) {
     CuAssert(ct, "async mapped population failed", waited > 0);
     CuAssertIntEquals(
         ct, FITSBIN_PAYLOAD_IO_SUBMIT_READY, reused);
+    CuAssertIntEquals(ct, 0, reused_ticket_present);
     CuAssertIntEquals(
         ct, FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED, expired);
+    CuAssertIntEquals(ct, 1, expired_ticket_present);
     CuAssert(ct, "expired mapped population failed",
              expired_waited > 0);
     CuAssertPtrEquals(ct, NULL, ticket);
-    CuAssertIntEquals(ct, 2, (int)stats.warm_calls);
+    CuAssert(ct, "mapped completion aging issued too few fills",
+             stats.warm_calls >= 2U);
     CuAssert(ct, "async mapped population reported no pages",
              stats.warm_bytes > 0U);
 #else

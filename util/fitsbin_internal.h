@@ -37,7 +37,7 @@
 #define FITSBIN_PREFETCH_COPY_CHUNK (16U * 1024U)
 #define FITSBIN_PAYLOAD_POPULATE_TOTAL_BUDGET \
     (16U * 1024U * 1024U)
-#define FITSBIN_PAYLOAD_IO_MAX_LANES 4
+/* Queued plus in-flight jobs also bound the number of useful I/O lanes. */
 #define FITSBIN_PAYLOAD_IO_MAX_JOBS 24U
 #define FITSBIN_PAYLOAD_IO_MAX_BYTES \
     (64U * 1024U * 1024U)
@@ -45,6 +45,15 @@
 #define FITSBIN_PAYLOAD_IO_DEMAND_RESERVED_JOBS 1U
 #define FITSBIN_PAYLOAD_IO_DEMAND_RESERVED_BYTES \
     (FITSBIN_PAYLOAD_IO_MAX_BYTES / 4U)
+
+/*
+ * Keep one vectored mapped-population operation small enough for cooperative
+ * cancellation while amortizing syscall entry over sparse page runs. A span
+ * larger than the byte bound remains one indivisible native operation.
+ */
+#define FITSBIN_PAYLOAD_POPULATE_BATCH_RANGES 64U
+#define FITSBIN_PAYLOAD_POPULATE_BATCH_BYTES \
+    (256U * 1024U)
 
 /*
  * Join only a one-page hole inside one exact mapping, and spend no more than
@@ -157,6 +166,7 @@ int fitsbin_prepare_mapped_spans(
     size_t range_count,
     size_t byte_budget,
     unsigned long long reuse_sequence,
+    anbool account_cache_stats,
     fitsbin_mapped_span_t* spans,
     size_t span_capacity,
     size_t* span_count,
@@ -183,7 +193,6 @@ void fitsbin_payload_mark_completed_span(
     fitsbin_t* fb,
     const fitsbin_mapped_span_t* span,
     unsigned long long sequence);
-
 unsigned long long fitsbin_payload_io_sequence_hint(void);
 unsigned long long fitsbin_timespec_delta_nanoseconds(
     const struct timespec* finish,

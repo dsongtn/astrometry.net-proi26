@@ -222,13 +222,22 @@ typedef struct index_shard_thread_state {
   size_t producer_width;
   size_t helper_width;
   size_t queue_waiters;
+  size_t staged_owner_wake_cursor;
+  size_t staged_select_cursor;
+  size_t staged_submit_rearm_cursor;
   size_t helper_groups_active;
+  size_t helper_ready_tasks;
   size_t helper_preparations_active;
   size_t helper_foreign_reservations;
   size_t staged_groups_active;
   size_t staged_tickets_active;
   /* Logical borrows kept live by the synchronous outer index owner. */
   size_t staged_source_leases;
+  size_t staged_prepare_ready;
+  size_t staged_submit_ready;
+  size_t staged_submit_waiting;
+  size_t staged_submit_credit_ready;
+  size_t staged_io_ready;
   size_t staged_compute_ready;
   size_t staged_reorder_ready;
   size_t staged_compute_running_global;
@@ -427,6 +436,7 @@ struct index_shard_helper_group {
   anbool stop_seen;
   anbool internal_error;
   anbool verification_group;
+  anbool ready_accounted;
   double helper_window_start;
 };
 
@@ -512,7 +522,14 @@ struct index_shard_staged_group {
   uint64_t owner_ready_mask;
   uint64_t results_ready_mask;
 
+  size_t accounted_prepare_ready;
+  size_t accounted_submit_ready;
+  size_t accounted_submit_waiting;
+  size_t accounted_submit_credit_ready;
+  size_t accounted_io_ready;
+
   anbool cancelling;
+  anbool readiness_accounted;
   anbool task_failed;
   anbool stop_seen;
   anbool internal_error;
@@ -1040,6 +1057,10 @@ int index_shard_staged_set_submit_wait_locked(
     index_shard_staged_group_t *group,
     index_shard_staged_task_t *task,
     anbool waiting);
+int index_shard_staged_account_readiness_locked(
+    index_shard_staged_group_t *group);
+int index_shard_staged_unaccount_readiness_locked(
+    index_shard_staged_group_t *group);
 int index_shard_staged_set_completion_pending_locked(
     index_shard_staged_group_t *group,
     index_shard_staged_task_t *task,

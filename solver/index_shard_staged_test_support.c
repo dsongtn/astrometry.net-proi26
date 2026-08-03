@@ -36,6 +36,8 @@
  * build, so production visibility and state layout remain unchanged.
  */
 
+int index_shard_helper_readiness_ledger_test(void);
+
 typedef struct index_shard_staged_retire_test_context {
   index_shard_thread_state_t *shared;
   size_t order[8];
@@ -105,6 +107,28 @@ void index_shard_staged_retire_test_destroy(
   pthread_cond_destroy(&shared->queue_cv);
   pthread_mutex_destroy(&shared->state_mutex);
   pthread_mutex_destroy(&shared->queue_mutex);
+}
+
+static int index_shard_staged_test_account(
+    index_shard_thread_state_t *shared,
+    index_shard_staged_group_t *group) {
+  int rc;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  rc = index_shard_staged_account_readiness_locked(group);
+  pthread_mutex_unlock(&shared->queue_mutex);
+  return rc;
+}
+
+static int index_shard_staged_test_unaccount(
+    index_shard_thread_state_t *shared,
+    index_shard_staged_group_t *group) {
+  int rc;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  rc = index_shard_staged_unaccount_readiness_locked(group);
+  pthread_mutex_unlock(&shared->queue_mutex);
+  return rc;
 }
 
 int index_shard_staged_retire_test_ready(
@@ -272,6 +296,7 @@ int index_shard_observability_counter_test(void) {
   index_shard_thread_state_t shared;
   index_shard_pool_t pool;
   index_shard_worker_context_t contexts[2];
+  index_shard_staged_group_t groups[2];
   unsigned char outer_states[2] = {
       INDEX_SHARD_OUTER_UNCLAIMED,
       INDEX_SHARD_OUTER_UNCLAIMED
@@ -285,6 +310,7 @@ int index_shard_observability_counter_test(void) {
   }
   memset(&pool, 0, sizeof(pool));
   memset(contexts, 0, sizeof(contexts));
+  memset(groups, 0, sizeof(groups));
   pool.contexts = contexts;
   pool.worker_count = 2;
   shared.pool = &pool;
@@ -292,6 +318,13 @@ int index_shard_observability_counter_test(void) {
   contexts[0].owner_cv_ready =
       pthread_cond_init(&contexts[0].owner_cv, NULL) == 0;
   if (!contexts[0].owner_cv_ready) {
+    index_shard_staged_retire_test_destroy(&shared);
+    return 1;
+  }
+  contexts[1].owner_cv_ready =
+      pthread_cond_init(&contexts[1].owner_cv, NULL) == 0;
+  if (!contexts[1].owner_cv_ready) {
+    pthread_cond_destroy(&contexts[0].owner_cv);
     index_shard_staged_retire_test_destroy(&shared);
     return 1;
   }
@@ -328,8 +361,42 @@ int index_shard_observability_counter_test(void) {
   index_shard_queue_broadcast_locked(&shared);
   failures += shared.queue_broadcasts != 1U;
   failures += shared.owner_broadcasts != 1U;
+
+  /* Ready staged owners receive private wakes in round-robin order. */
+  shared.staged_compute_ready = 1U;
+  contexts[0].published_staged_group = &groups[0];
+  contexts[1].published_staged_group = &groups[1];
+  contexts[0].owner_waiting = TRUE;
+  contexts[1].owner_waiting = TRUE;
+  index_shard_queue_signal_locked(&shared);
+  failures += contexts[0].owner_wake_pending != TRUE;
+  failures += contexts[1].owner_wake_pending != FALSE;
+  failures += shared.owner_signals != 2U;
+  failures += shared.staged_owner_wake_cursor != 1U;
+
+  /* Clearing a consumed wake must rotate the next two handoffs. */
+  contexts[0].owner_wake_pending = FALSE;
+  index_shard_queue_signal_locked(&shared);
+  failures += contexts[0].owner_wake_pending != FALSE;
+  failures += contexts[1].owner_wake_pending != TRUE;
+  failures += shared.owner_signals != 3U;
+  failures += shared.staged_owner_wake_cursor != 0U;
+  contexts[1].owner_wake_pending = FALSE;
+  index_shard_queue_signal_locked(&shared);
+  failures += contexts[0].owner_wake_pending != TRUE;
+  failures += contexts[1].owner_wake_pending != FALSE;
+  failures += shared.owner_signals != 4U;
+  failures += shared.staged_owner_wake_cursor != 1U;
+  shared.staged_compute_ready = 0U;
+  contexts[0].published_staged_group = NULL;
+  contexts[1].published_staged_group = NULL;
+  contexts[0].owner_waiting = FALSE;
+  contexts[1].owner_waiting = FALSE;
+  contexts[0].owner_wake_pending = FALSE;
+  contexts[1].owner_wake_pending = FALSE;
   pthread_mutex_unlock(&shared.queue_mutex);
 
+  pthread_cond_destroy(&contexts[1].owner_cv);
   pthread_cond_destroy(&contexts[0].owner_cv);
   index_shard_staged_retire_test_destroy(&shared);
   return failures;
@@ -376,6 +443,10 @@ int index_shard_staged_mask_selection_test(void) {
     groups[i].owner_worker = i;
     groups[i].owner_index_order = contexts[i].current_index_order;
   }
+  for (i = 0; i < 2; i++) {
+    failures += index_shard_staged_test_account(
+        shared, &groups[i]) != 0;
+  }
 
   pthread_mutex_lock(&shared->queue_mutex);
   failures += index_shard_staged_set_state_locked(
@@ -397,6 +468,137 @@ int index_shard_staged_mask_selection_test(void) {
       INDEX_SHARD_STAGED_TASK_EXECUTING;
   pthread_mutex_unlock(&shared->queue_mutex);
 
+  for (i = 0; i < 2; i++) {
+    failures += index_shard_staged_test_unaccount(
+        shared, &groups[i]) != 0;
+  }
+  index_shard_staged_retire_test_destroy(shared);
+  return failures;
+}
+
+static int index_shard_staged_owner_rotation_test(void) {
+  index_shard_pool_t pool;
+  index_shard_worker_context_t contexts[4];
+  index_shard_staged_group_t groups[3];
+  index_shard_staged_task_t tasks[3];
+  index_shard_staged_claim_t claim;
+  index_shard_thread_state_t *shared;
+  int failures = 0;
+  int i;
+
+  memset(&pool, 0, sizeof(pool));
+  memset(contexts, 0, sizeof(contexts));
+  memset(groups, 0, sizeof(groups));
+  memset(tasks, 0, sizeof(tasks));
+  shared = &pool.shared;
+  if (index_shard_staged_retire_test_init(shared)) {
+    return 1;
+  }
+  pool.worker_count = 4;
+  pool.generation = 17U;
+  pool.contexts = contexts;
+  shared->pool = &pool;
+  shared->worker_count = 4;
+  shared->observability_enabled = TRUE;
+
+  for (i = 0; i < 4; i++) {
+    contexts[i].worker_id = i;
+    contexts[i].pool = &pool;
+    contexts[i].generation_seen = pool.generation;
+  }
+  for (i = 0; i < 3; i++) {
+    contexts[i].current_outer_active = TRUE;
+    contexts[i].current_index_order = (size_t)(20 - i);
+    contexts[i].staged_group_epoch = 31U +
+        (unsigned long long)i;
+    contexts[i].published_staged_group = &groups[i];
+    groups[i].pool = &pool;
+    groups[i].tasks = &tasks[i];
+    groups[i].task_count = 1U;
+    groups[i].generation = pool.generation;
+    groups[i].owner_epoch = contexts[i].staged_group_epoch;
+    groups[i].owner_worker = i;
+    groups[i].owner_index_order =
+        contexts[i].current_index_order;
+    failures += index_shard_staged_test_account(
+        shared, &groups[i]) != 0;
+    pthread_mutex_lock(&shared->queue_mutex);
+    failures += index_shard_staged_set_state_locked(
+        shared, &groups[i], &tasks[i],
+        INDEX_SHARD_STAGED_TASK_COMPUTE_READY) != 0;
+    pthread_mutex_unlock(&shared->queue_mutex);
+  }
+
+  for (i = 0; i < 6; i++) {
+    int expected_owner = i % 3;
+
+    pthread_mutex_lock(&shared->queue_mutex);
+    failures += index_shard_staged_select_locked(
+        &contexts[3], shared,
+        INDEX_SHARD_STAGED_SELECT_COMPUTE,
+        FALSE, FALSE, &claim) != 0;
+    failures += claim.group != &groups[expected_owner];
+    failures += claim.task_index != 0U;
+    failures += claim.owner_claim;
+    pthread_mutex_unlock(&shared->queue_mutex);
+    failures += index_shard_staged_complete_claim(
+        shared, &claim,
+        INDEX_SHARD_STAGED_EXECUTE_COMPUTE_READY,
+        0.0, 0ULL) != 0;
+  }
+  for (i = 0; i < 3; i++) {
+    failures += groups[i].foreign_compute_executes != 2U;
+  }
+
+  /* Local owner work wins without disturbing the foreign rotation cursor. */
+  shared->staged_select_cursor = 1U;
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_select_locked(
+      &contexts[0], shared,
+      INDEX_SHARD_STAGED_SELECT_COMPUTE,
+      TRUE, FALSE, &claim) != 0;
+  failures += claim.group != &groups[0];
+  failures += claim.task_index != 0U;
+  failures += !claim.owner_claim;
+  failures += shared->staged_select_cursor != 1U;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  failures += index_shard_staged_complete_claim(
+      shared, &claim,
+      INDEX_SHARD_STAGED_EXECUTE_COMPUTE_READY,
+      0.0, 0ULL) != 0;
+
+  /* An owner without local ready work joins the foreign rotation. */
+  shared->staged_select_cursor = 2U;
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_set_state_locked(
+      shared, &groups[0], &tasks[0],
+      INDEX_SHARD_STAGED_TASK_PREPARE_READY) != 0;
+  failures += index_shard_staged_select_locked(
+      &contexts[0], shared,
+      INDEX_SHARD_STAGED_SELECT_COMPUTE,
+      TRUE, FALSE, &claim) != 0;
+  failures += claim.group != &groups[2];
+  failures += claim.task_index != 0U;
+  failures += claim.owner_claim;
+  failures += shared->staged_select_cursor != 3U;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  failures += index_shard_staged_complete_claim(
+      shared, &claim,
+      INDEX_SHARD_STAGED_EXECUTE_COMPUTE_READY,
+      0.0, 0ULL) != 0;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  for (i = 0; i < 3; i++) {
+    failures += index_shard_staged_set_state_locked(
+        shared, &groups[i], &tasks[i],
+        INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
+  }
+  pthread_mutex_unlock(&shared->queue_mutex);
+  for (i = 0; i < 3; i++) {
+    failures += index_shard_staged_test_unaccount(
+        shared, &groups[i]) != 0;
+    contexts[i].published_staged_group = NULL;
+  }
   index_shard_staged_retire_test_destroy(shared);
   return failures;
 }
@@ -459,6 +661,8 @@ int index_shard_ready_before_outer_test(void) {
   group.owner_epoch = contexts[0].staged_group_epoch;
   group.owner_worker = 0;
   group.owner_index_order = 0U;
+  failures += index_shard_staged_test_account(
+      shared, &group) != 0;
 
   /* No ready computation: the canonical outer task wins immediately. */
   contexts[1].ready_before_outer_eligible = TRUE;
@@ -532,6 +736,8 @@ int index_shard_ready_before_outer_test(void) {
       shared, &group, &tasks[1],
       INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
   pthread_mutex_unlock(&shared->queue_mutex);
+  failures += index_shard_staged_test_unaccount(
+      shared, &group) != 0;
   contexts[0].published_staged_group = NULL;
   index_shard_staged_retire_test_destroy(shared);
   return failures;
@@ -612,6 +818,8 @@ int index_shard_outer_cap_liveness_test(void) {
   group.owner_epoch = contexts[0].staged_group_epoch;
   group.owner_worker = 0;
   group.owner_index_order = 0U;
+  failures += index_shard_staged_account_readiness_locked(
+      &group) != 0;
   failures += index_shard_staged_set_state_locked(
       shared, &group, &task,
       INDEX_SHARD_STAGED_TASK_COMPUTE_READY) != 0;
@@ -634,6 +842,8 @@ int index_shard_outer_cap_liveness_test(void) {
   failures += index_shard_staged_set_state_locked(
       shared, &group, &task,
       INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
+  failures += index_shard_staged_unaccount_readiness_locked(
+      &group) != 0;
   shared->queue_waiters = 0U;
   pthread_mutex_unlock(&shared->queue_mutex);
   contexts[0].published_staged_group = NULL;
@@ -683,6 +893,10 @@ int index_shard_staged_submit_rearm_test(void) {
     groups[i].owner_worker = i;
     groups[i].owner_index_order = contexts[i].current_index_order;
   }
+  for (i = 0; i < 2; i++) {
+    failures += index_shard_staged_test_account(
+        shared, &groups[i]) != 0;
+  }
 
   pthread_mutex_lock(&shared->queue_mutex);
   for (i = 0; i < 2; i++) {
@@ -699,28 +913,20 @@ int index_shard_staged_submit_rearm_test(void) {
 
   failures += index_shard_staged_rearm_one_submit_waiter_locked(
       &pool, &owner) != 1;
-  failures += owner != 1;
-  failures += groups[1].submit_ready_mask != UINT64_C(1);
-  failures += groups[1].submit_wait_mask != UINT64_C(2);
-  failures += groups[1].submit_credit_mask != UINT64_C(1);
-  failures += groups[0].submit_ready_mask != UINT64_C(0);
-  failures += groups[0].submit_wait_mask != UINT64_C(3);
-
-  owner = -1;
-  failures += index_shard_staged_rearm_one_submit_waiter_locked(
-      &pool, &owner) != 1;
-  failures += owner != 1;
-  failures += groups[1].submit_ready_mask != UINT64_C(3);
-  failures += groups[1].submit_wait_mask != UINT64_C(0);
-  failures += groups[1].submit_credit_mask != UINT64_C(3);
-
-  owner = -1;
-  failures += index_shard_staged_rearm_one_submit_waiter_locked(
-      &pool, &owner) != 1;
   failures += owner != 0;
   failures += groups[0].submit_ready_mask != UINT64_C(1);
   failures += groups[0].submit_wait_mask != UINT64_C(2);
   failures += groups[0].submit_credit_mask != UINT64_C(1);
+  failures += groups[1].submit_ready_mask != UINT64_C(0);
+  failures += groups[1].submit_wait_mask != UINT64_C(3);
+
+  owner = -1;
+  failures += index_shard_staged_rearm_one_submit_waiter_locked(
+      &pool, &owner) != 1;
+  failures += owner != 1;
+  failures += groups[1].submit_ready_mask != UINT64_C(1);
+  failures += groups[1].submit_wait_mask != UINT64_C(2);
+  failures += groups[1].submit_credit_mask != UINT64_C(1);
 
   owner = -1;
   failures += index_shard_staged_rearm_one_submit_waiter_locked(
@@ -730,6 +936,14 @@ int index_shard_staged_submit_rearm_test(void) {
   failures += groups[0].submit_wait_mask != UINT64_C(0);
   failures += groups[0].submit_credit_mask != UINT64_C(3);
 
+  owner = -1;
+  failures += index_shard_staged_rearm_one_submit_waiter_locked(
+      &pool, &owner) != 1;
+  failures += owner != 1;
+  failures += groups[1].submit_ready_mask != UINT64_C(3);
+  failures += groups[1].submit_wait_mask != UINT64_C(0);
+  failures += groups[1].submit_credit_mask != UINT64_C(3);
+
   owner = 0;
   failures += index_shard_staged_rearm_one_submit_waiter_locked(
       &pool, &owner) != 0;
@@ -738,6 +952,10 @@ int index_shard_staged_submit_rearm_test(void) {
   failures += !shared->staged_submit_backpressure;
   pthread_mutex_unlock(&shared->queue_mutex);
 
+  for (i = 0; i < 2; i++) {
+    failures += index_shard_staged_test_unaccount(
+        shared, &groups[i]) != 0;
+  }
   contexts[0].published_staged_group = NULL;
   contexts[1].published_staged_group = NULL;
   index_shard_staged_retire_test_destroy(shared);
@@ -782,6 +1000,8 @@ int index_shard_staged_submit_handoff_test(void) {
   group.owner_epoch = context.staged_group_epoch;
   group.owner_worker = 0;
   group.owner_index_order = context.current_index_order;
+  failures += index_shard_staged_test_account(
+      shared, &group) != 0;
 
   pthread_mutex_lock(&shared->queue_mutex);
   failures += index_shard_staged_set_state_locked(
@@ -823,6 +1043,8 @@ int index_shard_staged_submit_handoff_test(void) {
   failures += shared->staged_submit_handoffs != 1U;
   pthread_mutex_unlock(&shared->queue_mutex);
 
+  failures += index_shard_staged_test_unaccount(
+      shared, &group) != 0;
   context.published_staged_group = NULL;
   index_shard_staged_retire_test_destroy(shared);
   return failures;
@@ -870,6 +1092,8 @@ int index_shard_staged_submit_backpressure_test(void) {
   group.owner_epoch = context.staged_group_epoch;
   group.owner_worker = 0;
   group.owner_index_order = context.current_index_order;
+  failures += index_shard_staged_test_account(
+      shared, &group) != 0;
 
   pthread_mutex_lock(&shared->queue_mutex);
   failures += index_shard_staged_set_state_locked(
@@ -933,6 +1157,8 @@ int index_shard_staged_submit_backpressure_test(void) {
   failures += shared->staged_submit_backpressure;
   pthread_mutex_unlock(&shared->queue_mutex);
 
+  failures += index_shard_staged_test_unaccount(
+      shared, &group) != 0;
   context.published_staged_group = NULL;
   index_shard_staged_retire_test_destroy(shared);
   return failures;
@@ -975,6 +1201,8 @@ int index_shard_completion_registry_test(void) {
   group.owner_epoch = contexts[0].staged_group_epoch;
   group.owner_worker = 0;
   group.owner_index_order = contexts[0].current_index_order;
+  failures += index_shard_staged_test_account(
+      shared, &group) != 0;
 
   pthread_mutex_lock(&shared->queue_mutex);
   failures += index_shard_staged_set_state_locked(
@@ -1035,6 +1263,8 @@ int index_shard_completion_registry_test(void) {
   failures += shared->completion_registry_invalid != 0U;
   pthread_mutex_unlock(&shared->queue_mutex);
 
+  failures += index_shard_staged_test_unaccount(
+      shared, &group) != 0;
   contexts[0].published_staged_group = NULL;
   index_shard_staged_retire_test_destroy(shared);
   return failures;
@@ -1112,6 +1342,8 @@ int index_shard_completion_inline_poll_case(
   group.io_submitted = 1U;
   task.output = &poll_status;
   task.output_bytes = sizeof(poll_status);
+  failures += index_shard_staged_test_account(
+      shared, &group) != 0;
 
   pthread_mutex_lock(&shared->queue_mutex);
   failures += index_shard_staged_set_state_locked(
@@ -1152,6 +1384,8 @@ int index_shard_completion_inline_poll_case(
   failures += shared->completion_registry_invalid != 0U;
   pthread_mutex_unlock(&shared->queue_mutex);
 
+  failures += index_shard_staged_test_unaccount(
+      shared, &group) != 0;
   contexts[0].published_staged_group = NULL;
   index_shard_staged_retire_test_destroy(shared);
   return failures;
@@ -1180,18 +1414,277 @@ int index_shard_completion_inline_poll_test(void) {
           TRUE);
 }
 
+static int index_shard_execute_handoff_case(
+    index_shard_staged_execute_status_t status,
+    index_shard_staged_task_state_t expected_state,
+    anbool backpressure,
+    anbool expect_wait) {
+  index_shard_thread_state_t shared;
+  index_shard_staged_group_t group;
+  index_shard_staged_task_t task;
+  index_shard_staged_claim_t claim;
+  int failures = 0;
+
+  if (index_shard_staged_retire_test_init(&shared)) {
+    return 1;
+  }
+  memset(&group, 0, sizeof(group));
+  memset(&task, 0, sizeof(task));
+  memset(&claim, 0, sizeof(claim));
+  group.tasks = &task;
+  group.task_count = 1U;
+  group.owner_worker = 0;
+  group.running_count = 1U;
+  group.compute_running = 1U;
+  shared.staged_compute_running_global = 1U;
+  shared.staged_submit_backpressure = backpressure;
+  shared.observability_enabled = TRUE;
+  task.scheduler_state = INDEX_SHARD_STAGED_TASK_EXECUTING;
+  claim.group = &group;
+  claim.kind = INDEX_SHARD_STAGED_CLAIM_EXECUTE;
+
+  failures += index_shard_staged_complete_claim(
+      &shared, &claim, status, 0.0, 0ULL) != 0;
+  pthread_mutex_lock(&shared.queue_mutex);
+  failures += task.scheduler_state != expected_state;
+  failures += group.running_count != 0U;
+  failures += group.compute_running != 0U;
+  failures += shared.staged_compute_running_global != 0U;
+  failures += group.prepare_ready_mask !=
+      (expected_state == INDEX_SHARD_STAGED_TASK_PREPARE_READY
+           ? UINT64_C(1)
+           : UINT64_C(0));
+  failures += group.submit_ready_mask !=
+      (expected_state == INDEX_SHARD_STAGED_TASK_SUBMIT_READY &&
+               !expect_wait
+           ? UINT64_C(1)
+           : UINT64_C(0));
+  failures += group.submit_wait_mask !=
+      (expect_wait ? UINT64_C(1) : UINT64_C(0));
+  failures += group.compute_ready_mask !=
+      (expected_state == INDEX_SHARD_STAGED_TASK_COMPUTE_READY
+           ? UINT64_C(1)
+           : UINT64_C(0));
+  failures += group.owner_ready_mask !=
+      (expected_state == INDEX_SHARD_STAGED_TASK_OWNER_READY
+           ? UINT64_C(1)
+           : UINT64_C(0));
+  failures += shared.staged_submit_deferrals !=
+      (expect_wait ? 1U : 0U);
+  failures += group.internal_error;
+  failures += group.task_failed;
+  failures += index_shard_staged_set_state_locked(
+      &shared, &group, &task,
+      INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
+  pthread_mutex_unlock(&shared.queue_mutex);
+
+  index_shard_staged_retire_test_destroy(&shared);
+  return failures;
+}
+
+static int index_shard_execute_handoff_test(void) {
+  return index_shard_execute_handoff_case(
+      INDEX_SHARD_STAGED_EXECUTE_MORE,
+      INDEX_SHARD_STAGED_TASK_PREPARE_READY,
+      FALSE,
+      FALSE) +
+      index_shard_execute_handoff_case(
+          INDEX_SHARD_STAGED_EXECUTE_SUBMIT_READY,
+          INDEX_SHARD_STAGED_TASK_SUBMIT_READY,
+          FALSE,
+          FALSE) +
+      index_shard_execute_handoff_case(
+          INDEX_SHARD_STAGED_EXECUTE_SUBMIT_READY,
+          INDEX_SHARD_STAGED_TASK_SUBMIT_READY,
+          TRUE,
+          TRUE) +
+      index_shard_execute_handoff_case(
+          INDEX_SHARD_STAGED_EXECUTE_COMPUTE_READY,
+          INDEX_SHARD_STAGED_TASK_COMPUTE_READY,
+          FALSE,
+          FALSE) +
+      index_shard_execute_handoff_case(
+          INDEX_SHARD_STAGED_EXECUTE_OWNER_READY,
+          INDEX_SHARD_STAGED_TASK_OWNER_READY,
+      FALSE,
+      FALSE);
+}
+
+static int index_shard_readiness_ledger_test(void) {
+  index_shard_pool_t pool;
+  index_shard_worker_context_t context;
+  index_shard_staged_group_t group;
+  index_shard_staged_task_t tasks[4];
+  index_shard_thread_state_t *shared;
+  int rearmed_owner = -1;
+  int failures = 0;
+  size_t i;
+
+  memset(&pool, 0, sizeof(pool));
+  memset(&context, 0, sizeof(context));
+  memset(&group, 0, sizeof(group));
+  memset(tasks, 0, sizeof(tasks));
+  shared = &pool.shared;
+  if (index_shard_staged_retire_test_init(shared)) {
+    return 1;
+  }
+  pool.worker_count = 1;
+  pool.generation = 19U;
+  pool.contexts = &context;
+  shared->pool = &pool;
+  shared->worker_count = 1;
+  shared->observability_enabled = TRUE;
+  context.worker_id = 0;
+  context.pool = &pool;
+  context.generation_seen = pool.generation;
+  context.current_outer_active = TRUE;
+  context.current_index_order = 7U;
+  context.staged_group_epoch = 51U;
+  context.published_staged_group = &group;
+  group.pool = &pool;
+  group.tasks = tasks;
+  group.task_count = 4U;
+  group.generation = pool.generation;
+  group.owner_epoch = context.staged_group_epoch;
+  group.owner_worker = 0;
+  group.owner_index_order = context.current_index_order;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[0],
+      INDEX_SHARD_STAGED_TASK_PREPARE_READY) != 0;
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[1],
+      INDEX_SHARD_STAGED_TASK_SUBMIT_READY) != 0;
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[2],
+      INDEX_SHARD_STAGED_TASK_IO_SUBMITTED) != 0;
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[3],
+      INDEX_SHARD_STAGED_TASK_COMPUTE_READY) != 0;
+  failures += shared->staged_prepare_ready != 0U;
+  failures += shared->staged_submit_ready != 0U;
+  failures += shared->staged_submit_waiting != 0U;
+  failures += shared->staged_submit_credit_ready != 0U;
+  failures += shared->staged_io_ready != 0U;
+  failures += shared->staged_compute_ready != 1U;
+
+  failures += index_shard_staged_account_readiness_locked(
+      &group) != 0;
+  failures += index_shard_staged_account_readiness_locked(
+      &group) != -1;
+  failures += shared->staged_prepare_ready != 1U;
+  failures += shared->staged_submit_ready != 1U;
+  failures += shared->staged_submit_waiting != 0U;
+  failures += shared->staged_submit_credit_ready != 0U;
+  failures += shared->staged_io_ready != 0U;
+
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[0],
+      INDEX_SHARD_STAGED_TASK_OWNER_READY) != 0;
+  failures += index_shard_staged_set_submit_wait_locked(
+      &group, &tasks[1], TRUE) != 0;
+  failures += shared->staged_prepare_ready != 0U;
+  failures += shared->staged_submit_ready != 0U;
+  failures += shared->staged_submit_waiting != 1U;
+  failures += index_shard_staged_rearm_one_submit_waiter_locked(
+      &pool, &rearmed_owner) != 1;
+  failures += rearmed_owner != 0;
+  failures += shared->staged_submit_ready != 1U;
+  failures += shared->staged_submit_waiting != 0U;
+  failures += shared->staged_submit_credit_ready != 1U;
+  failures += !shared->staged_submit_backpressure;
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[1],
+      INDEX_SHARD_STAGED_TASK_SUBMITTING) != 0;
+  failures += shared->staged_submit_ready != 0U;
+  failures += shared->staged_submit_credit_ready != 0U;
+  failures += !shared->staged_submit_backpressure;
+  index_shard_staged_refresh_submit_backpressure_locked(&pool);
+  failures += shared->staged_submit_backpressure;
+
+  failures += index_shard_staged_set_completion_pending_locked(
+      &group, &tasks[2], TRUE) != 0;
+  failures += shared->staged_io_ready != 1U;
+  failures += index_shard_staged_set_completion_pending_locked(
+      &group, &tasks[2], FALSE) != 0;
+  failures += shared->staged_io_ready != 0U;
+  group.cancelling = TRUE;
+  failures += index_shard_staged_set_completion_pending_locked(
+      &group, &tasks[2], FALSE) != 0;
+  failures += shared->staged_io_ready != 1U;
+  tasks[2].cancel_sent = TRUE;
+  group.cancel_sent_mask |= 1ULL << 2U;
+  failures += index_shard_staged_set_completion_pending_locked(
+      &group, &tasks[2], FALSE) != 0;
+  failures += shared->staged_io_ready != 0U;
+  tasks[2].cancel_sent = FALSE;
+  group.cancel_sent_mask &= ~(1ULL << 2U);
+  failures += index_shard_staged_set_completion_pending_locked(
+      &group, &tasks[2], FALSE) != 0;
+  failures += shared->staged_io_ready != 1U;
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[2],
+      INDEX_SHARD_STAGED_TASK_IO_CANCELLING) != 0;
+  failures += shared->staged_io_ready != 0U;
+
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[3],
+      INDEX_SHARD_STAGED_TASK_EXECUTING) != 0;
+  failures += shared->staged_compute_ready != 0U;
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[0],
+      INDEX_SHARD_STAGED_TASK_RESULTS_READY) != 0;
+  failures += shared->staged_reorder_ready != 1U;
+  failures += shared->staged_prepare_ready != 0U;
+  failures += shared->staged_submit_ready != 0U;
+  failures += shared->staged_submit_waiting != 0U;
+  failures += shared->staged_submit_credit_ready != 0U;
+  failures += shared->staged_io_ready != 0U;
+  shared->queue_waiters = 1U;
+  index_shard_queue_signal_locked(shared);
+  failures += shared->queue_signals != 0U;
+  failures += shared->queue_signals_no_work != 1U;
+  shared->queue_waiters = 0U;
+
+  for (i = 0U; i < 4U; i++) {
+    failures += index_shard_staged_set_state_locked(
+        shared, &group, &tasks[i],
+        INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
+  }
+  failures += shared->staged_reorder_ready != 0U;
+  failures += index_shard_staged_unaccount_readiness_locked(
+      &group) != 0;
+  failures += index_shard_staged_unaccount_readiness_locked(
+      &group) != -1;
+  failures += shared->staged_prepare_ready != 0U;
+  failures += shared->staged_submit_ready != 0U;
+  failures += shared->staged_submit_waiting != 0U;
+  failures += shared->staged_submit_credit_ready != 0U;
+  failures += shared->staged_io_ready != 0U;
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  context.published_staged_group = NULL;
+  index_shard_staged_retire_test_destroy(shared);
+  return failures;
+}
+
 int index_shard_test_staged_retire_more(void) {
   return index_shard_staged_retire_test_order() +
       index_shard_staged_retire_test_terminal() +
       index_shard_staged_child_helper_test() +
       index_shard_observability_counter_test() +
       index_shard_staged_mask_selection_test() +
+      index_shard_staged_owner_rotation_test() +
       index_shard_ready_before_outer_test() +
       index_shard_outer_cap_liveness_test() +
       index_shard_staged_submit_rearm_test() +
       index_shard_staged_submit_handoff_test() +
       index_shard_staged_submit_backpressure_test() +
       index_shard_completion_registry_test() +
-      index_shard_completion_inline_poll_test();
+      index_shard_completion_inline_poll_test() +
+      index_shard_execute_handoff_test() +
+      index_shard_readiness_ledger_test() +
+      index_shard_helper_readiness_ledger_test();
 }
 #endif

@@ -14,7 +14,7 @@ void test_fitsbin_payload_short_read_and_eintr(CuTest* ct) {
     off_t offsets[4];
     size_t requests[4];
 
-    CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
+    payload_fixture_open_for_test(ct, &fixture);
     expected_offset =
         fixture.chunk->data_file_offset + 5;
 
@@ -80,7 +80,7 @@ void test_fitsbin_payload_eof_is_eio(CuTest* ct) {
     int rc;
     int saved_errno;
 
-    CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
+    payload_fixture_open_for_test(ct, &fixture);
 
     payload_wrapper_reset(PAYLOAD_WRAPPER_EOF);
     errno = 0;
@@ -130,7 +130,7 @@ void test_fitsbin_mapped_population_is_all_or_nothing(
     fitsbin_payload_io_stats_t stats;
     int rc;
 
-    CuAssertIntEquals(ct, 0, payload_fixture_open(&fixture));
+    payload_fixture_open_for_test(ct, &fixture);
     CuAssertIntEquals(
         ct,
         0,

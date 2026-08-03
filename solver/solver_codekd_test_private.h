@@ -48,15 +48,32 @@ typedef struct solver_codekd_test_reserve_result {
     int allocation_failed;
 } solver_codekd_test_reserve_result_t;
 
+typedef struct solver_codekd_test_detached_result {
+    int supported;
+    int queued_callback;
+    int success_compute_ready;
+    int repeated_cycles;
+    int fully_resident_compute_ready;
+    int empty_owner_replay;
+    int callback_error;
+    int eagain_retry;
+    int refusal_owner_fallback;
+    int cancellation_stopped;
+} solver_codekd_test_detached_result_t;
+
 int solver_codekd_test_run_candidate_windows(
     solver_codekd_test_window_result_t* result);
 int solver_codekd_test_run_nonresident_fallback(
     solver_codekd_test_fallback_result_t* result);
 int solver_codekd_test_run_verification_reserve(
     solver_codekd_test_reserve_result_t* result);
+int solver_codekd_test_run_detached_initial_planning(
+    solver_codekd_test_detached_result_t* result);
 
 int solver_test_candidate_rolling_windows(void);
 int solver_test_candidate_nonresident_zero_submit_falls_back(void);
 int solver_test_verification_packet_bounds(void);
-
+int solver_test_captured_verification_requires_owned_sweep(void);
+int solver_test_verification_retirement_horizon(void);
+int solver_test_codekd_detached_initial_planning(void);
 #endif

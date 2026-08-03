@@ -239,6 +239,74 @@ int payload_planned_ranges(
     return 1;
 }
 
+int payload_blocking_planned_ranges(
+    void* opaque,
+    fitsbin_payload_io_cancel_check_fn cancelled,
+    void* cancel_opaque,
+    fitsbin_prefetch_range_t* ranges,
+    size_t range_capacity,
+    size_t* range_count) {
+    payload_blocking_planned_state_t* state = opaque;
+
+    if (!state || !state->gate || !cancelled || !ranges ||
+        !range_capacity || !range_count) {
+        errno = EINVAL;
+        return -1;
+    }
+    *range_count = 0U;
+    pthread_mutex_lock(&state->gate->mutex);
+    state->calls++;
+    state->gate->calls++;
+    pthread_cond_broadcast(&state->gate->condition);
+    while (!state->gate->release && !cancelled(cancel_opaque)) {
+        pthread_cond_wait(
+            &state->gate->condition,
+            &state->gate->mutex);
+    }
+    pthread_mutex_unlock(&state->gate->mutex);
+    if (cancelled(cancel_opaque)) {
+        errno = ECANCELED;
+        return -1;
+    }
+    ranges[0] = state->range;
+    *range_count = 1U;
+    return 1;
+}
+
+int payload_planned_gate_wait_for_calls(
+    payload_planned_gate_t* gate,
+    int expected,
+    int timeout_seconds) {
+    struct timespec deadline;
+    int status = 0;
+
+    if (!gate || expected < 0 || timeout_seconds < 0 ||
+        clock_gettime(CLOCK_REALTIME, &deadline)) {
+        return -1;
+    }
+    deadline.tv_sec += timeout_seconds;
+    pthread_mutex_lock(&gate->mutex);
+    while (gate->calls < expected && status != ETIMEDOUT) {
+        status = pthread_cond_timedwait(
+            &gate->condition,
+            &gate->mutex,
+            &deadline);
+    }
+    expected = gate->calls >= expected;
+    pthread_mutex_unlock(&gate->mutex);
+    return expected ? 0 : -1;
+}
+
+void payload_planned_gate_release(payload_planned_gate_t* gate) {
+    if (!gate) {
+        return;
+    }
+    pthread_mutex_lock(&gate->mutex);
+    gate->release = 1;
+    pthread_cond_broadcast(&gate->condition);
+    pthread_mutex_unlock(&gate->mutex);
+}
+
 int payload_wait_helper_wait_for_calls(
     payload_wait_helper_state_t* helper,
     int expected,
@@ -410,6 +478,30 @@ void payload_fixture_close(
     }
     unlink(fixture->filename);
     memset(fixture, 0, sizeof(*fixture));
+}
+
+static void payload_fixture_test_cleanup(void* opaque) {
+    payload_fixture_t* fixture = opaque;
+
+    /* A failed assertion can leave a synthetic read blocked. */
+    payload_wrapper_release();
+    fitsbin_payload_io_notify_wait_helpers();
+    fitsbin_payload_io_service_stop();
+    fitsbin_payload_io_configure_workers(1);
+    payload_wrapper_reset(PAYLOAD_WRAPPER_PASS);
+    payload_fixture_close(fixture);
+}
+
+void payload_fixture_open_for_test(
+    CuTest* ct,
+    payload_fixture_t* fixture) {
+    int status = payload_fixture_open(fixture);
+
+    if (!status) {
+        CuTestSetFailureCleanup(
+            ct, payload_fixture_test_cleanup, fixture);
+    }
+    CuAssertIntEquals(ct, 0, status);
 }
 
 

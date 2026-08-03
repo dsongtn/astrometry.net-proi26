@@ -122,6 +122,7 @@ int main(void) {
   check_width_plan(4, 4, 1, 1, 4U, 0U);
   check_width_plan(5, 4, 1, 1, 4U, 1U);
   check_width_plan(6, 4, 1, 1, 4U, 2U);
+  check_width_plan(6, 6, 1, 1, 6U, 0U);
   check_width_plan(8, 4, 1, 1, 4U, 4U);
   check_width_plan(8, 6, 1, 1, 6U, 2U);
   check_width_plan(8, 8, 1, 1, 8U, 0U);

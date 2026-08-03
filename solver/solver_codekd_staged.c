@@ -75,6 +75,16 @@ solver_codekd_packet_execute_ready(
     }
     if (packet && more_work &&
         packet->state ==
+            SOLVER_CODEKD_PACKET_VERIFY_PREPARE_COMPUTE_READY) {
+        if (!input || input_size != sizeof(*input) ||
+            output_size != sizeof(*packet)) {
+            return INDEX_SHARD_HELPER_TASK_ERROR;
+        }
+        return solver_codekd_packet_prepare_and_score_verification_ready(
+            input, packet);
+    }
+    if (packet && more_work &&
+        packet->state ==
             SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY) {
         return solver_codekd_packet_score_verification_ready(packet);
     }
@@ -217,7 +227,6 @@ solver_codekd_packet_staged_prepare(
     size_t output_size) {
     solver_codekd_search_packet_t* packet = output_bytes;
     index_shard_helper_task_status_t descriptor_status;
-    int plan_status;
 
     if (!packet || output_size != sizeof(*packet)) {
         return INDEX_SHARD_STAGED_PREPARE_ERROR;
@@ -237,22 +246,8 @@ solver_codekd_packet_staged_prepare(
     }
     if (packet->state != SOLVER_CODEKD_PACKET_DESCRIPTORS_READY) {
         if (packet->state ==
-                SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE) {
-            return packet->plan_complete &&
-                    packet->plan_first < packet->plan_end &&
-                    packet->plan_end <= packet->next_descriptor &&
-                    packet->next_descriptor <= packet->count &&
-                    packet->plan_range_count &&
-                    packet->plan_range_count <=
-                        packet->page_workspace->sealed_range_capacity
-                ? INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY
-                : INDEX_SHARD_STAGED_PREPARE_ERROR;
-        }
-        if (packet->state ==
-                SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER) {
-            return INDEX_SHARD_STAGED_PREPARE_OWNER_READY;
-        }
-        if (packet->state ==
+                SOLVER_CODEKD_PACKET_VERIFY_PREPARE_COMPUTE_READY ||
+            packet->state ==
                 SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY ||
             packet->state ==
                 SOLVER_CODEKD_PACKET_VERIFY_SWEEP_COMPUTE_READY ||
@@ -316,30 +311,7 @@ solver_codekd_packet_staged_prepare(
             : INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY;
     }
     if (packet->next_descriptor < packet->count) {
-        plan_status = solver_codekd_search_packet_prepare_next_plan(
-            packet,
-            solver_codekd_packet_plan_cancelled,
-            NULL);
-        if (plan_status < 0) {
-            packet->state = SOLVER_CODEKD_PACKET_FAILED;
-            return INDEX_SHARD_STAGED_PREPARE_ERROR;
-        }
-        if (plan_status == 2) {
-            return INDEX_SHARD_STAGED_PREPARE_STOPPED;
-        }
-        if (plan_status > 0) {
-            return packet->state ==
-                        SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE &&
-                    packet->plan_complete &&
-                    packet->plan_first < packet->plan_end &&
-                    packet->plan_end <= packet->next_descriptor &&
-                    packet->next_descriptor <= packet->count &&
-                    packet->plan_range_count &&
-                    packet->plan_range_count <=
-                        packet->page_workspace->sealed_range_capacity
-                ? INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY
-                : INDEX_SHARD_STAGED_PREPARE_ERROR;
-        }
+        return INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY;
     }
     if (packet->state == SOLVER_CODEKD_PACKET_RESULTS_READY ||
         packet->next_descriptor == packet->count) {
@@ -490,6 +462,40 @@ static int solver_codekd_packet_staged_cancel(
 }
 
 static index_shard_staged_execute_status_t
+solver_codekd_packet_staged_next_status(
+    const solver_codekd_search_packet_t* packet) {
+    if (!packet) {
+        return INDEX_SHARD_STAGED_EXECUTE_ERROR;
+    }
+    switch (packet->state) {
+    case SOLVER_CODEKD_PACKET_ALLOCATED:
+    case SOLVER_CODEKD_PACKET_DESCRIPTORS_READY:
+        return INDEX_SHARD_STAGED_EXECUTE_MORE;
+    case SOLVER_CODEKD_PACKET_QUAD_SUBMIT_READY:
+    case SOLVER_CODEKD_PACKET_STAR_SUBMIT_READY:
+    case SOLVER_CODEKD_PACKET_VERIFY_SUBMIT_READY:
+    case SOLVER_CODEKD_PACKET_VERIFY_PAGE_PLAN_COMPLETE:
+    case SOLVER_CODEKD_PACKET_VERIFY_SWEEP_SUBMIT_READY:
+        return INDEX_SHARD_STAGED_EXECUTE_SUBMIT_READY;
+    case SOLVER_CODEKD_PACKET_COMPUTE_READY:
+    case SOLVER_CODEKD_PACKET_QUAD_COMPUTE_READY:
+    case SOLVER_CODEKD_PACKET_STAR_COMPUTE_READY:
+    case SOLVER_CODEKD_PACKET_VERIFY_QUERY_COMPUTE_READY:
+    case SOLVER_CODEKD_PACKET_VERIFY_SWEEP_COMPUTE_READY:
+    case SOLVER_CODEKD_PACKET_VERIFY_PREPARE_COMPUTE_READY:
+    case SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY:
+    case SOLVER_CODEKD_PACKET_VERIFY_COMPUTE_READY:
+        return INDEX_SHARD_STAGED_EXECUTE_COMPUTE_READY;
+    case SOLVER_CODEKD_PACKET_RESULTS_READY:
+        return INDEX_SHARD_STAGED_EXECUTE_OK;
+    case SOLVER_CODEKD_PACKET_STOPPED:
+        return INDEX_SHARD_STAGED_EXECUTE_STOPPED;
+    default:
+        return INDEX_SHARD_STAGED_EXECUTE_ERROR;
+    }
+}
+
+static index_shard_staged_execute_status_t
 solver_codekd_packet_staged_execute(
     const void* input_bytes,
     size_t input_size,
@@ -510,9 +516,18 @@ solver_codekd_packet_staged_execute(
     if (status != INDEX_SHARD_HELPER_TASK_OK) {
         return INDEX_SHARD_STAGED_EXECUTE_ERROR;
     }
-    return more_work
-        ? INDEX_SHARD_STAGED_EXECUTE_MORE
-        : INDEX_SHARD_STAGED_EXECUTE_OK;
+    {
+        solver_codekd_search_packet_t* packet = output_bytes;
+        index_shard_staged_execute_status_t next =
+            solver_codekd_packet_staged_next_status(packet);
+
+        if ((next == INDEX_SHARD_STAGED_EXECUTE_OK && more_work) ||
+            (next > INDEX_SHARD_STAGED_EXECUTE_STOPPED &&
+             !more_work)) {
+            return INDEX_SHARD_STAGED_EXECUTE_ERROR;
+        }
+        return next;
+    }
 }
 
 static index_shard_staged_execute_status_t
@@ -521,9 +536,10 @@ solver_codekd_packet_staged_owner(
     size_t input_size,
     void* output_bytes,
     size_t output_size) {
-    const solver_codekd_packet_task_input_t* input = input_bytes;
     solver_codekd_search_packet_t* packet = output_bytes;
-    int prepare_status;
+
+    (void)input_bytes;
+    (void)input_size;
 
     if (!packet || output_size != sizeof(*packet)) {
         return INDEX_SHARD_STAGED_EXECUTE_ERROR;
@@ -536,34 +552,12 @@ solver_codekd_packet_staged_owner(
     if (packet->state == SOLVER_CODEKD_PACKET_DESCRIPTORS_READY) {
         return INDEX_SHARD_STAGED_EXECUTE_MORE;
     }
-    if (packet->state ==
-            SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER) {
-        if (!input || input_size != sizeof(*input)) {
-            packet->state = SOLVER_CODEKD_PACKET_FAILED;
-            return INDEX_SHARD_STAGED_EXECUTE_ERROR;
-        }
-        prepare_status =
-            solver_codekd_packet_prepare_verification_owner(
-                input, packet);
-        if (prepare_status == 2) {
-            return INDEX_SHARD_STAGED_EXECUTE_STOPPED;
-        }
-        if (prepare_status < 0) {
-            packet->state = SOLVER_CODEKD_PACKET_FAILED;
-            return INDEX_SHARD_STAGED_EXECUTE_ERROR;
-        }
-        return prepare_status
-            ? INDEX_SHARD_STAGED_EXECUTE_MORE
-            : INDEX_SHARD_STAGED_EXECUTE_OK;
-    }
     if (packet->state == SOLVER_CODEKD_PACKET_RESULTS_READY) {
         if (solver_codekd_packet_finish_codekd(packet)) {
             packet->state = SOLVER_CODEKD_PACKET_FAILED;
             return INDEX_SHARD_STAGED_EXECUTE_ERROR;
         }
-        return packet->state == SOLVER_CODEKD_PACKET_RESULTS_READY
-            ? INDEX_SHARD_STAGED_EXECUTE_OK
-            : INDEX_SHARD_STAGED_EXECUTE_MORE;
+        return solver_codekd_packet_staged_next_status(packet);
     }
     return INDEX_SHARD_STAGED_EXECUTE_ERROR;
 }

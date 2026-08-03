@@ -295,6 +295,7 @@ static size_t fitsbin_payload_filter_completed_pages(
     size_t span_capacity,
     size_t page_size,
     unsigned long long sequence,
+    anbool account_cache_stats,
     unsigned long long* reused_pages) {
     fitsbin_mapped_span_t filtered[FITSBIN_PREFETCH_RANGE_LIMIT];
     unsigned long long hits = 0ULL;
@@ -363,10 +364,12 @@ static size_t fitsbin_payload_filter_completed_pages(
     }
     memcpy(spans, filtered, filtered_count * sizeof(*spans));
     *reused_pages = hits;
-    __atomic_add_fetch(
-        &fb->payload_cache_hits, hits, __ATOMIC_RELAXED);
-    __atomic_add_fetch(
-        &fb->payload_cache_misses, misses, __ATOMIC_RELAXED);
+    if (account_cache_stats) {
+        __atomic_add_fetch(
+            &fb->payload_cache_hits, hits, __ATOMIC_RELAXED);
+        __atomic_add_fetch(
+            &fb->payload_cache_misses, misses, __ATOMIC_RELAXED);
+    }
     return filtered_count;
 }
 
@@ -399,10 +402,26 @@ void fitsbin_payload_mark_completed_span(
     while (cursor < span->end) {
         size_t page_index = (size_t)(
             (cursor - span->map_begin) / page_size);
-        __atomic_store_n(
-            &sequences[page_index],
-            completed_sequence,
-            __ATOMIC_RELEASE);
+        unsigned int previous = __atomic_load_n(
+            &sequences[page_index], __ATOMIC_ACQUIRE);
+
+        /*
+         * Lanes may finish tickets out of submission order. Never let an
+         * older completion replace a newer marker for the same mapped page.
+         * The active reuse window is far below half the unsigned serial
+         * space, so this wrap-safe comparison is unambiguous.
+         */
+        while ((!previous ||
+                (int32_t)(completed_sequence - previous) > 0) &&
+               !__atomic_compare_exchange_n(
+                   &sequences[page_index],
+                   &previous,
+                   completed_sequence,
+                   TRUE,
+                   __ATOMIC_RELEASE,
+                   __ATOMIC_ACQUIRE)) {
+            /* Retry with the value returned through previous. */
+        }
         if (span->end - cursor <= page_size) {
             break;
         }
@@ -557,6 +576,7 @@ int fitsbin_prepare_mapped_spans(
     size_t range_count,
     size_t byte_budget,
     unsigned long long reuse_sequence,
+    anbool account_cache_stats,
     fitsbin_mapped_span_t* spans,
     size_t span_capacity,
     size_t* span_count,
@@ -716,30 +736,33 @@ int fitsbin_prepare_mapped_spans(
         exact_bytes += span_bytes;
     }
     original_merged = merged;
-    filtered = fitsbin_payload_filter_completed_pages(
-        fb,
-        spans,
-        merged,
-        span_capacity,
-        page_size,
-        reuse_sequence,
-        &reused_pages);
-    if (filtered != SIZE_MAX) {
-        merged = filtered;
-        exact_bytes = 0U;
-        for (i = 0U; i < merged; i++) {
-            size_t span_bytes =
-                (size_t)(spans[i].end - spans[i].begin);
+    if (reuse_sequence) {
+        filtered = fitsbin_payload_filter_completed_pages(
+            fb,
+            spans,
+            merged,
+            span_capacity,
+            page_size,
+            reuse_sequence,
+            account_cache_stats,
+            &reused_pages);
+        if (filtered != SIZE_MAX) {
+            merged = filtered;
+            exact_bytes = 0U;
+            for (i = 0U; i < merged; i++) {
+                size_t span_bytes =
+                    (size_t)(spans[i].end - spans[i].begin);
 
-            if (exact_bytes > byte_budget ||
-                span_bytes > byte_budget - exact_bytes) {
-                errno = E2BIG;
-                return -1;
+                if (exact_bytes > byte_budget ||
+                    span_bytes > byte_budget - exact_bytes) {
+                    errno = E2BIG;
+                    return -1;
+                }
+                exact_bytes += span_bytes;
             }
-            exact_bytes += span_bytes;
+        } else {
+            reused_pages = 0ULL;
         }
-    } else {
-        reused_pages = 0ULL;
     }
     gap_budget = MIN(
         byte_budget - exact_bytes,

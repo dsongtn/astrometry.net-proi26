@@ -153,6 +153,8 @@ void CuTestInit(CuTest* t, const char* name, TestFunction function)
 	t->message = NULL;
 	t->function = function;
 	t->jumpBuf = NULL;
+	t->failureCleanupFunction = NULL;
+	t->failureCleanupContext = NULL;
 }
 
 void CuTestFree(CuTest* t) {
@@ -169,6 +171,18 @@ CuTest* CuTestNew(const char* name, TestFunction function)
 	return tc;
 }
 
+static void CuTestRunFailureCleanup(CuTest* tc)
+{
+	if (tc->failureCleanupFunction != NULL)
+	{
+		FailureCleanupFunction function = tc->failureCleanupFunction;
+		void* context = tc->failureCleanupContext;
+		tc->failureCleanupFunction = NULL;
+		tc->failureCleanupContext = NULL;
+		function(context);
+	}
+}
+
 void CuTestRun(CuTest* tc)
 {
 	jmp_buf buf;
@@ -179,6 +193,15 @@ void CuTestRun(CuTest* tc)
 		(tc->function)(tc);
 	}
 	tc->jumpBuf = 0;
+	tc->failureCleanupFunction = NULL;
+	tc->failureCleanupContext = NULL;
+}
+
+void CuTestSetFailureCleanup(
+	CuTest* tc, FailureCleanupFunction function, void* context)
+{
+	tc->failureCleanupFunction = function;
+	tc->failureCleanupContext = context;
 }
 
 static void CuFailInternal(CuTest* tc, const char* file, int line, CuString* string)
@@ -195,7 +218,12 @@ static void CuFailInternal(CuTest* tc, const char* file, int line, CuString* str
 
 	tc->failed = 1;
 	tc->message = string->buffer;
-	if (tc->jumpBuf != 0) longjmp(*(tc->jumpBuf), 0);
+	if (tc->jumpBuf != 0)
+	{
+		/* Run cleanup while the failing test's stack is still valid. */
+		CuTestRunFailureCleanup(tc);
+		longjmp(*(tc->jumpBuf), 0);
+	}
 }
 
 void CuFail_Line(CuTest* tc, const char* file, int line, const char* message2, const char* message)

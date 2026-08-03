@@ -39,6 +39,7 @@ void CuDieOnFail();
 typedef struct CuTest CuTest;
 
 typedef void (*TestFunction)(CuTest *);
+typedef void (*FailureCleanupFunction)(void *);
 
 struct CuTest
 {
@@ -48,12 +49,17 @@ struct CuTest
 	int ran;
 	const char* message;
 	jmp_buf *jumpBuf;
+	FailureCleanupFunction failureCleanupFunction;
+	void* failureCleanupContext;
 };
 
 void CuTestInit(CuTest* t, const char* name, TestFunction function);
 CuTest* CuTestNew(const char* name, TestFunction function);
 void CuTestFree(CuTest* tc);
 void CuTestRun(CuTest* tc);
+/* Called before a failed assertion unwinds the test function. */
+void CuTestSetFailureCleanup(
+	CuTest* tc, FailureCleanupFunction function, void* context);
 
 /* Internal versions of assert functions -- use the public versions */
 void CuFail_Line(CuTest* tc, const char* file, int line, const char* message2, const char* message);

@@ -45,9 +45,26 @@
     FITSBIN_MMAP_PREFETCH_RANGE_LIMIT
 #define SOLVER_CODEKD_DELIVERY_BUDGET_BYTES \
     (2U * 1024U * 1024U)
+/*
+ * Publish one following descriptor wave so the payload service can prime its
+ * exact mapped pages before completion lanes block on the current wave. The
+ * physical lookahead does not change descriptor grain or retirement order.
+ */
+#define SOLVER_CODEKD_MAX_LOOKAHEAD_WAVES 2U
+#define SOLVER_CODEKD_LOOKAHEAD_WAVES 2U
+#if SOLVER_CODEKD_LOOKAHEAD_WAVES < 1U || \
+    SOLVER_CODEKD_LOOKAHEAD_WAVES > \
+        SOLVER_CODEKD_MAX_LOOKAHEAD_WAVES
+#error "CodeKD lookahead wave count is outside the supported bound"
+#endif
 #define SOLVER_CANDIDATE_DELIVERY_LIMIT \
     (FITSBIN_PREAD_ASYNC_RANGE_LIMIT / 2U)
-#define SOLVER_VERIFY_QUERY_LOOKAHEAD 16U
+#define SOLVER_VERIFY_RETIRE_HORIZON \
+    (SOLVER_CANDIDATE_DELIVERY_LIMIT / 2U)
+#if SOLVER_VERIFY_RETIRE_HORIZON == 0 || \
+    SOLVER_VERIFY_RETIRE_HORIZON > SOLVER_CANDIDATE_DELIVERY_LIMIT
+#error "verification retirement horizon is outside candidate window"
+#endif
 #ifndef SOLVER_VERIFY_SWEEP_ASYNC_DIRECT_ENABLED
 #define SOLVER_VERIFY_SWEEP_ASYNC_DIRECT_ENABLED 0
 #endif
@@ -79,6 +96,7 @@ typedef struct solver_codekd_result_slot {
 typedef enum solver_codekd_search_packet_state {
     SOLVER_CODEKD_PACKET_ALLOCATED = 0,
     SOLVER_CODEKD_PACKET_DESCRIPTORS_READY,
+    SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED,
     SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE,
     SOLVER_CODEKD_PACKET_COMPUTE_READY,
     SOLVER_CODEKD_PACKET_QUAD_SUBMIT_READY,
@@ -94,7 +112,7 @@ typedef enum solver_codekd_search_packet_state {
     SOLVER_CODEKD_PACKET_VERIFY_SWEEP_SUBMIT_READY,
     SOLVER_CODEKD_PACKET_VERIFY_SWEEP_IO_SUBMITTED,
     SOLVER_CODEKD_PACKET_VERIFY_SWEEP_COMPUTE_READY,
-    SOLVER_CODEKD_PACKET_VERIFY_PREPARE_OWNER,
+    SOLVER_CODEKD_PACKET_VERIFY_PREPARE_COMPUTE_READY,
     SOLVER_CODEKD_PACKET_VERIFY_SCORE_COMPUTE_READY,
     SOLVER_CODEKD_PACKET_VERIFY_COMPUTE_READY,
     SOLVER_CODEKD_PACKET_EXECUTING,
@@ -449,7 +467,13 @@ int solver_codekd_search_packet_prepare_next_plan(
     solver_codekd_search_packet_t* packet,
     fitsbin_payload_io_cancel_check_fn cancelled,
     void* cancel_opaque);
-anbool solver_codekd_packet_plan_cancelled(void* opaque);
+int solver_codekd_packet_plan_codekd_pages(
+    void* opaque,
+    fitsbin_payload_io_cancel_check_fn cancelled,
+    void* cancel_opaque,
+    fitsbin_prefetch_range_t* ranges,
+    size_t range_capacity,
+    size_t* range_count);
 void solver_codekd_packet_disable_verification_delivery(
     solver_codekd_search_packet_t* packet);
 void solver_codekd_packet_reset_verify_plan(
@@ -474,7 +498,6 @@ int solver_codekd_search_packet_release_ticket(
 void solver_codekd_packet_profile_accumulate(
     solver_t* solver,
     const solver_codekd_search_packet_t* packet);
-
 int solver_codekd_search_packet_prepare(
     const solver_t* solver,
     solver_codekd_search_packet_t* packet,
@@ -525,13 +548,16 @@ index_shard_helper_task_status_t
 solver_codekd_packet_capture_sweep_ready(
     solver_codekd_search_packet_t* packet,
     anbool* more_work);
-int solver_codekd_packet_prepare_verification_owner(
+index_shard_helper_task_status_t
+solver_codekd_packet_prepare_and_score_verification_ready(
     const solver_codekd_packet_task_input_t* input,
     solver_codekd_search_packet_t* packet);
 index_shard_helper_task_status_t
 solver_codekd_packet_score_verification_ready(
     solver_codekd_search_packet_t* packet);
 int solver_codekd_packet_retired_verification_complete(
+    solver_codekd_search_packet_t* packet);
+int solver_codekd_packet_rearm_verification_owner(
     solver_codekd_search_packet_t* packet);
 
 int solver_codekd_descriptor_execute_owner(

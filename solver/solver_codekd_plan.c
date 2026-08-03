@@ -678,11 +678,6 @@ void solver_codekd_page_plan_record_refusal(
     packet->page_stats.refusal_counts[reason]++;
 }
 
-anbool solver_codekd_packet_plan_cancelled(void* opaque) {
-    (void)opaque;
-    return index_shard_worker_stop_requested();
-}
-
 /*
  * Plan the next contiguous descriptor slice transactionally. A positive
  * result exposes one complete sealed plan. Zero means every descriptor now
@@ -703,7 +698,8 @@ int solver_codekd_search_packet_prepare_next_plan(
         !packet->tree->io || !packet->tree->io_is_fitsbin ||
         !packet->descriptors || !packet->slots ||
         !packet->page_workspace || !cancelled ||
-        packet->state != SOLVER_CODEKD_PACKET_DESCRIPTORS_READY ||
+        packet->state !=
+            SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED ||
         packet->next_descriptor > packet->count) {
         return -1;
     }
@@ -898,6 +894,66 @@ int solver_codekd_search_packet_prepare_next_plan(
         }
         packet->state = SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE;
     }
+    return 1;
+}
+
+int solver_codekd_packet_plan_codekd_pages(
+    void* opaque,
+    fitsbin_payload_io_cancel_check_fn cancelled,
+    void* cancel_opaque,
+    fitsbin_prefetch_range_t* ranges,
+    size_t range_capacity,
+    size_t* range_count) {
+    solver_codekd_search_packet_t* packet = opaque;
+    int plan_status;
+
+    if (!packet || !cancelled || !ranges || !range_count) {
+        errno = EINVAL;
+        return -1;
+    }
+    *range_count = 0U;
+    plan_status = solver_codekd_search_packet_prepare_next_plan(
+        packet, cancelled, cancel_opaque);
+    if (plan_status < 0) {
+        packet->state = SOLVER_CODEKD_PACKET_FAILED;
+        errno = EIO;
+        return -1;
+    }
+    if (plan_status == 2) {
+        errno = ECANCELED;
+        return -1;
+    }
+    if (!plan_status) {
+        if (packet->state != SOLVER_CODEKD_PACKET_RESULTS_READY ||
+            packet->plan_complete ||
+            packet->next_descriptor != packet->count) {
+            packet->state = SOLVER_CODEKD_PACKET_FAILED;
+            errno = EINVAL;
+            return -1;
+        }
+        return 0;
+    }
+    if (packet->state != SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE ||
+        !packet->plan_complete ||
+        packet->plan_first >= packet->plan_end ||
+        packet->plan_end > packet->next_descriptor ||
+        packet->next_descriptor > packet->count ||
+        !packet->plan_range_count ||
+        !packet->page_workspace ||
+        packet->plan_range_count > range_capacity ||
+        packet->plan_range_count >
+            packet->page_workspace->sealed_range_capacity) {
+        packet->state = SOLVER_CODEKD_PACKET_FAILED;
+        errno = packet->plan_range_count > range_capacity
+            ? E2BIG
+            : EINVAL;
+        return -1;
+    }
+    memcpy(
+        ranges,
+        packet->page_workspace->sealed_ranges,
+        packet->plan_range_count * sizeof(*ranges));
+    *range_count = packet->plan_range_count;
     return 1;
 }
 

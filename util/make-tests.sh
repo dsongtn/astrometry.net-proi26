@@ -29,10 +29,11 @@ cat $FILES | grep '^void test_' |
 echo \
 '
 
-void RunAllTests(void) 
+int RunAllTests(void)
 {
     CuString *output = CuStringNew();
     CuSuite* suite = CuSuiteNew();
+    int failed;
 
 '
 cat $FILES | grep '^void test_' | 
@@ -50,8 +51,11 @@ echo \
 printf %s \
 '    printf("%s\n", output->buffer);
 
+    failed = suite->failCount != 0;
+
     CuSuiteFree(suite);
     CuStringFree(output);
+    return failed;
 }
 
 int main(int argc, char** args)
@@ -60,7 +64,6 @@ int main(int argc, char** args)
         printf("Setting die on fail.\n");
         CuDieOnFail();
     }
-    RunAllTests();
-    return 0;
+    return RunAllTests() ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 '

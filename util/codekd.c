@@ -48,7 +48,7 @@ int codetree_get_permuted(codetree_t* s, int index) {
 static codetree_t* my_open(const char* fn, anqfits_t* fits,
                            anbool metadata_only) {
     codetree_t* s;
-    kdtree_fits_t* io;
+    kdtree_fits_t* io = NULL;
     char* treename = CODETREE_NAME;
 
     s = codetree_alloc();
@@ -81,7 +81,14 @@ static codetree_t* my_open(const char* fn, anqfits_t* fits,
 
     return s;
  bailout:
-    free(s);
+    if (s->tree) {
+        /* The tree owns io after a successful header read. */
+        io = NULL;
+    }
+    if (io) {
+        kdtree_fits_io_close(io);
+    }
+    codetree_close(s);
     return NULL;
 }
 

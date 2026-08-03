@@ -112,6 +112,19 @@ typedef struct payload_planned_state {
     int calls;
 } payload_planned_state_t;
 
+typedef struct payload_planned_gate {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    int calls;
+    int release;
+} payload_planned_gate_t;
+
+typedef struct payload_blocking_planned_state {
+    payload_planned_gate_t* gate;
+    fitsbin_prefetch_range_t range;
+    int calls;
+} payload_blocking_planned_state_t;
+
 typedef struct payload_readahead_state {
     pthread_mutex_t mutex;
     int recording;
@@ -136,6 +149,18 @@ int payload_planned_ranges(
     fitsbin_prefetch_range_t* ranges,
     size_t range_capacity,
     size_t* range_count);
+int payload_blocking_planned_ranges(
+    void* opaque,
+    fitsbin_payload_io_cancel_check_fn cancelled,
+    void* cancel_opaque,
+    fitsbin_prefetch_range_t* ranges,
+    size_t range_capacity,
+    size_t* range_count);
+int payload_planned_gate_wait_for_calls(
+    payload_planned_gate_t* gate,
+    int expected,
+    int timeout_seconds);
+void payload_planned_gate_release(payload_planned_gate_t* gate);
 int payload_wait_helper_wait_for_calls(
     payload_wait_helper_state_t* helper,
     int expected,
@@ -146,6 +171,9 @@ int payload_ticket_drain_wait_started(
     payload_ticket_drain_state_t* state,
     int timeout_seconds);
 int payload_fixture_open(payload_fixture_t* fixture);
+void payload_fixture_open_for_test(
+    CuTest* ct,
+    payload_fixture_t* fixture);
 void payload_fixture_close(payload_fixture_t* fixture);
 int payload_credit_round(
     payload_fixture_t* fixture,

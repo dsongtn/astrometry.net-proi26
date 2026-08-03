@@ -39,10 +39,23 @@
 #include "astrometry/fitsbin.h"
 #include "astrometry/fitsioutils.h"
 /* queue_mutex must be held. */
+static anbool index_shard_inner_work_available_locked(
+    const index_shard_thread_state_t *shared) {
+  if (!shared) {
+    return FALSE;
+  }
+  return shared->helper_ready_tasks ||
+      shared->staged_io_ready ||
+      shared->staged_compute_ready ||
+      (shared->staged_submit_backpressure
+           ? shared->staged_submit_credit_ready
+           : shared->staged_submit_ready) ||
+      shared->staged_prepare_ready;
+}
+
+/* queue_mutex must be held. */
 static anbool index_shard_queue_work_available_locked(
     const index_shard_thread_state_t *shared) {
-  int owner_worker;
-
   if (!shared || !shared->pool) {
     return FALSE;
   }
@@ -51,44 +64,66 @@ static anbool index_shard_queue_work_available_locked(
       shared->outer_running < shared->producer_width) {
     return TRUE;
   }
-  for (owner_worker = 0;
-       owner_worker < shared->worker_count;
-       owner_worker++) {
-    const index_shard_worker_context_t *owner =
-        &shared->pool->contexts[owner_worker];
-    const index_shard_staged_group_t *staged =
-        owner->published_staged_group;
-    const index_shard_helper_group_t *helper =
-        owner->published_helper_group;
-    uint64_t io_ready;
+  return index_shard_inner_work_available_locked(shared);
+}
 
-    if (helper && helper->ready_count) {
-      return TRUE;
+/*
+ * Outer owners wait on private condition variables while their staged group
+ * remains live. They are not queue_cv waiters, but they may execute foreign
+ * globally-ready work. Wake one such owner when no shared queue waiter can
+ * consume the handoff; otherwise ready work can remain stranded while every
+ * compute worker sleeps on a different owner_cv.
+ *
+ * queue_mutex must be held.
+ */
+static void index_shard_signal_staged_owner_locked(
+    index_shard_thread_state_t *shared) {
+  size_t offset;
+  size_t start;
+
+  if (!shared || !shared->pool ||
+      shared->worker_count <= 0 ||
+      !index_shard_inner_work_available_locked(shared)) {
+    return;
+  }
+  start = shared->staged_owner_wake_cursor;
+  if (start >= (size_t)shared->worker_count) {
+    start = 0U;
+  }
+  for (offset = 0U;
+       offset < (size_t)shared->worker_count;
+       offset++) {
+    size_t worker_id = start + offset;
+    index_shard_worker_context_t *owner;
+
+    if (worker_id >= (size_t)shared->worker_count) {
+      worker_id -= (size_t)shared->worker_count;
     }
-    if (!staged) {
+    owner = &shared->pool->contexts[worker_id];
+    if (!owner->published_staged_group ||
+        owner->published_helper_group ||
+        !owner->owner_cv_ready || !owner->owner_waiting ||
+        owner->owner_wake_pending) {
       continue;
     }
-    io_ready = staged->io_submitted_mask &
-        staged->completion_pending_mask;
-    if (staged->cancelling) {
-      io_ready |= staged->io_submitted_mask &
-          ~staged->cancel_sent_mask;
+    shared->staged_owner_wake_cursor = worker_id + 1U;
+    if (shared->staged_owner_wake_cursor >=
+        (size_t)shared->worker_count) {
+      shared->staged_owner_wake_cursor = 0U;
     }
-    if (io_ready || staged->compute_ready_mask ||
-        (shared->staged_submit_backpressure
-             ? staged->submit_credit_mask
-             : staged->submit_ready_mask) ||
-        staged->prepare_ready_mask) {
-      return TRUE;
-    }
+    index_shard_owner_signal_locked(shared, (int)worker_id);
+    return;
   }
-  return FALSE;
 }
 
 /* queue_mutex must be held. */
 void index_shard_queue_signal_locked(
     index_shard_thread_state_t *shared) {
-  if (!shared || !shared->queue_waiters) {
+  if (!shared) {
+    return;
+  }
+  if (!shared->queue_waiters) {
+    index_shard_signal_staged_owner_locked(shared);
     return;
   }
   if (!index_shard_queue_work_available_locked(shared)) {

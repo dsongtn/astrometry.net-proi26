@@ -252,8 +252,11 @@ int main(int argc, char** args) {
     free(flatwanted);
 
     assert(!solver_test_verification_packet_bounds());
+    assert(!solver_test_captured_verification_requires_owned_sweep());
+    assert(!solver_test_verification_retirement_horizon());
     assert(!solver_test_candidate_nonresident_zero_submit_falls_back());
     assert(!solver_test_candidate_rolling_windows());
+    assert(!solver_test_codekd_detached_initial_planning());
 
     return 0;
 }

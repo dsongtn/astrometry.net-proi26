@@ -105,6 +105,51 @@ static int index_shard_helper_release_foreign_reservations_locked(
 }
 
 /* queue_mutex must be held. */
+static int index_shard_helper_account_ready_locked(
+    index_shard_thread_state_t *shared,
+    index_shard_helper_group_t *group) {
+  if (!shared || !group || group->ready_accounted ||
+      SIZE_MAX - shared->helper_ready_tasks < group->ready_count) {
+    return -1;
+  }
+  shared->helper_ready_tasks += group->ready_count;
+  group->ready_accounted = TRUE;
+  return 0;
+}
+
+/* queue_mutex must be held. */
+static int index_shard_helper_remove_ready_locked(
+    index_shard_thread_state_t *shared,
+    index_shard_helper_group_t *group,
+    size_t count) {
+  if (!shared || !group || count > group->ready_count) {
+    return -1;
+  }
+  if (group->ready_accounted) {
+    if (count > shared->helper_ready_tasks) {
+      return -1;
+    }
+    shared->helper_ready_tasks -= count;
+  }
+  return 0;
+}
+
+/* queue_mutex must be held. */
+static int index_shard_helper_unaccount_ready_locked(
+    index_shard_thread_state_t *shared,
+    index_shard_helper_group_t *group) {
+  if (!shared || !group || !group->ready_accounted) {
+    return -1;
+  }
+  if (group->ready_count > shared->helper_ready_tasks) {
+    return -1;
+  }
+  shared->helper_ready_tasks -= group->ready_count;
+  group->ready_accounted = FALSE;
+  return 0;
+}
+
+/* queue_mutex must be held. */
 static void index_shard_helper_cancel_ready_locked(
     index_shard_thread_state_t *shared,
     index_shard_helper_group_t *group,
@@ -118,6 +163,10 @@ static void index_shard_helper_cancel_ready_locked(
       shared,
       group,
       group->foreign_reservations_outstanding);
+  if (index_shard_helper_remove_ready_locked(
+          shared, group, group->ready_count)) {
+    group->internal_error = TRUE;
+  }
   for (i = 0U; i < group->task_count; i++) {
     index_shard_helper_task_t *task = &group->tasks[i];
 
@@ -152,13 +201,14 @@ static void index_shard_helper_cancel_ready_locked(
 
 /* queue_mutex must be held. */
 static int index_shard_helper_claim_locked(
+    index_shard_thread_state_t *shared,
     index_shard_helper_group_t *group,
     size_t *task_index) {
   index_shard_helper_task_t *task;
   unsigned long long work;
   size_t candidate;
 
-  if (!group || !task_index || !group->tasks) {
+  if (!shared || !group || !task_index || !group->tasks) {
     return -1;
   }
   if (!group->ready_count) {
@@ -183,6 +233,11 @@ static int index_shard_helper_claim_locked(
     return -1;
   }
 
+  if (index_shard_helper_remove_ready_locked(
+          shared, group, 1U)) {
+    group->internal_error = TRUE;
+    return -1;
+  }
   task->scheduler_state = INDEX_SHARD_HELPER_TASK_RUNNING;
   group->next_claim = candidate + 1U;
   group->ready_count--;
@@ -259,7 +314,7 @@ static int index_shard_helper_select_locked(
     return -1;
   }
   if (index_shard_helper_claim_locked(
-          best, &claim->task_index)) {
+          shared, best, &claim->task_index)) {
     pthread_mutex_unlock(&shared->state_mutex);
     return -1;
   }
@@ -317,8 +372,10 @@ int index_shard_inner_select_locked(
     return rc;
   }
 
-  rc = index_shard_helper_select_locked(
-      worker, shared, &claim->helper);
+  rc = shared->helper_ready_tasks
+      ? index_shard_helper_select_locked(
+          worker, shared, &claim->helper)
+      : 1;
   if (rc <= 0) {
     if (!rc) {
       claim->kind = INDEX_SHARD_INNER_CLAIM_HELPER;
@@ -524,7 +581,7 @@ int index_shard_helper_owner_claim_locked(
       shared->solved_published;
   if (!fatal && !stopped) {
     rc = index_shard_helper_claim_locked(
-        group, task_index);
+        shared, group, task_index);
     pthread_mutex_unlock(&shared->state_mutex);
     return rc;
   }
@@ -760,7 +817,6 @@ index_shard_helper_run_internal(
   int prepublish_fatal = FALSE;
   int preparation_permit = FALSE;
   int staged_child_permit = FALSE;
-  int helper_window_active = FALSE;
 
   if (stats) {
     memset(stats, 0, sizeof(*stats));
@@ -873,7 +929,7 @@ index_shard_helper_run_internal(
              shared->solved_published) {
     result = INDEX_SHARD_HELPER_STOPPED;
   } else if (index_shard_helper_claim_locked(
-                 &group, &claim.task_index)) {
+                 shared, &group, &claim.task_index)) {
     prepublish_fatal = TRUE;
     result = INDEX_SHARD_HELPER_FATAL;
   }
@@ -901,6 +957,13 @@ index_shard_helper_run_internal(
     index_shard_request_fatal_stop(shared);
     return INDEX_SHARD_HELPER_FATAL;
   }
+  if (index_shard_helper_account_ready_locked(
+          shared, &group)) {
+    pthread_mutex_unlock(&shared->state_mutex);
+    pthread_mutex_unlock(&shared->queue_mutex);
+    index_shard_request_fatal_stop(shared);
+    return INDEX_SHARD_HELPER_FATAL;
+  }
   group.foreign_reservations_outstanding =
       group.foreign_reserve;
   shared->helper_foreign_reservations +=
@@ -923,8 +986,6 @@ index_shard_helper_run_internal(
     }
   }
   pthread_mutex_unlock(&shared->state_mutex);
-  fitsbin_payload_io_begin_helper_window();
-  helper_window_active = TRUE;
   index_shard_queue_signal_locked(shared);
   pthread_mutex_unlock(&shared->queue_mutex);
   fitsbin_payload_io_notify_wait_helpers();
@@ -1061,7 +1122,7 @@ index_shard_helper_run_internal(
             &group, INDEX_SHARD_HELPER_TASK_ERROR);
       } else if (!claim_status) {
         group.owner_claims++;
-              group.owner_work += index_shard_helper_task_work(
+        group.owner_work += index_shard_helper_task_work(
             &group.tasks[claim.task_index]);
         shared->helper_tasks_owner++;
         have_claim = TRUE;
@@ -1113,6 +1174,10 @@ index_shard_helper_run_internal(
     ctx->published_helper_group = NULL;
     group.internal_error = TRUE;
   }
+  if (index_shard_helper_unaccount_ready_locked(
+          shared, &group)) {
+    group.internal_error = TRUE;
+  }
   if (!shared->helper_groups_active) {
     group.internal_error = TRUE;
   } else {
@@ -1122,17 +1187,12 @@ index_shard_helper_run_internal(
       shared, group.owner_worker);
   pthread_mutex_unlock(&shared->queue_mutex);
 
-  if (helper_window_active) {
+  if (shared->observability_enabled) {
     double helper_window_seconds = 0.0;
 
-    if (shared->observability_enabled) {
-      helper_window_seconds =
-          monotonic_seconds() - group.helper_window_start;
-    }
-    fitsbin_payload_io_end_helper_window();
-    helper_window_active = FALSE;
-    if (shared->observability_enabled &&
-        helper_window_seconds >= 0.0) {
+    helper_window_seconds =
+        monotonic_seconds() - group.helper_window_start;
+    if (helper_window_seconds >= 0.0) {
       pthread_mutex_lock(&shared->queue_mutex);
       shared->helper_window_seconds +=
           helper_window_seconds;
@@ -1191,3 +1251,178 @@ index_shard_helper_run_ordered(
       owner_context,
       stats);
 }
+
+#ifdef TESTING_INDEX_SHARD_HELPER_LEDGER
+static void index_shard_helper_ledger_test_init_group(
+    index_shard_helper_group_t *group,
+    index_shard_helper_task_t *tasks,
+    size_t task_count,
+    const index_shard_pool_t *pool,
+    const index_shard_worker_context_t *owner) {
+  size_t i;
+
+  memset(group, 0, sizeof(*group));
+  memset(tasks, 0, task_count * sizeof(*tasks));
+  group->tasks = tasks;
+  group->task_count = task_count;
+  group->generation = pool->generation;
+  group->owner_epoch = owner->helper_group_epoch;
+  group->owner_worker = owner->worker_id;
+  group->owner_index_order = owner->current_index_order;
+  group->ready_count = task_count;
+  group->ready_work = (unsigned long long)task_count;
+  for (i = 0U; i < task_count; i++) {
+    tasks[i].work_units = 1U;
+    tasks[i].scheduler_state = INDEX_SHARD_HELPER_TASK_READY;
+    tasks[i].execute_status = INDEX_SHARD_HELPER_TASK_ERROR;
+  }
+}
+
+int index_shard_helper_readiness_ledger_test(void) {
+  index_shard_pool_t pool;
+  index_shard_worker_context_t contexts[2];
+  index_shard_helper_group_t group;
+  index_shard_helper_group_t mismatch_group;
+  index_shard_helper_task_t tasks[4];
+  index_shard_helper_task_t mismatch_tasks[2];
+  index_shard_helper_claim_t first_owner_claim;
+  index_shard_helper_claim_t foreign_claim;
+  index_shard_helper_claim_t second_owner_claim;
+  index_shard_thread_state_t *shared;
+  int failures = 0;
+  size_t i;
+
+  memset(&pool, 0, sizeof(pool));
+  memset(contexts, 0, sizeof(contexts));
+  memset(&first_owner_claim, 0, sizeof(first_owner_claim));
+  memset(&foreign_claim, 0, sizeof(foreign_claim));
+  memset(&second_owner_claim, 0, sizeof(second_owner_claim));
+  shared = &pool.shared;
+  if (pthread_mutex_init(&shared->queue_mutex, NULL)) {
+    return 1;
+  }
+  if (pthread_mutex_init(&shared->state_mutex, NULL)) {
+    pthread_mutex_destroy(&shared->queue_mutex);
+    return 1;
+  }
+
+  pool.worker_count = 2;
+  pool.generation = 31U;
+  pool.contexts = contexts;
+  shared->pool = &pool;
+  shared->worker_count = 2;
+  for (i = 0U; i < 2U; i++) {
+    contexts[i].worker_id = (int)i;
+    contexts[i].pool = &pool;
+    contexts[i].generation_seen = pool.generation;
+    contexts[i].current_outer_active = TRUE;
+    contexts[i].current_index_order = i;
+  }
+  contexts[0].helper_group_epoch = 41U;
+  index_shard_helper_ledger_test_init_group(
+      &group, tasks, 4U, &pool, &contexts[0]);
+  first_owner_claim.group = &group;
+  second_owner_claim.group = &group;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_helper_owner_claim_locked(
+      shared, &group, &first_owner_claim.task_index) != 0;
+  failures += first_owner_claim.task_index != 0U;
+  failures += group.ready_count != 3U;
+  failures += shared->helper_ready_tasks != 0U;
+  failures += index_shard_helper_account_ready_locked(
+      shared, &group) != 0;
+  failures += !group.ready_accounted;
+  failures += shared->helper_ready_tasks != 3U;
+  contexts[0].published_helper_group = &group;
+
+  failures += index_shard_helper_select_locked(
+      &contexts[1], shared, &foreign_claim) != 0;
+  failures += foreign_claim.group != &group;
+  failures += foreign_claim.task_index != 1U;
+  failures += group.ready_count != 2U;
+  failures += shared->helper_ready_tasks != 2U;
+
+  failures += index_shard_helper_owner_claim_locked(
+      shared, &group, &second_owner_claim.task_index) != 0;
+  failures += second_owner_claim.task_index != 2U;
+  failures += group.ready_count != 1U;
+  failures += group.running_count != 3U;
+  failures += shared->helper_ready_tasks != 1U;
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  failures += index_shard_helper_complete_claim(
+      shared, &first_owner_claim,
+      INDEX_SHARD_HELPER_TASK_OK) != 0;
+  failures += index_shard_helper_complete_claim(
+      shared, &foreign_claim,
+      INDEX_SHARD_HELPER_TASK_OK) != 0;
+  failures += index_shard_helper_complete_claim(
+      shared, &second_owner_claim,
+      INDEX_SHARD_HELPER_TASK_OK) != 0;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += group.ready_count != 1U;
+  failures += group.running_count != 0U;
+  failures += group.completed_count != 3U;
+  failures += shared->helper_ready_tasks != 1U;
+  index_shard_helper_cancel_ready_locked(
+      shared, &group, INDEX_SHARD_HELPER_TASK_STOPPED);
+  failures += group.ready_count != 0U;
+  failures += group.running_count != 0U;
+  failures += group.completed_count != 4U;
+  failures += group.ready_work != 0U;
+  failures += !group.stop_seen;
+  failures += shared->helper_ready_tasks != 0U;
+  for (i = 0U; i < 4U; i++) {
+    failures += tasks[i].scheduler_state !=
+        INDEX_SHARD_HELPER_TASK_DONE;
+  }
+  contexts[0].published_helper_group = NULL;
+  failures += index_shard_helper_unaccount_ready_locked(
+      shared, &group) != 0;
+  failures += group.ready_accounted;
+  failures += shared->helper_ready_tasks != 0U;
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  contexts[0].helper_group_epoch++;
+  index_shard_helper_ledger_test_init_group(
+      &mismatch_group, mismatch_tasks, 2U,
+      &pool, &contexts[0]);
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_helper_account_ready_locked(
+      shared, &mismatch_group) != 0;
+  contexts[0].published_helper_group = &mismatch_group;
+  failures += shared->helper_ready_tasks != 2U;
+  shared->helper_ready_tasks = 1U;
+  pthread_mutex_lock(&shared->state_mutex);
+  shared->fatal_error = TRUE;
+  pthread_mutex_unlock(&shared->state_mutex);
+  failures += !index_shard_helper_cancel_for_pool_locked(
+      shared, &mismatch_group);
+  failures += !mismatch_group.internal_error;
+  failures += !mismatch_group.task_failed;
+  failures += mismatch_group.stop_seen;
+  failures += mismatch_group.ready_count != 0U;
+  failures += mismatch_group.running_count != 0U;
+  failures += mismatch_group.completed_count != 2U;
+  failures += mismatch_group.ready_work != 0U;
+  for (i = 0U; i < 2U; i++) {
+    failures += mismatch_tasks[i].scheduler_state !=
+        INDEX_SHARD_HELPER_TASK_DONE;
+    failures += mismatch_tasks[i].execute_status !=
+        INDEX_SHARD_HELPER_TASK_ERROR;
+  }
+  contexts[0].published_helper_group = NULL;
+  failures += index_shard_helper_unaccount_ready_locked(
+      shared, &mismatch_group) != 0;
+  failures += mismatch_group.ready_accounted;
+  failures += shared->helper_ready_tasks != 1U;
+  shared->helper_ready_tasks = 0U;
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  pthread_mutex_destroy(&shared->state_mutex);
+  pthread_mutex_destroy(&shared->queue_mutex);
+  return failures;
+}
+#endif

@@ -30,6 +30,8 @@ typedef enum verify_prepared_state {
 struct verify_index_query {
     /* source is borrowed until this query is consumed or destroyed. */
     const startree_t* source;
+    /* Captured preparation validates ids without dereferencing source. */
+    int source_nstars;
     double center[3];
     double radius2;
     double* refxyz;
@@ -37,6 +39,28 @@ struct verify_index_query {
     uint8_t* sweep;
     int nrall;
 };
+
+/*
+ * Continue only from a fully captured query. This private path never reads
+ * source, its tree, or mapped sweep storage, so a foreign compute worker may
+ * prepare the packet-private context while the owner retains index lifetime.
+ */
+int verify_prepare_captured_hit_from_query(
+    verify_index_query_t** query,
+    int index_cutnside,
+    const MatchObj* mo,
+    const sip_t* sip,
+    const verify_field_t* vf,
+    double pix2,
+    double distractors,
+    double fieldW,
+    double fieldH,
+    double logbail,
+    double logaccept,
+    double logstoplooking,
+    anbool do_gamma,
+    anbool fake_match,
+    verify_prepared_hit_t** prepared);
 
 struct verify_prepared_hit {
     /* Index-backed arrays are owned; verify.testxy borrows verify_field data. */
