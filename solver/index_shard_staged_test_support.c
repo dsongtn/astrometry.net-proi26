@@ -458,7 +458,7 @@ int index_shard_staged_mask_selection_test(void) {
   failures += index_shard_staged_select_locked(
       &contexts[0], shared,
       INDEX_SHARD_STAGED_SELECT_COMPUTE,
-      FALSE, TRUE, &claim) != 0;
+      INDEX_SHARD_STAGED_SCOPE_FOREIGN, &claim) != 0;
   failures += claim.group != &groups[1];
   failures += claim.task_index != 1U;
   failures += claim.kind != INDEX_SHARD_STAGED_CLAIM_EXECUTE;
@@ -482,6 +482,7 @@ static int index_shard_staged_owner_rotation_test(void) {
   index_shard_staged_group_t groups[3];
   index_shard_staged_task_t tasks[3];
   index_shard_staged_claim_t claim;
+  index_shard_inner_claim_t inner_claim;
   index_shard_thread_state_t *shared;
   int failures = 0;
   int i;
@@ -536,7 +537,7 @@ static int index_shard_staged_owner_rotation_test(void) {
     failures += index_shard_staged_select_locked(
         &contexts[3], shared,
         INDEX_SHARD_STAGED_SELECT_COMPUTE,
-        FALSE, FALSE, &claim) != 0;
+        INDEX_SHARD_STAGED_SCOPE_GLOBAL, &claim) != 0;
     failures += claim.group != &groups[expected_owner];
     failures += claim.task_index != 0U;
     failures += claim.owner_claim;
@@ -556,7 +557,8 @@ static int index_shard_staged_owner_rotation_test(void) {
   failures += index_shard_staged_select_locked(
       &contexts[0], shared,
       INDEX_SHARD_STAGED_SELECT_COMPUTE,
-      TRUE, FALSE, &claim) != 0;
+      INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
+      &claim) != 0;
   failures += claim.group != &groups[0];
   failures += claim.task_index != 0U;
   failures += !claim.owner_claim;
@@ -567,23 +569,78 @@ static int index_shard_staged_owner_rotation_test(void) {
       INDEX_SHARD_STAGED_EXECUTE_COMPUTE_READY,
       0.0, 0ULL) != 0;
 
-  /* An owner without local ready work joins the foreign rotation. */
+  /* Owner progress advances local PREPARE before foreign COMPUTE. */
   shared->staged_select_cursor = 2U;
   pthread_mutex_lock(&shared->queue_mutex);
   failures += index_shard_staged_set_state_locked(
       shared, &groups[0], &tasks[0],
       INDEX_SHARD_STAGED_TASK_PREPARE_READY) != 0;
-  failures += index_shard_staged_select_locked(
-      &contexts[0], shared,
-      INDEX_SHARD_STAGED_SELECT_COMPUTE,
-      TRUE, FALSE, &claim) != 0;
-  failures += claim.group != &groups[2];
-  failures += claim.task_index != 0U;
-  failures += claim.owner_claim;
+  failures += index_shard_owner_or_global_select_locked(
+      &contexts[0], shared, &inner_claim) != 0;
+  failures += inner_claim.kind != INDEX_SHARD_INNER_CLAIM_STAGED;
+  failures += inner_claim.staged.group != &groups[0];
+  failures += inner_claim.staged.task_index != 0U;
+  failures += inner_claim.staged.kind !=
+      INDEX_SHARD_STAGED_CLAIM_PREPARE;
+  failures += !inner_claim.staged.owner_claim;
+  failures += shared->staged_select_cursor != 2U;
+  failures += tasks[2].scheduler_state !=
+      INDEX_SHARD_STAGED_TASK_COMPUTE_READY;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  failures += index_shard_staged_complete_claim(
+      shared, &inner_claim.staged,
+      INDEX_SHARD_STAGED_PREPARE_MORE,
+      0.0, 0ULL) != 0;
+
+  /* A payload wait inside an owner callback cannot reenter OWNER work. */
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_set_state_locked(
+      shared, &groups[0], &tasks[0],
+      INDEX_SHARD_STAGED_TASK_OWNER_READY) != 0;
+  contexts[0].staged_owner_callback_active = TRUE;
+  contexts[0].staged_owner_callback_group = &groups[0];
+  failures += index_shard_owner_progress_select_locked(
+      &contexts[0], shared, &inner_claim) != 1;
+  failures += inner_claim.kind != INDEX_SHARD_INNER_CLAIM_NONE;
+  failures += index_shard_inner_select_locked(
+      &contexts[0], shared, TRUE, &inner_claim) != 0;
+  failures += inner_claim.kind != INDEX_SHARD_INNER_CLAIM_STAGED;
+  failures += inner_claim.staged.group != &groups[2];
+  failures += inner_claim.staged.owner_claim;
+  failures += tasks[0].scheduler_state !=
+      INDEX_SHARD_STAGED_TASK_OWNER_READY;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  failures += index_shard_staged_complete_claim(
+      shared, &inner_claim.staged,
+      INDEX_SHARD_STAGED_EXECUTE_COMPUTE_READY,
+      0.0, 0ULL) != 0;
+  contexts[0].staged_owner_callback_group = NULL;
+  contexts[0].staged_owner_callback_active = FALSE;
+
+  /* Owner-only selection never borrows foreign work on a local miss. */
+  shared->staged_select_cursor = 2U;
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_set_state_locked(
+      shared, &groups[0], &tasks[0],
+      INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
+  failures += index_shard_owner_progress_select_locked(
+      &contexts[0], shared, &inner_claim) != 1;
+  failures += inner_claim.kind != INDEX_SHARD_INNER_CLAIM_NONE;
+  failures += tasks[2].scheduler_state !=
+      INDEX_SHARD_STAGED_TASK_COMPUTE_READY;
+  failures += shared->staged_select_cursor != 2U;
+
+  /* The unchanged global selector is the explicit fallback. */
+  failures += index_shard_inner_select_locked(
+      &contexts[0], shared, TRUE, &inner_claim) != 0;
+  failures += inner_claim.kind != INDEX_SHARD_INNER_CLAIM_STAGED;
+  failures += inner_claim.staged.group != &groups[2];
+  failures += inner_claim.staged.task_index != 0U;
+  failures += inner_claim.staged.owner_claim;
   failures += shared->staged_select_cursor != 3U;
   pthread_mutex_unlock(&shared->queue_mutex);
   failures += index_shard_staged_complete_claim(
-      shared, &claim,
+      shared, &inner_claim.staged,
       INDEX_SHARD_STAGED_EXECUTE_COMPUTE_READY,
       0.0, 0ULL) != 0;
 
@@ -1136,7 +1193,8 @@ int index_shard_staged_submit_backpressure_test(void) {
   failures += index_shard_staged_select_locked(
       &context, shared,
       INDEX_SHARD_STAGED_SELECT_SUBMIT,
-      TRUE, FALSE, &next_claim) != 0;
+      INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
+      &next_claim) != 0;
   failures += next_claim.task_index != 0U;
   failures += !next_claim.submit_credit;
   failures += group.submit_ready_mask != UINT64_C(0);
@@ -1144,7 +1202,8 @@ int index_shard_staged_submit_backpressure_test(void) {
   failures += index_shard_staged_select_locked(
       &context, shared,
       INDEX_SHARD_STAGED_SELECT_SUBMIT,
-      TRUE, FALSE, &claim) != 1;
+      INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
+      &claim) != 1;
 
   group.running_count = 0U;
   shared->staged_submit_callbacks_active = 0U;

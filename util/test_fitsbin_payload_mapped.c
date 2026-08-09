@@ -257,7 +257,7 @@ void test_fitsbin_payload_mapped_source_parallel_lanes(CuTest* ct) {
     payload_fixture_close(&fixture);
 }
 
-void test_fitsbin_payload_mapped_prime_precedes_population(CuTest* ct) {
+void test_fitsbin_payload_mapped_completion_precedes_next_plan(CuTest* ct) {
     payload_fixture_t fixture;
     fitsbin_payload_io_ticket_t* blocker = NULL;
     fitsbin_payload_io_ticket_t* first = NULL;
@@ -353,8 +353,10 @@ void test_fitsbin_payload_mapped_prime_precedes_population(CuTest* ct) {
         blocker = NULL;
     }
     if (first) {
-        first_wait = fitsbin_payload_io_ticket_wait(
-            fixture.fitsbin, first);
+        first_wait = first_poll == 1
+            ? first_result
+            : fitsbin_payload_io_ticket_wait(
+                  fixture.fitsbin, first);
         fitsbin_payload_io_ticket_destroy(first);
         first = NULL;
     }
@@ -382,11 +384,11 @@ void test_fitsbin_payload_mapped_prime_precedes_population(CuTest* ct) {
     CuAssertIntEquals(
         ct, FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED, second_submit);
     CuAssertIntEquals(ct, 0, second_started);
-    CuAssertIntEquals(ct, 0, first_poll);
-    CuAssertIntEquals(ct, 0, first_result);
-    CuAssertIntEquals(ct, 1, first_cancel);
+    CuAssertIntEquals(ct, 1, first_poll);
+    CuAssertIntEquals(ct, 1, first_result);
+    CuAssertIntEquals(ct, 0, first_cancel);
     CuAssert(ct, "blocking mapped ticket failed", blocker_wait > 0);
-    CuAssertIntEquals(ct, 0, first_wait);
+    CuAssert(ct, "inline mapped ticket failed", first_wait > 0);
     CuAssert(ct, "second mapped ticket failed", second_wait > 0);
     CuAssertIntEquals(ct, 1, blocker_plan.calls);
     CuAssertIntEquals(ct, 1, first_plan.calls);

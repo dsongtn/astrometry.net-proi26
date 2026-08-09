@@ -374,8 +374,7 @@ index_shard_select_work(
           worker,
           shared,
           INDEX_SHARD_STAGED_SELECT_COMPUTE,
-          FALSE,
-          TRUE,
+          INDEX_SHARD_STAGED_SCOPE_FOREIGN,
           &inner_claim->staged);
       if (inner_selection < 0) {
         pthread_mutex_unlock(&shared->queue_mutex);

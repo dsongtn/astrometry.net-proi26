@@ -1321,23 +1321,79 @@ int index_shard_staged_select_locked(
     index_shard_worker_context_t *worker,
     index_shard_thread_state_t *shared,
     index_shard_staged_select_class_t select_class,
-    anbool allow_owner,
-    anbool foreign_only,
+    index_shard_staged_select_scope_t select_scope,
     index_shard_staged_claim_t *claim) {
   index_shard_staged_group_t *best_group = NULL;
   size_t best_task = SIZE_MAX;
   index_shard_staged_claim_kind_t best_kind =
       INDEX_SHARD_STAGED_CLAIM_NONE;
   size_t start;
+  anbool class_ready = FALSE;
   anbool local_ready = FALSE;
+  anbool allow_owner;
+  anbool foreign_only;
+  anbool owner_only;
+  int scan_count;
   int offset;
 
   if (!worker || !worker->pool || !shared || !claim) {
     return -1;
   }
+  switch (select_scope) {
+  case INDEX_SHARD_STAGED_SCOPE_GLOBAL:
+    allow_owner = FALSE;
+    foreign_only = FALSE;
+    owner_only = FALSE;
+    break;
+  case INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER:
+    allow_owner = !worker->staged_owner_callback_active &&
+        !worker->staged_owner_callback_group;
+    foreign_only = FALSE;
+    owner_only = FALSE;
+    break;
+  case INDEX_SHARD_STAGED_SCOPE_FOREIGN:
+    allow_owner = FALSE;
+    foreign_only = TRUE;
+    owner_only = FALSE;
+    break;
+  case INDEX_SHARD_STAGED_SCOPE_OWNER:
+    allow_owner = !worker->staged_owner_callback_active &&
+        !worker->staged_owner_callback_group;
+    foreign_only = FALSE;
+    owner_only = TRUE;
+    break;
+  default:
+    return -1;
+  }
   memset(claim, 0, sizeof(*claim));
-  if (!index_shard_staged_class_ready_locked(
-          worker, shared, select_class, allow_owner)) {
+  if (shared->worker_count <= 0 || worker->worker_id < 0 ||
+      worker->worker_id >= shared->worker_count) {
+    return -1;
+  }
+  if (owner_only) {
+    index_shard_worker_context_t *context =
+        &worker->pool->contexts[worker->worker_id];
+    index_shard_staged_group_t *group =
+        context->published_staged_group;
+    uint64_t mask = UINT64_C(0);
+
+    if (group) {
+      if (index_shard_staged_group_valid_locked(
+              worker->pool, context, group)) {
+        group->internal_error = TRUE;
+        return -1;
+      }
+      mask = index_shard_staged_select_mask_locked(
+          shared, group, select_class, allow_owner);
+    }
+    local_ready =
+        index_shard_staged_lowest_task(mask) != SIZE_MAX;
+    class_ready = local_ready;
+  } else {
+    class_ready = index_shard_staged_class_ready_locked(
+        worker, shared, select_class, allow_owner);
+  }
+  if (!class_ready) {
     if (shared->observability_enabled) {
       index_shard_observability_increment(
           &shared->selection_misses);
@@ -1348,12 +1404,7 @@ int index_shard_staged_select_locked(
     index_shard_observability_increment(
         &shared->selection_scans);
   }
-  if (shared->worker_count <= 0) {
-    return -1;
-  }
-  if (allow_owner && !foreign_only &&
-      worker->worker_id >= 0 &&
-      worker->worker_id < shared->worker_count) {
+  if (allow_owner && !owner_only) {
     index_shard_worker_context_t *context =
         &worker->pool->contexts[worker->worker_id];
     index_shard_staged_group_t *group =
@@ -1373,10 +1424,11 @@ int index_shard_staged_select_locked(
           index_shard_staged_lowest_task(mask) != SIZE_MAX;
     }
   }
-  start = local_ready
+  start = owner_only || local_ready
       ? (size_t)worker->worker_id
       : shared->staged_select_cursor % (size_t)shared->worker_count;
-  for (offset = 0; offset < shared->worker_count; offset++) {
+  scan_count = owner_only ? 1 : shared->worker_count;
+  for (offset = 0; offset < scan_count; offset++) {
     int owner = (int)((start + (size_t)offset) %
         (size_t)shared->worker_count);
     index_shard_worker_context_t *context =
@@ -2603,8 +2655,14 @@ index_shard_staged_run_ordered(
       break;
     }
 
-    selection = index_shard_inner_select_locked(
-        ctx, shared, TRUE, &claim);
+    /*
+     * Advance one claimable action in this owner's staged pipeline before
+     * borrowing global work. This prevents foreign ready computation from
+     * indefinitely delaying the owner's next packet. Helpers retain the
+     * existing global compute-first policy.
+     */
+    selection = index_shard_owner_or_global_select_locked(
+        ctx, shared, &claim);
     if (selection < 0) {
       group->internal_error = TRUE;
       pthread_mutex_unlock(&shared->queue_mutex);

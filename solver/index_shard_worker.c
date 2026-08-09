@@ -560,8 +560,8 @@ static int index_shard_payload_wait_help(void *opaque) {
       shared->helper_tasks_owner++;
     }
   } else {
-    selection = index_shard_inner_select_locked(
-        ctx, shared, TRUE, &claim);
+    selection = index_shard_owner_or_global_select_locked(
+        ctx, shared, &claim);
   }
   pthread_mutex_unlock(&shared->queue_mutex);
 

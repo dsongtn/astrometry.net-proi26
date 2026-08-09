@@ -45,6 +45,17 @@ static void check_width_plan(int workers,
                              size_t expected_helpers) {
   index_shard_width_plan_t plan = { SIZE_MAX, SIZE_MAX };
 
+  if (INDEX_SHARD_PRODUCER_WIDTH_LIMIT > 0 &&
+      expected_producers >
+          (size_t)INDEX_SHARD_PRODUCER_WIDTH_LIMIT) {
+    expected_producers =
+        (size_t)INDEX_SHARD_PRODUCER_WIDTH_LIMIT;
+    if (expected_producers > (size_t)workers) {
+      expected_producers = (size_t)workers;
+    }
+    expected_helpers = (size_t)workers - expected_producers;
+  }
+
   CHECK(index_shard_config_plan_widths(
       workers, io_width, detached, exact_demand, &plan) == 0);
   CHECK(plan.producer_width == expected_producers);
@@ -93,6 +104,19 @@ int main(void) {
   CHECK(index_shard_config_effective_workers(8, 3) == 8);
   CHECK(index_shard_config_effective_workers(1, 9) == 1);
   CHECK(index_shard_config_effective_workers(0, 9) == 1);
+
+  CHECK(index_shard_config_payload_io_width(0) == -1);
+  CHECK(index_shard_config_payload_io_width(1) == 1);
+  CHECK(index_shard_config_payload_io_width(4) ==
+        (INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT > 0 &&
+         INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT < 4
+             ? INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT
+             : 4));
+  CHECK(index_shard_config_payload_io_width(8) ==
+        (INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT > 0 &&
+         INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT < 8
+             ? INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT
+             : 8));
 
   CHECK(index_shard_config_exact_demand_pass(
       1, 4, 1, 1, 349U, 0U, 0));
