@@ -791,6 +791,17 @@ typedef enum index_shard_staged_select_class {
   INDEX_SHARD_STAGED_SELECT_PREPARE
 } index_shard_staged_select_class_t;
 
+typedef enum index_shard_staged_select_scope {
+  /* Scan every staged group without admitting owner-only callbacks. */
+  INDEX_SHARD_STAGED_SCOPE_GLOBAL = 0,
+  /* Scan every group and prefer this worker's owner-capable group. */
+  INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
+  /* Scan every staged group except this worker's published group. */
+  INDEX_SHARD_STAGED_SCOPE_FOREIGN,
+  /* Scan only this worker's published group, including owner callbacks. */
+  INDEX_SHARD_STAGED_SCOPE_OWNER
+} index_shard_staged_select_scope_t;
+
 struct index_shard_pool {
 
   onefield_t *owner_bp;
@@ -890,6 +901,14 @@ int index_shard_inner_select_locked(
     index_shard_worker_context_t *worker,
     index_shard_thread_state_t *shared,
     anbool allow_owner,
+    index_shard_inner_claim_t *claim);
+int index_shard_owner_progress_select_locked(
+    index_shard_worker_context_t *worker,
+    index_shard_thread_state_t *shared,
+    index_shard_inner_claim_t *claim);
+int index_shard_owner_or_global_select_locked(
+    index_shard_worker_context_t *worker,
+    index_shard_thread_state_t *shared,
     index_shard_inner_claim_t *claim);
 int index_shard_helper_execute_claim(
     index_shard_thread_state_t *shared,
@@ -1082,8 +1101,7 @@ int index_shard_staged_select_locked(
     index_shard_worker_context_t *worker,
     index_shard_thread_state_t *shared,
     index_shard_staged_select_class_t select_class,
-    anbool allow_owner,
-    anbool foreign_only,
+    index_shard_staged_select_scope_t select_scope,
     index_shard_staged_claim_t *claim);
 int index_shard_staged_complete_claim(
     index_shard_thread_state_t *shared,

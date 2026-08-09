@@ -455,7 +455,15 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
    * Completion lanes populate only packet-planned mapped pages. They are not
    * compute workers and do not own solver, index, or result state.
    */
-  payload_io_lanes = worker_count;
+  payload_io_lanes =
+      index_shard_config_payload_io_width(worker_count);
+  if (payload_io_lanes < 1) {
+    logerr("[index-shard] invalid payload completion width "
+           "workers=%i width=%i\n",
+           worker_count,
+           payload_io_lanes);
+    payload_io_lanes = 1;
+  }
   if (!fitsbin_payload_io_service_width()) {
     if (fitsbin_payload_io_service_start(payload_io_lanes)) {
       logverb("[index-shard] mapped-page completion unavailable; "
@@ -504,18 +512,19 @@ int index_shard_pool_start(onefield_t *bp, solver_t *sp) {
     pool->helper_width = width_plan.helper_width;
   }
   fitsbin_payload_io_configure_workers(
-      pool->payload_completion_registered
-          ? (int)pool->producer_width
-          : worker_count);
+      payload_io_width > 0 ? payload_io_width : 1);
 
   logverb("[index-shard] workers=%i mode=pthread "
           "compute_width=%i producer_width=%zu helper_width=%zu "
-          "payload_io_width=%i inverse_cache_budget=%zu\n",
+          "payload_io_width=%i producer_width_limit=%i "
+          "payload_width_limit=%i inverse_cache_budget=%zu\n",
           worker_count,
           worker_count,
           pool->producer_width,
           pool->helper_width,
           payload_io_width,
+          INDEX_SHARD_PRODUCER_WIDTH_LIMIT,
+          INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT,
           pool->inverse_cache_budget);
 
   pthread_mutex_unlock(&index_shard_global_pool_mutex);

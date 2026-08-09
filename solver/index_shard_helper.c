@@ -343,16 +343,20 @@ int index_shard_inner_select_locked(
     anbool allow_owner,
     index_shard_inner_claim_t *claim) {
   index_shard_staged_select_class_t select_class;
+  index_shard_staged_select_scope_t select_scope;
   int rc;
 
   if (!worker || !shared || !claim) {
     return -1;
   }
   memset(claim, 0, sizeof(*claim));
+  select_scope = allow_owner
+      ? INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER
+      : INDEX_SHARD_STAGED_SCOPE_GLOBAL;
 
   select_class = INDEX_SHARD_STAGED_SELECT_COMPUTE;
   rc = index_shard_staged_select_locked(
-      worker, shared, select_class, allow_owner, FALSE,
+      worker, shared, select_class, select_scope,
       &claim->staged);
   if (rc <= 0) {
     if (!rc) {
@@ -363,7 +367,7 @@ int index_shard_inner_select_locked(
 
   select_class = INDEX_SHARD_STAGED_SELECT_IO;
   rc = index_shard_staged_select_locked(
-      worker, shared, select_class, allow_owner, FALSE,
+      worker, shared, select_class, select_scope,
       &claim->staged);
   if (rc <= 0) {
     if (!rc) {
@@ -385,7 +389,7 @@ int index_shard_inner_select_locked(
 
   select_class = INDEX_SHARD_STAGED_SELECT_SUBMIT;
   rc = index_shard_staged_select_locked(
-      worker, shared, select_class, allow_owner, FALSE,
+      worker, shared, select_class, select_scope,
       &claim->staged);
   if (rc <= 0) {
     if (!rc) {
@@ -396,7 +400,7 @@ int index_shard_inner_select_locked(
 
   select_class = INDEX_SHARD_STAGED_SELECT_PREPARE;
   rc = index_shard_staged_select_locked(
-      worker, shared, select_class, allow_owner, FALSE,
+      worker, shared, select_class, select_scope,
       &claim->staged);
   if (rc <= 0) {
     if (!rc) {
@@ -405,6 +409,70 @@ int index_shard_inner_select_locked(
     return rc;
   }
   return 1;
+}
+
+/*
+ * Select one action from this worker's published staged group. The owner gets
+ * one bounded opportunity to advance its own pipeline before it may borrow
+ * globally visible work. No callback is invoked under the queue lock.
+ * queue_mutex must be held.
+ */
+int index_shard_owner_progress_select_locked(
+    index_shard_worker_context_t *worker,
+    index_shard_thread_state_t *shared,
+    index_shard_inner_claim_t *claim) {
+  static const index_shard_staged_select_class_t classes[] = {
+    INDEX_SHARD_STAGED_SELECT_COMPUTE,
+    INDEX_SHARD_STAGED_SELECT_IO,
+    INDEX_SHARD_STAGED_SELECT_SUBMIT,
+    INDEX_SHARD_STAGED_SELECT_PREPARE
+  };
+  size_t i;
+
+  if (!worker || !shared || !claim) {
+    return -1;
+  }
+  memset(claim, 0, sizeof(*claim));
+  for (i = 0U; i < sizeof(classes) / sizeof(classes[0]); i++) {
+    int rc = index_shard_staged_select_locked(
+        worker,
+        shared,
+        classes[i],
+        INDEX_SHARD_STAGED_SCOPE_OWNER,
+        &claim->staged);
+
+    if (rc <= 0) {
+      if (!rc) {
+        claim->kind = INDEX_SHARD_INNER_CLAIM_STAGED;
+      }
+      return rc;
+    }
+  }
+  return 1;
+}
+
+/*
+ * Give a published owner pipeline one local progress quantum, then retain the
+ * existing global work-conserving fallback. queue_mutex must be held.
+ */
+int index_shard_owner_or_global_select_locked(
+    index_shard_worker_context_t *worker,
+    index_shard_thread_state_t *shared,
+    index_shard_inner_claim_t *claim) {
+  int selection = 1;
+
+  if (!worker || !shared || !claim) {
+    return -1;
+  }
+  if (worker->published_staged_group) {
+    selection = index_shard_owner_progress_select_locked(
+        worker, shared, claim);
+  }
+  if (selection > 0) {
+    selection = index_shard_inner_select_locked(
+        worker, shared, TRUE, claim);
+  }
+  return selection;
 }
 
 static int index_shard_helper_complete_claim(

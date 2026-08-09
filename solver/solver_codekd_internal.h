@@ -46,12 +46,14 @@
 #define SOLVER_CODEKD_DELIVERY_BUDGET_BYTES \
     (2U * 1024U * 1024U)
 /*
- * Publish one following descriptor wave so the payload service can prime its
- * exact mapped pages before completion lanes block on the current wave. The
- * physical lookahead does not change descriptor grain or retirement order.
+ * Keep the native attribution candidate at one descriptor wave. A controlled
+ * build may select the rejected second wave without changing descriptor grain
+ * or retirement order when new evidence justifies reconsideration.
  */
 #define SOLVER_CODEKD_MAX_LOOKAHEAD_WAVES 2U
-#define SOLVER_CODEKD_LOOKAHEAD_WAVES 2U
+#ifndef SOLVER_CODEKD_LOOKAHEAD_WAVES
+#define SOLVER_CODEKD_LOOKAHEAD_WAVES 1U
+#endif
 #if SOLVER_CODEKD_LOOKAHEAD_WAVES < 1U || \
     SOLVER_CODEKD_LOOKAHEAD_WAVES > \
         SOLVER_CODEKD_MAX_LOOKAHEAD_WAVES

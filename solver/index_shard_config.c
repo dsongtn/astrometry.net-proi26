@@ -143,6 +143,20 @@ int index_shard_config_effective_workers(int configured_workers,
   return workers;
 }
 
+int index_shard_config_payload_io_width(int worker_count) {
+  int width;
+
+  if (worker_count < 1) {
+    return -1;
+  }
+  width = worker_count;
+  if (INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT > 0 &&
+      width > INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT) {
+    width = INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT;
+  }
+  return width > 0 ? width : 1;
+}
+
 int index_shard_config_exact_demand_pass(
     int detached_completion,
     int payload_io_width,
@@ -201,6 +215,14 @@ int index_shard_config_plan_widths(
   } else {
     helpers = workers > 1U ? 1U : 0U;
     producers = workers - helpers;
+  }
+  if (INDEX_SHARD_PRODUCER_WIDTH_LIMIT > 0 &&
+      producers > (size_t)INDEX_SHARD_PRODUCER_WIDTH_LIMIT) {
+    producers = (size_t)INDEX_SHARD_PRODUCER_WIDTH_LIMIT;
+    if (producers > workers) {
+      producers = workers;
+    }
+    helpers = workers - producers;
   }
   if (!producers || producers > workers ||
       helpers != workers - producers) {

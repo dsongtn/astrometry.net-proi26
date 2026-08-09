@@ -95,13 +95,6 @@ struct fitsbin_payload_io_ticket {
     unsigned long long page_count;
     unsigned long long sequence;
     unsigned long long read_nanoseconds;
-    unsigned long long plan_nanoseconds;
-    unsigned long long prime_readahead_calls;
-    unsigned long long prime_readahead_bytes;
-    unsigned long long prime_willneed_calls;
-    unsigned long long prime_willneed_bytes;
-    unsigned long long prime_willneed_spans;
-    unsigned long long prime_willneed_failures;
     fitsbin_payload_io_ticket_state_t state;
     fitsbin_payload_io_ticket_kind_t kind;
     fitsbin_payload_io_priority_t priority;
@@ -121,8 +114,6 @@ struct fitsbin_payload_io_ticket {
     anbool owner_draining;
     anbool helper_waiter;
     anbool refresh_plan;
-    anbool mapped_primed;
-    anbool mapped_prime_requeued;
 };
 
 static pthread_mutex_t fitsbin_payload_io_mutex =
@@ -175,8 +166,6 @@ typedef struct fitsbin_payload_transport_metrics {
     unsigned long long mapped_submitted;
     unsigned long long mapped_ready;
     unsigned long long mapped_immediate_ready;
-    unsigned long long mapped_prime_passes;
-    unsigned long long mapped_prime_requeues;
     unsigned long long direct_ranges;
     unsigned long long direct_bytes;
     unsigned long long mapped_spans;
@@ -1443,7 +1432,6 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
         anbool measured;
         anbool cancelled;
         anbool acquired = FALSE;
-        anbool requeue_primed = FALSE;
         size_t work_index;
         int saved_errno = 0;
         int status = 0;
@@ -1540,7 +1528,7 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
                 saved_errno = ENOTSUP;
                 status = -1;
             }
-            if (!status && !ticket->mapped_primed &&
+            if (!status &&
                 (ticket->plan || ticket->refresh_plan) &&
                 !cancelled) {
                 int plan_status =
@@ -1572,8 +1560,7 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
             }
 #if defined(MADV_POPULATE_READ)
 #if FITSBIN_PAYLOAD_PROCESS_MADVISE
-            if (!status && !cancelled &&
-                !ticket->mapped_primed) {
+            if (!status && !cancelled) {
                 fitsbin_payload_io_willneed_ticket(
                     ticket,
                     &willneed_calls,
@@ -1595,7 +1582,6 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
              */
             for (work_index = 0U;
                  !status &&
-                     !ticket->mapped_primed &&
                      work_index < ticket->queued_span_count &&
                      !cancelled;
                  work_index++) {
@@ -1629,57 +1615,6 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
                     __ATOMIC_ACQUIRE);
             }
 #endif
-            if (!status && !cancelled &&
-                !ticket->mapped_primed) {
-                ticket->mapped_primed = TRUE;
-                pthread_mutex_lock(&fitsbin_payload_io_mutex);
-                requeue_primed = ticket->span_count &&
-                    !fitsbin_payload_io_queue_empty_locked();
-                if (requeue_primed) {
-                    if (measured &&
-                        clock_gettime(
-                            CLOCK_MONOTONIC,
-                            &read_finish) == 0) {
-                        read_nanoseconds =
-                            fitsbin_timespec_delta_nanoseconds(
-                                &read_finish, &read_start);
-                    }
-                    fitsbin_payload_counter_add(
-                        &ticket->plan_nanoseconds,
-                        plan_nanoseconds);
-                    fitsbin_payload_counter_add(
-                        &ticket->read_nanoseconds,
-                        read_nanoseconds);
-                    fitsbin_payload_counter_add(
-                        &ticket->prime_readahead_calls,
-                        readahead_calls);
-                    fitsbin_payload_counter_add(
-                        &ticket->prime_readahead_bytes,
-                        readahead_bytes);
-                    fitsbin_payload_counter_add(
-                        &ticket->prime_willneed_calls,
-                        willneed_calls);
-                    fitsbin_payload_counter_add(
-                        &ticket->prime_willneed_bytes,
-                        willneed_bytes);
-                    fitsbin_payload_counter_add(
-                        &ticket->prime_willneed_spans,
-                        willneed_spans);
-                    fitsbin_payload_counter_add(
-                        &ticket->prime_willneed_failures,
-                        willneed_failures);
-                    ticket->mapped_prime_requeued = TRUE;
-                    fitsbin_payload_io_enqueue_locked(ticket);
-                    pthread_cond_signal(&fitsbin_payload_io_cv);
-                }
-                pthread_mutex_unlock(&fitsbin_payload_io_mutex);
-                if (requeue_primed) {
-                    if (acquired) {
-                        fitsbin_payload_io_release();
-                    }
-                    continue;
-                }
-            }
             if (!status && !cancelled &&
                 fitsbin_payload_io_populate_ticket(
                     ticket,
@@ -1716,30 +1651,6 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
                         &read_finish,
                         &read_start);
         }
-        fitsbin_payload_counter_add(
-            &plan_nanoseconds,
-            ticket->plan_nanoseconds);
-        fitsbin_payload_counter_add(
-            &read_nanoseconds,
-            ticket->read_nanoseconds);
-        fitsbin_payload_counter_add(
-            &readahead_calls,
-            ticket->prime_readahead_calls);
-        fitsbin_payload_counter_add(
-            &readahead_bytes,
-            ticket->prime_readahead_bytes);
-        fitsbin_payload_counter_add(
-            &willneed_calls,
-            ticket->prime_willneed_calls);
-        fitsbin_payload_counter_add(
-            &willneed_bytes,
-            ticket->prime_willneed_bytes);
-        fitsbin_payload_counter_add(
-            &willneed_spans,
-            ticket->prime_willneed_spans);
-        fitsbin_payload_counter_add(
-            &willneed_failures,
-            ticket->prime_willneed_failures);
         if (acquired) {
             fitsbin_payload_io_release();
         }
@@ -1815,14 +1726,6 @@ static void* fitsbin_payload_io_service_worker(void* opaque) {
                     &fitsbin_payload_io_transport_metrics.direct_bytes,
                     (unsigned long long)ticket->byte_count);
             } else {
-                fitsbin_payload_counter_add(
-                    &fitsbin_payload_io_transport_metrics.
-                        mapped_prime_passes,
-                    ticket->mapped_primed ? 1ULL : 0ULL);
-                fitsbin_payload_counter_add(
-                    &fitsbin_payload_io_transport_metrics.
-                        mapped_prime_requeues,
-                    ticket->mapped_prime_requeued ? 1ULL : 0ULL);
                 fitsbin_payload_counter_add(
                     &fitsbin_payload_io_transport_metrics.mapped_spans,
                     (unsigned long long)ticket->span_count);
@@ -2105,8 +2008,6 @@ void fitsbin_payload_io_service_stop(void) {
             "direct_attempts=%llu direct_policy_refused=%llu "
             "direct_ranges=%llu direct_bytes=%llu "
             "mapped_immediate_ready=%llu "
-            "mapped_prime_passes=%llu "
-            "mapped_prime_requeues=%llu "
             "mapped_spans=%llu mapped_exact_spans=%llu "
             "mapped_reused_pages=%llu "
             "mapped_gap_merges=%llu mapped_gap_bytes=%llu "
@@ -2126,8 +2027,6 @@ void fitsbin_payload_io_service_stop(void) {
             fitsbin_payload_io_transport_metrics.direct_ranges,
             fitsbin_payload_io_transport_metrics.direct_bytes,
             fitsbin_payload_io_transport_metrics.mapped_immediate_ready,
-            fitsbin_payload_io_transport_metrics.mapped_prime_passes,
-            fitsbin_payload_io_transport_metrics.mapped_prime_requeues,
             fitsbin_payload_io_transport_metrics.mapped_spans,
             fitsbin_payload_io_transport_metrics.mapped_exact_spans,
             fitsbin_payload_io_transport_metrics.mapped_reused_pages,

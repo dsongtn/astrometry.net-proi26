@@ -15,7 +15,7 @@ void test_fitsbin_payload_async_mapped_population(CuTest* ct);
 void test_fitsbin_payload_deferred_mapped_plan(CuTest* ct);
 void test_fitsbin_payload_fully_resident_plan_is_advisory(CuTest* ct);
 void test_fitsbin_payload_mapped_source_parallel_lanes(CuTest* ct);
-void test_fitsbin_payload_mapped_prime_precedes_population(CuTest* ct);
+void test_fitsbin_payload_mapped_completion_precedes_next_plan(CuTest* ct);
 void test_fitsbin_payload_precomputed_plan_refresh(CuTest* ct);
 void test_fitsbin_payload_precomputed_plan_expands_after_reuse_expiry(
     CuTest* ct);

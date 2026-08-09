@@ -10,6 +10,24 @@
 #define INDEX_SHARD_WORKERS_AUTO 0
 #define INDEX_SHARD_WORKERS_UNSET (-1)
 
+/*
+ * Internal build-time attribution controls. Zero preserves automatic policy.
+ * They are deliberately not command-line or environment options.
+ */
+#ifndef INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT
+#define INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT 0
+#endif
+#if INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT < 0
+#error "INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT must be nonnegative"
+#endif
+
+#ifndef INDEX_SHARD_PRODUCER_WIDTH_LIMIT
+#define INDEX_SHARD_PRODUCER_WIDTH_LIMIT 0
+#endif
+#if INDEX_SHARD_PRODUCER_WIDTH_LIMIT < 0
+#error "INDEX_SHARD_PRODUCER_WIDTH_LIMIT must be nonnegative"
+#endif
+
 typedef struct index_shard_width_plan {
   size_t producer_width;
   size_t helper_width;
@@ -49,6 +67,12 @@ int index_shard_config_resolve_workers(int requested_workers,
  */
 int index_shard_config_effective_workers(int configured_workers,
                                          size_t nindexes);
+
+/*
+ * Resolve the payload completion-lane width independently from outer owner
+ * admission. The default is one completion lane per configured worker.
+ */
+int index_shard_config_payload_io_width(int worker_count);
 
 /*
  * Return nonzero only when one pass can use detached exact-demand delivery

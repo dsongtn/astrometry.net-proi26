@@ -358,13 +358,11 @@ static int index_shard_pool_submit(
 
   /*
    * The prior generation is quiescent and the next one is not visible yet.
-   * Match explicit demand admission to its cold-owner width without holding
-   * a shard mutex across the payload provider's own lock.
+   * Keep active delivery capacity equal to the independently selected payload
+   * width without holding a shard mutex across the provider's own lock.
    */
   fitsbin_payload_io_configure_workers(
-      pass_exact_demand
-          ? (int)pass_width_plan.producer_width
-          : worker_count);
+      payload_io_width > 0 ? payload_io_width : 1);
 
   // Generation publication is the hard band barrier release.
   pool->generation++;
