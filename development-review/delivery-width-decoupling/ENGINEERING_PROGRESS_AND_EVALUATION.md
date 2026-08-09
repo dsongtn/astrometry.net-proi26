@@ -1,6 +1,6 @@
 # Engineering Progress and Evaluation
 
-Branch-local review copy for `test/inner-parallelism-and-scaling`. Do not merge
+Branch-local review copy for `test/delivery-width-decoupling`. Do not merge
 or publish this file with an official branch. The external
 `proi26-documentation/engineering-workspace` is inbound review material;
 branch implementation updates and responses to that advice are recorded only
@@ -26,24 +26,24 @@ Sections 1 through 13 preserve the reported six-hour development session on
 2026-08-02. The checkpointed implementation interval was 18:47 through 22:55
 local time; the last field run completed at 23:02. Section 14 records the
 2026-08-09 to 2026-08-10 reduction work and supersedes the old candidate status
-and next gate in Sections 11 and 12.
+and next gate in Sections 11 and 12. Section 15 records the later
+FITS/catalog-side proposal review.
 
 ## 2. Exact development identity
 
 The source-bearing implementation snapshot documented here is:
 
 ```text
-branch: test/inner-parallelism-and-scaling
-commit: d0b5a0c66d6d3bdeebd51949bab56558091bf324
-tree: 86044a499518ceb37267ef66d94160f718034ad3
-parent: c24da8f9500ba241f0b9417f1dcfe6d104a49572
+branch: test/delivery-width-decoupling
+source-bearing commit: 2db39ae1ede4602e893754770df4372cb538b398
+source tree: 06fe375c644aaf1ae1d1fe48e4a574e4e16d8a7c
+parent: adc027322558f05b6063f9e62a9a33ae903d3ea3
 published base: e07c44c2cd7995c684bfa20ab3dc7b861038e1b8
 ```
 
 The Phase 05 candidate-mechanism source blobs match the local owner-progress
-checkpoint. The tree hashes differ because the branch also contains these
-review documents, while the checkpoint captured two unrelated pre-existing
-worktree edits that are not part of this candidate.
+checkpoint. The tree hashes differ because the checkpoint captured two
+unrelated pre-existing worktree edits that are not part of this candidate.
 
 The earlier review snapshot at `adc027322558f05b6063f9e62a9a33ae903d3ea3`
 and its Phase 12 checkpoint remain historical provenance for Sections 3
@@ -537,11 +537,11 @@ The reduction was captured through local-only checkpoints before publication:
 | `phase-05-owner-progress` | `da07571c81c567e3bb822a26178f9d2910175d99` | `8e7c3c30c0b2a010d4ef26a369324d2a11d2b180` | Add bounded owner-local progress |
 
 The candidate-mechanism source blobs from the final checkpoint are published
-on this branch at:
+on the current branch at:
 
 ```text
-commit: d0b5a0c66d6d3bdeebd51949bab56558091bf324
-tree:   86044a499518ceb37267ef66d94160f718034ad3
+commit: 2db39ae1ede4602e893754770df4372cb538b398
+tree:   06fe375c644aaf1ae1d1fe48e4a574e4e16d8a7c
 ```
 
 The private checkpoint remains the rollback and build-provenance identity for
@@ -646,7 +646,7 @@ Raw evidence:
 run_outputs/delivery_width_attribution_20260809/width-cold-triplets-phase05/20260809T221910Z-ABC-pid390310/
 ```
 
-### 14.5 Current decision and next gate
+### 14.5 Decision at the end of the width screen
 
 ```text
 mapped prime/requeue: REJECTED and removed
@@ -665,3 +665,149 @@ contracts and must use one fixed width contrast. If B is unchanged, only the
 counterbalanced `BCA` and `CAB` runs can complete the existing attribution
 sequence; they cannot turn the observed regression into an admission by
 selection.
+
+Section 15 supersedes this section's implementation order. It does not change
+the evidence classification of the incomplete width screen.
+
+## 15. FITS/catalog-side design review - 2026-08-10
+
+Status: `PROPOSAL REVIEWED`; no mechanism in this section is implemented or
+performance-admitted.
+
+The review evaluated three related proposals against the exact source-bearing
+commit in Section 14 and the Phase 05 `ABC` evidence.
+
+### 15.1 Independent compute, producer, and delivery widths
+
+Treating total compute width, outer producer width, and payload-delivery width
+as separate absolute quantities is `KEEP` for attribution. The active source
+already provides internal build-only producer and delivery limits; no public
+option or adaptive controller is required.
+
+The `ABC` result proves that delivery width cannot be interpreted without its
+producer width. P1/D2 lost nearly all useful compute in that ordered screen,
+while P2/D2 made much greater diagnostic progress. One order and three joint
+timeouts do not select an optimum. C2/C4/C6 scaling should be measured only
+after a defensible absolute P/D pair is selected.
+
+### 15.2 Existing byte admission and the missing lifetime
+
+The payload provider already bounds admitted work by both job count and bytes:
+
+```text
+maximum admitted jobs: 24
+maximum admitted bytes: 64 MiB
+reserved demand capacity: one job and one quarter of the byte budget
+```
+
+For a prebuilt range ticket, admission uses its aligned byte count. A
+lane-planned ticket reserves its supplied planning budget and later rejects a
+plan that exceeds the reservation. This means a new global byte counter is not
+the first missing mechanism.
+
+The current provider releases admission when its ticket becomes READY, FAILED,
+or CANCELLED. It does not retain that accounting until a READY packet executes
+or is retired. Consequently the existing limit bounds provider queue and I/O
+work, but it does not bound every prepared mapped page retained by READY or
+reorder state.
+
+If later evidence shows that READY-page pressure causes eviction and reload,
+the corrected mechanism is a prepared-page lease spanning:
+
+```text
+admission or exact plan
+  -> IO_SUBMITTED
+  -> READY
+  -> EXECUTING
+  -> consumed, cancelled, or retired
+  -> release exact aligned-byte lease
+```
+
+This would cross provider, scheduler, generation, cancellation, and retirement
+ownership. It is therefore a medium-risk lifecycle change, not a low-risk
+counter addition. It must not be implemented before unnecessary delivery
+stages are removed.
+
+### 15.3 Delivery-stage ablation
+
+Delivery-stage ablation is the strongest next source experiment. The Phase 05
+P2/D2 screen reported 203,300 provider tickets and 41.2 GB of mapped/populated
+range accounting. Important CodeKD generations showed aligned page coverage
+near ten times their logical bytes. Verification preparation added further
+multi-gigabyte coverage. These counters are not exact physical-device bytes,
+but they show that the active planner and provider create substantial work.
+
+The current staged path has dependencies. Delivered Quad and candidate-Star
+data construct verification queries, so `CodeKD plus verification leaves` is
+not an independent switch in the current state machine. The lowest-risk
+ablation removes stages from the tail while preserving native owner fallback:
+
+1. full chain versus full chain without sweep delivery;
+2. remove verification page delivery;
+3. remove the candidate Quad/Star staged chain, leaving CodeKD delivery and
+   native owner candidate resolution;
+4. compare the remaining CodeKD-only path with native mapped access.
+
+Each build changes one stage only, retains one CodeKD wave and fixed C/P/D
+widths, and preserves descriptor order, owner-only retirement, cancellation,
+and native fallback. CodeKD-only is a control, not an assumed final design,
+because CodeKD planning itself has high aligned-page amplification.
+
+### 15.4 CodeKD inspector/executor fusion
+
+The current CodeKD path traverses KD topology twice. The I/O-lane inspector
+uses the scalar pruning and child order to emit DATA/PERM ranges. After mapped
+readiness, the executor calls the native range search and traverses the same
+topology again before testing leaf rows.
+
+Fusion is plausible only after the reduced delivery pipeline is profiled. A
+safe representation must keep two different orders:
+
+- physical page ranges may be sorted, merged, and deduplicated for delivery;
+- per-descriptor logical leaf spans must retain native traversal order for
+  result construction.
+
+The existing coalesced page plan is not a scientific worklist because it loses
+descriptor and traversal identity. A fusion candidate must reuse the native
+distance and result-addition logic and reproduce exact ordered result IDs and
+distances. Its first version must fall back for permutation tables,
+unsupported tree modes, incomplete plans, allocation refusal, cancellation,
+and generation mismatch.
+
+This is a medium-high scientific risk. It cannot claim a warm W1 improvement:
+W1 deliberately retains the native serial path and does not execute the staged
+CodeKD planner. The relevant performance comparator is the staged W4 path or a
+focused one-index packet benchmark.
+
+### 15.5 Revised correction order
+
+```text
+1. Close the fixed-width attribution without adding adaptive control.
+2. Ablate delivery stages one at a time, starting from the tail.
+3. Select the smallest delivery chain that improves useful scientific work.
+4. Measure C2/C4/C6 with the selected absolute P/D widths.
+5. Add a READY-to-consumption page-byte lease only if residual evidence
+   demonstrates prepared-page pressure.
+6. Profile the reduced pipeline.
+7. Fuse CodeKD inspection and execution only if duplicate topology traversal
+   retains material end-to-end potential.
+```
+
+The governing rule is to stop preparing pages that do not repay their cost
+before adding another delivery mechanism. Width control identifies the
+resource balance, stage ablation removes net work, an optional page lease
+bounds what remains, and fusion addresses residual duplicate CPU work.
+
+### 15.6 Confidence and admission boundary
+
+| Claim | Confidence | Status |
+| --- | --- | --- |
+| Absolute C/P/D factorization is the correct attribution model | High | `KEEP` |
+| A new provider-only byte budget is missing | Low | Existing mechanism already provides it |
+| READY-to-consumption byte lifetime may be missing | Medium | `PROPOSED IF EVIDENCE REQUIRES` |
+| Delivery-stage ablation is the next implementation experiment | Medium-high | `PROPOSED` |
+| CodeKD fusion is scientifically safe as presently described | Medium-low | Requires exact ordered-result design and tests |
+| The aggregate branch improves field performance | Low | `NOT ADMITTED` |
+
+No build, field run, sanitizer, or scientific admission test was performed for
+this documentation-only review.

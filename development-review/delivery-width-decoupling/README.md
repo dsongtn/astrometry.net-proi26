@@ -1,8 +1,8 @@
-# Inner Parallelism Branch Review Notes
+# Delivery Width Decoupling Branch Review Notes
 
 Status: branch-local communication material only.
 
-These files belong only to `test/inner-parallelism-and-scaling`. They are not
+These files belong only to `test/delivery-width-decoupling`. They are not
 release documentation and must not be merged or published with an official
 branch.
 
@@ -15,7 +15,8 @@ Read:
 1. `ENGINEERING_PROGRESS_AND_EVALUATION.md` for dates, phases, implementation
    steps, results, failures, and current candidate status.
 2. `PARALLEL_SOLVER_ARCHITECTURE.md` for design, ownership, data delivery,
-   scheduling, fallback, and Phase 12 deviations from the published baseline.
+   scheduling, fallback, and delivery-width deviations from the published
+   baseline.
 
 Communication is simplex from this branch: implementation status and evidence
 are updated here, while reviewer responses remain in
@@ -24,9 +25,9 @@ are updated here, while reviewer responses remain in
 Implementation snapshot documented here:
 
 ```text
-branch: test/inner-parallelism-and-scaling
-commit: d0b5a0c66d6d3bdeebd51949bab56558091bf324
-tree: 86044a499518ceb37267ef66d94160f718034ad3
+branch: test/delivery-width-decoupling
+source-bearing commit: 2db39ae1ede4602e893754770df4372cb538b398
+source tree: 06fe375c644aaf1ae1d1fe48e4a574e4e16d8a7c
 base: e07c44c2cd7995c684bfa20ab3dc7b861038e1b8
 review copy prepared: 2026-08-09
 last branch update: 2026-08-10
@@ -39,4 +40,8 @@ Current implementation decisions:
 - bounded owner-local progress: `EXPERIMENT`, focused-test verified;
 - producer and payload width: `EXPERIMENT`, one `ABC` screen complete and no
   width admitted;
+- delivery-stage ablation: `PROPOSED`, strongest next source experiment;
+- READY-to-consumption page-byte lease: `PROPOSED IF NEEDED`, not implemented;
+- CodeKD inspector/executor fusion: `DEFERRED`, requires residual profiling and
+  exact ordered-result parity;
 - aggregate candidate: `NOT ADMITTED`.

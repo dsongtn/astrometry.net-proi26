@@ -1,6 +1,6 @@
 # Parallel Solver Architecture
 
-Branch-local review copy for `test/inner-parallelism-and-scaling`. Do not merge
+Branch-local review copy for `test/delivery-width-decoupling`. Do not merge
 or publish this file with an official branch. The external
 `proi26-documentation/engineering-workspace` is inbound review material;
 branch implementation updates and responses to that advice are recorded only
@@ -17,8 +17,8 @@ ownership and lifetime boundaries, not every internal function.
 Active private candidate deviation:
 
 ```text
-branch commit: d0b5a0c66d6d3bdeebd51949bab56558091bf324
-branch tree: 86044a499518ceb37267ef66d94160f718034ad3
+source-bearing commit: 2db39ae1ede4602e893754770df4372cb538b398
+source tree: 06fe375c644aaf1ae1d1fe48e4a574e4e16d8a7c
 source checkpoint: phase-05-owner-progress
 mapped prime/requeue: REJECTED
 CodeKD lookahead: one wave
@@ -196,10 +196,11 @@ not merely to an underlying file offset. File-page identity can avoid
 duplicate storage work, but it cannot replace mapping identity when readiness
 means that the exact compute mapping has been populated.
 
-Prepared pages are not pinned. Memory pressure can reclaim them. Therefore the
-READY queue and in-flight byte budget remain bounded, and readiness is
-revalidated through ticket and generation ownership rather than assumed to be
-permanent.
+Prepared pages are not pinned. Memory pressure can reclaim them. The provider
+queue and I/O admission are bounded, and readiness is revalidated through
+ticket and generation ownership rather than assumed to be permanent. The
+existing provider-byte admission ends when the ticket becomes terminal; it
+does not currently account for all READY pages through compute consumption.
 
 The provider:
 
@@ -350,7 +351,45 @@ aggregate branch candidate: NOT ADMITTED
 The full source identities and results are recorded in
 `ENGINEERING_PROGRESS_AND_EVALUATION.md`.
 
-## 12. Safe extension rule
+## 12. Reviewed next mechanisms - NOT IMPLEMENTED
+
+The FITS/catalog-side review identified three separable mechanisms. They are
+proposals, not descriptions of active production behavior.
+
+### 12.1 Width factorization
+
+Keep compute width, outer producer width, and delivery width independently
+fixed during attribution. Select an absolute producer/delivery pair before
+measuring C2/C4/C6. Do not add adaptive width control until fixed-width
+evidence establishes a stable direction.
+
+### 12.2 Delivery-stage ablation
+
+The staged CodeKD pipeline includes leaf, Quad, candidate-Star, verification,
+and sweep delivery. Remove one tail stage per experiment and use the native
+owner path as the authoritative fallback. Verification-query construction
+depends on candidate Quad/Star data, so not every stage can be enabled or
+disabled independently without adding a new bridge.
+
+The intended decision metric is useful scientific progress per wall second,
+not ticket count, fault count, or CPU percentage alone.
+
+### 12.3 Prepared-page lifetime budget
+
+The provider already limits admitted jobs and bytes. A future memory-pressure
+correction, if justified, must extend exact aligned-byte ownership from
+admission through READY execution, cancellation, or retirement. Releasing the
+lease at I/O completion would not bound READY-page pressure. This change must
+include generation-safe cancellation and single-release accounting.
+
+### 12.4 CodeKD inspector/executor fusion
+
+Physical range order and logical solver order are separate. Physical page
+ranges may be coalesced, but per-descriptor leaf spans must retain native child
+and result order. Fusion is deferred until the reduced pipeline shows that the
+second topology traversal remains material. W1 stays on the native serial path.
+
+## 13. Safe extension rule
 
 Before adding an inner module, identify:
 
