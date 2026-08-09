@@ -1,12 +1,14 @@
 # Parallel Solver Architecture
 
 Branch-local review copy for `test/inner-parallelism-and-scaling`. Do not merge
-or publish this file with an official branch. Review responses belong in the
-external `proi26-documentation/engineering-workspace`.
+or publish this file with an official branch. The external
+`proi26-documentation/engineering-workspace` is inbound review material;
+branch implementation updates and responses to that advice are recorded only
+in this directory.
 
-Status: `KEEP`
+Status: baseline `KEEP`; active branch candidate `EXPERIMENT / NOT ADMITTED`
 
-Applies to source tree:
+Public baseline source tree:
 `acc451dad31db38582ef35dc22ca4fb83db26cf1`
 
 This document describes the public baseline at commit `e07c44c2`. It records
@@ -15,14 +17,17 @@ ownership and lifetime boundaries, not every internal function.
 Active private candidate deviation:
 
 ```text
-branch commit: adc027322558f05b6063f9e62a9a33ae903d3ea3
-branch tree: c29c6039c1e25db6b4a546f1956fcad2516069cd
-original checkpoint: phase-12-two-stage-mapped-prime
-status: PROVISIONAL
+branch commit: d0b5a0c66d6d3bdeebd51949bab56558091bf324
+branch tree: 86044a499518ceb37267ef66d94160f718034ad3
+source checkpoint: phase-05-owner-progress
+mapped prime/requeue: REJECTED
+CodeKD lookahead: one wave
+owner progress and width policy: EXPERIMENT
 ```
 
-The public architecture remains the release authority. Subsections explicitly
-labelled Phase 12 describe only the private candidate.
+The public architecture remains the release authority. Historical Phase 12
+subsections are retained as audit records and explicitly labelled rejected or
+superseded where the active branch no longer implements them.
 
 ## 1. End-to-end structure
 
@@ -87,15 +92,44 @@ The fixed pool has two internal roles:
 1. Outer producers own indexes and run the native solver flow.
 2. Surplus workers claim already-published staged or verification work.
 
-For frozen public production exact-demand passes, outer producer width is
-bounded by live payload-delivery width. The public I/O lane ceiling is four.
-Workers beyond the producer width are not permanently idle; they are eligible
-for inner packages. This width separation reduces simultaneous cold mappings,
-but its wider-width performance is provisional.
+The active branch derives payload completion width independently from outer
+ownership. By default the requested payload width follows compute width and is
+bounded by the provider's 24-job safety capacity. Internal build-only limits
+can reduce producer or payload width for attribution; they are not public
+command-line or environment controls.
+
+For detached exact-demand passes, outer producer width is bounded by the live
+payload-delivery width. Remaining compute workers are helpers for published
+staged work. Resident, loaded-index, and other non-exact-demand passes retain
+full outer width. Without detached completion, the legacy fixed-helper policy
+remains the fallback. No tested width is currently admitted as the production
+optimum.
 
 No worker may block waiting for child work submitted to the same saturated
 pool. Owner progress, helper publication, completion routing, and reduction
 use explicit predicates and generation checks.
+
+### 4.1 Bounded owner-local progress - EXPERIMENT
+
+An owner with a published staged group receives one local selection
+opportunity before it borrows global work. The bounded selection order is:
+
+```text
+COMPUTE -> IO completion -> SUBMIT -> PREPARE -> global fallback
+```
+
+This advances only the owner's already-published staged group. It does not let
+a helper traverse mutable owner state, change index ownership, or retire the
+owner's scientific results. Helpers retain global compute-first selection.
+
+The active call path is:
+
+```text
+index_shard_staged_run_ordered()
+  -> index_shard_owner_or_global_select_locked()
+  -> index_shard_owner_progress_select_locked()
+  -> index_shard_staged_select_locked(..., INDEX_SHARD_STAGED_SCOPE_OWNER)
+```
 
 ## 5. CodeKD packet pipeline
 
@@ -125,19 +159,23 @@ CodeKD result bytes per packet: 2 MiB
 CodeKD mapped-delivery bytes per packet: 2 MiB
 provider in-flight bytes: 64 MiB
 provider in-flight jobs: 24
-public provider lane ceiling: 4
+default requested lanes: compute width
+attribution lane limit: internal build control only
 ```
 
 These are implementation safety bounds, not workload-specific performance
 promises. Any change requires allocation, overflow, cancellation, and
 backpressure tests.
 
-### 5.1 Private Phase 12 packet window
+### 5.1 Active packet window
 
-Phase 12 permits one following descriptor wave in the same ordered staged
-group. The maximum logical lookahead is two waves. This changes physical
-overlap opportunity, not descriptor grain, sequence assignment, or owner-only
-retirement. It is not part of the frozen public baseline.
+The active branch publishes one descriptor wave in an ordered staged group.
+Two waves remain the compile-time supported maximum only so the rejected
+lookahead experiment can be reproduced against an exact source. The second
+wave is not enabled in the candidate and must not be described as active.
+
+This reduction does not change descriptor grain, sequence assignment, or
+owner-only retirement.
 
 ## 6. Mapped-page delivery
 
@@ -173,36 +211,31 @@ The provider:
   registry;
 - records immutable numeric completion identities and validates owner epochs.
 
-### 6.1 Private Phase 12 two-stage mapped delivery
+### 6.1 Active mapped delivery
 
-The private candidate separates advisory priming from authoritative mapped
-population:
+The Phase 12 two-pass `prime -> requeue -> populate` lifecycle is `REJECTED`
+and has been removed. The active mapped ticket remains within one service
+execution:
 
 ```text
 SUBMITTED
-  -> exact plan
-  -> bounded WILLNEED/readahead prime
-  -> requeue when another ticket is waiting
+  -> exact plan and mapping validation
+  -> bounded WILLNEED/readahead advice
   -> authoritative MADV_POPULATE_READ
   -> READY, FAILED, or CANCELLED
 ```
 
-The first pass does not publish READY. If no other ticket is queued, it falls
-through to population instead of requeueing. One ticket retains the duplicated
-descriptor, source lease, mapping generation, priority, sequence, and
-completion identity across both passes.
+There is no prime requeue boundary and no detached READY interval between
+advice and mapped population. Advice remains best-effort; authoritative
+population may block one provider lane. The ticket retains its source lease,
+duplicated descriptor, mapping generation, priority, sequence, and numeric
+completion identity until one terminal transfer.
 
-The candidate also allows the payload service to start at the requested live
-compute width, bounded by the existing provider job and byte ceilings. For an
-exact-demand pass, producer width follows this live delivery width. W4 therefore
-uses four producers and four delivery lanes; W8 may use eight. Wider behavior
-is an experiment and can increase cold mappings, page pressure, and storage
-contention.
-
-Priming is advisory. It does not prove that storage completed before the
-authoritative population pass, and prepared pages remain reclaimable. Phase 12
-therefore improves ordering opportunity but is not a true asynchronous storage
-completion interface.
+Provider width can exceed producer width in a controlled attribution build,
+but configured width does not prove that lanes overlap usefully. A provider
+lane may be waiting in mapped population while compute workers exhaust READY
+work. Native mapped dereference remains the exact fallback on refusal, failure,
+unsupported input, or cancellation.
 
 ## 7. Whole-cohort residency
 
@@ -290,7 +323,34 @@ Do not reintroduce these without new contrary evidence and a bounded gate:
 - candidate dropping, changed tolerances, or reduced search coverage;
 - extra threads whose only benefit is a higher reported CPU percentage.
 
-## 11. Safe extension rule
+## 11. Current evidence boundary
+
+The source-exact Phase 05 APOD1 W4 `ABC` screen compared P1/D1, P1/D2, and
+P2/D2 with one CodeKD wave and no mapped prime/requeue. All three candidates
+reached the 120-second wall limit without a solution.
+
+P1/D2 showed a severe single-screen regression: effective process CPU usage
+fell to 0.25 cores and generation 2 contained an 88.90-second flattened-owner
+phase.
+P2/D2 made substantially more diagnostic progress than P1/D2, but neither a
+joint timeout nor one ordering admits a width. The result does not prove that
+data delivery, worker scaling, or owner progress is solved.
+
+Current decisions are:
+
+```text
+ownership, generation checks, ordered retirement, native fallback: KEEP
+mapped prime/requeue: REJECTED
+second CodeKD wave: REJECTED for the active candidate
+bounded owner progress: EXPERIMENT
+producer/payload width policy: EXPERIMENT
+aggregate branch candidate: NOT ADMITTED
+```
+
+The full source identities and results are recorded in
+`ENGINEERING_PROGRESS_AND_EVALUATION.md`.
+
+## 12. Safe extension rule
 
 Before adding an inner module, identify:
 

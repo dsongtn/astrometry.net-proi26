@@ -1,4 +1,4 @@
-# Phase 12 Branch Review Notes
+# Inner Parallelism Branch Review Notes
 
 Status: branch-local communication material only.
 
@@ -6,9 +6,9 @@ These files belong only to `test/inner-parallelism-and-scaling`. They are not
 release documentation and must not be merged or published with an official
 branch.
 
-The material is copied from `co_dev_docs` because that record already describes
-the Phase 12 development accurately. Branch-local edits are limited to current
-source identity, status, and this communication notice.
+This directory is the outbound development record for this branch. The
+external `proi26-documentation/engineering-workspace` is the inbound review
+and advice workspace; implementation progress must not be written there.
 
 Read:
 
@@ -17,16 +17,26 @@ Read:
 2. `PARALLEL_SOLVER_ARCHITECTURE.md` for design, ownership, data delivery,
    scheduling, fallback, and Phase 12 deviations from the published baseline.
 
-Communication is simplex from this branch. Review responses and advice belong
-in `proi26-documentation/engineering-workspace`; they are not copied back here
-automatically.
+Communication is simplex from this branch: implementation status and evidence
+are updated here, while reviewer responses remain in
+`proi26-documentation/engineering-workspace`.
 
-Exact branch snapshot:
+Implementation snapshot documented here:
 
 ```text
 branch: test/inner-parallelism-and-scaling
-commit: adc027322558f05b6063f9e62a9a33ae903d3ea3
-tree: c29c6039c1e25db6b4a546f1956fcad2516069cd
+commit: d0b5a0c66d6d3bdeebd51949bab56558091bf324
+tree: 86044a499518ceb37267ef66d94160f718034ad3
 base: e07c44c2cd7995c684bfa20ab3dc7b861038e1b8
 review copy prepared: 2026-08-09
+last branch update: 2026-08-10
 ```
+
+Current implementation decisions:
+
+- mapped prime/requeue: `REJECTED` and removed;
+- two-wave CodeKD lookahead: `REDUCED` to one wave;
+- bounded owner-local progress: `EXPERIMENT`, focused-test verified;
+- producer and payload width: `EXPERIMENT`, one `ABC` screen complete and no
+  width admitted;
+- aggregate candidate: `NOT ADMITTED`.
