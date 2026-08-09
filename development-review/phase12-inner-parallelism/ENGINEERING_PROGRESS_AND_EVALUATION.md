@@ -1,12 +1,14 @@
 # Engineering Progress and Evaluation
 
 Branch-local review copy for `test/inner-parallelism-and-scaling`. Do not merge
-or publish this file with an official branch. Review responses belong in the
-external `proi26-documentation/engineering-workspace`.
+or publish this file with an official branch. The external
+`proi26-documentation/engineering-workspace` is inbound review material;
+branch implementation updates and responses to that advice are recorded only
+in this directory.
 
-Status: `KEEP AS AUDIT RECORD`; current candidate status: `PROVISIONAL`
+Status: `KEEP AS AUDIT RECORD`; current candidate status: `EXPERIMENT / NOT ADMITTED`
 
-Development record last reconciled: 2026-08-03
+Development record last reconciled: 2026-08-10
 
 Branch review identity added: 2026-08-09
 
@@ -20,23 +22,32 @@ It is not a replacement for source, private checkpoints, or raw run evidence.
 When this document conflicts with an exact source tree or raw log, the source
 and raw evidence take precedence.
 
-This entry covers the reported six-hour development session on 2026-08-02.
-The checkpointed implementation interval was 18:47 through 22:55 local time;
-the last field run completed at 23:02. Earlier investigation and later result
-analysis were outside that checkpoint interval.
+Sections 1 through 13 preserve the reported six-hour development session on
+2026-08-02. The checkpointed implementation interval was 18:47 through 22:55
+local time; the last field run completed at 23:02. Section 14 records the
+2026-08-09 to 2026-08-10 reduction work and supersedes the old candidate status
+and next gate in Sections 11 and 12.
 
 ## 2. Exact development identity
 
-The final local checkpoint tree described below was subsequently captured as
-the branch snapshot used for this review:
+The source-bearing implementation snapshot documented here is:
 
 ```text
 branch: test/inner-parallelism-and-scaling
-commit: adc027322558f05b6063f9e62a9a33ae903d3ea3
-tree: c29c6039c1e25db6b4a546f1956fcad2516069cd
-parent: 5bddecc9a8dc78f3ac27d6a258f92eb6cb992e5a
+commit: d0b5a0c66d6d3bdeebd51949bab56558091bf324
+tree: 86044a499518ceb37267ef66d94160f718034ad3
+parent: c24da8f9500ba241f0b9417f1dcfe6d104a49572
 published base: e07c44c2cd7995c684bfa20ab3dc7b861038e1b8
 ```
+
+The Phase 05 candidate-mechanism source blobs match the local owner-progress
+checkpoint. The tree hashes differ because the branch also contains these
+review documents, while the checkpoint captured two unrelated pre-existing
+worktree edits that are not part of this candidate.
+
+The earlier review snapshot at `adc027322558f05b6063f9e62a9a33ae903d3ea3`
+and its Phase 12 checkpoint remain historical provenance for Sections 3
+through 13.
 
 The following normal-HEAD and checkpoint details describe the original
 2026-08-02 development session and are retained as historical provenance.
@@ -151,7 +162,7 @@ to the Phase 11 checkpoint.
 | 10 fair cross-owner | 22:31 | Preferred immediately ready local work and used fair foreign rotation only when local work was absent; disabled the second lookahead wave | Retained local-first/fairness rules; avoided leaving unproven speculation enabled |
 | 11 validated retirement/width balance | 22:38 | Consolidated and reviewed the Phase 10 source | No source delta from Phase 10; status was validation, not a new mechanism |
 | 11 clean-built fair delivery | 22:41 | Recorded the clean-build state | No source delta |
-| 12 two-stage mapped prime | 22:55 | Split mapped delivery into prime/requeue and authoritative population passes; re-enabled one following CodeKD wave | Current `PROVISIONAL` candidate |
+| 12 two-stage mapped prime | 22:55 | Split mapped delivery into prime/requeue and authoritative population passes; re-enabled one following CodeKD wave | Historical `PROVISIONAL` candidate; later rejected and reduced |
 
 ### 5.1 Important Phase 04 regression
 
@@ -453,7 +464,7 @@ guest-page-cache-cold screen, not independently physical-cold admission.
 | Wider-worker scaling | Low | Not measured for Phase 12; dynamic lane width can increase cold concurrency |
 | Release readiness | Low | Missing three-run field admission, APOD5, final sanitizer coverage, and reproducible provenance package |
 
-## 11. Current decision
+## 11. Historical Phase 12 decision - SUPERSEDED
 
 Phase 12 is classified as:
 
@@ -464,8 +475,8 @@ release status: NOT ADMITTED
 ```
 
 Do not add another scheduler, lookahead, or payload mechanism before resolving
-the current candidate's repeatability. Do not use the 95.39-second result as a
-median or claim that the data-delivery problem is complete.
+the then-current Phase 12 candidate's repeatability. Do not use the 95.39-second
+result as a median or claim that the data-delivery problem is complete.
 
 The first rollback boundary is Phase 11:
 
@@ -477,7 +488,7 @@ phase-11-validated-retirement-width-balance
 The final Phase 12 delta can be reviewed independently because it affects four
 source/test files relative to that checkpoint.
 
-## 12. Single next gate
+## 12. Historical next gate - SUPERSEDED
 
 Run one later isolated APOD1 W4 guest-page-cache-cold screen using the exact
 Phase 12 binary, configuration, manifest, and input identities, with no prior
@@ -509,3 +520,148 @@ Decision rule:
 Raw logs remain immutable. Any future conclusion must state whether it uses
 the checkpoint identity, the installed binary identity, or only a historical
 directory label.
+
+## 14. Reduction and width attribution - 2026-08-09 to 2026-08-10
+
+This section is the current branch record. It supersedes the active-candidate
+language in the historical Phase 12 sections above.
+
+### 14.1 Source and rollback identities
+
+The reduction was captured through local-only checkpoints before publication:
+
+| Checkpoint | Commit | Tree | Decision |
+| --- | --- | --- | --- |
+| `phase-03-prime-rejected` | `6c0c94584e3462fc8d61b2a7d3626cb7e08a4e07` | `4870fbdb1d106692ecbc052d362f53b16194f516` | Remove mapped prime/requeue |
+| `phase-04-lookahead-reduced` | `dd62398ffaf7925c80d505e217a829ab4781ce47` | `e14c83ab3d4a33d5c92af75d8af67477dd4aec42` | Return to one CodeKD wave |
+| `phase-05-owner-progress` | `da07571c81c567e3bb822a26178f9d2910175d99` | `8e7c3c30c0b2a010d4ef26a369324d2a11d2b180` | Add bounded owner-local progress |
+
+The candidate-mechanism source blobs from the final checkpoint are published
+on this branch at:
+
+```text
+commit: d0b5a0c66d6d3bdeebd51949bab56558091bf324
+tree:   86044a499518ceb37267ef66d94160f718034ad3
+```
+
+The private checkpoint remains the rollback and build-provenance identity for
+the width experiment. The branch commit is the review identity.
+
+### 14.2 Mechanism changes
+
+The follow-on work reduced rather than expanded the payload design:
+
+1. The separate advisory-prime service pass and ticket requeue were removed.
+   Bounded WILLNEED/readahead remains immediately before authoritative mapped
+   population in the same service execution. One mapped ticket reaches one
+   terminal state in that service pass.
+2. CodeKD publication returned from two logical waves to one. The rejected
+   second wave remains available only as a build-time attribution variant.
+3. Producer and payload widths were separated through internal build-time
+   attribution controls. These are not command-line or environment options.
+4. An owner with a published staged group gets one bounded local selection
+   opportunity before global borrowing. Selection order is COMPUTE, IO,
+   SUBMIT, then PREPARE. Global work-conserving selection remains the fallback.
+
+The owner-progress call path is:
+
+```text
+index_shard_staged_run_ordered()
+  -> index_shard_owner_or_global_select_locked()
+  -> index_shard_owner_progress_select_locked()
+  -> index_shard_staged_select_locked(..., INDEX_SHARD_STAGED_SCOPE_OWNER)
+```
+
+When no published helper group exists, `index_shard_payload_wait_help()` uses
+the same owner-or-global selector. Its existing helper-owner claim path remains
+authoritative when a helper group exists. Ownership, numeric completion
+identities, generation checks, canonical owner retirement, reducer-only
+publication, and native mmap fallback are unchanged.
+
+### 14.3 Focused verification
+
+The final source passed these focused checks:
+
+| Check | Result |
+| --- | --- |
+| Width configuration test | PASS |
+| Staged scheduler test | `INDEX_SHARD_STAGED_TEST_OK cases=19` |
+| Payload I/O suite | `OK (21 tests)` |
+| Source whitespace check | clean |
+
+These are source and lifecycle checks. They do not admit performance or prove
+scientific parity for a field result.
+
+### 14.4 Source-exact Phase 05 width screen
+
+The Phase 05 `ABC` screen used the same APOD1 AXY, W4 compute width, one CodeKD
+wave, no mapped prime/requeue, the ordered 349-index manifest, a 120-second
+wall limit, and a 720-second CPU limit. Only producer and payload widths varied.
+
+| Candidate | Producers / helpers / payload | Engine SHA-256 | Config SHA-256 |
+| --- | --- | --- | --- |
+| A | 1 / 3 / 1 | `dd515b9089ad623195cec86aabc1ee67129906ff8d7381a542b03818c7719656` | `82754494161ebf4b99fa3f0e8a22cc5175ee0d9f686e3fe75f881264a307a8d7` |
+| B | 1 / 3 / 2 | `3ee3a13c1fede145b11e8220ca33b702b708ea07aec006f53b3b6a7869c10b32` | `de671bf56a36ba900202d8f4702b7e2e8e2971b47b01f42c6fa75e992e312f63` |
+| C | 2 / 2 / 2 | `b3f5394789158047c7e501177e0f68011634a53ce500ba444ade13af1551c297` | `fa139584b03bbe071c06570f4cfb493b13933cc27b34b079e43772c656f46e68` |
+
+The exact input SHA-256 was
+`dff10c3eee3bf4811453b952cfd31e8931d40d059d64070bdb5c8e384c3ed7f5`.
+The index-order SHA-256 remained
+`7ee54821c993f3a8ac16e212256d428bcf3a7b2f3308571866d3f2d88a27337e`.
+
+| Candidate | Solved | Wall | Effective cores | Hypotheses | Hypotheses/s | Canonical prefix |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| A | no | 122.010 s | 0.97 | 2,276,089 | 18,956.68 | 4 |
+| B | no | 121.060 s | 0.25 | 118,088 | 983.96 | 7 |
+| C | no | 121.180 s | 1.80 | 4,264,138 | 35,531.68 | 138 |
+
+All three processes exited cleanly after the solver wall limit. No candidate
+produced a WCS, so this screen contains no positive scientific-result parity
+evidence.
+
+In this `ABC` screen, B showed a severe regression rather than a payload-width
+success. Relative to A, its aggregate hypothesis rate fell to about 5.2 percent
+and owner wait per producer became about 1.82 times A, an increase of about 82
+percent. Its first completed pass was about 9 percent faster, but generation 2
+then contained an 88.90-second flattened-owner phase.
+One ordered screen cannot determine whether this is repeatable or isolate its
+cause, but it falsifies any claim that D2 is already an admitted improvement.
+
+C made much more diagnostic progress than B, including about 36 times B's
+hypothesis rate and a canonical prefix of 138. This is still a jointly timed
+out, order-dependent progress comparison. It does not admit P2/H2 or establish
+a solved wall-time gain.
+
+Analyzer decision:
+
+```text
+SCREEN_INCOMPLETE
+required sequence: ABC, BCA, CAB
+observed sequence: ABC
+```
+
+Raw evidence:
+
+```text
+run_outputs/delivery_width_attribution_20260809/width-cold-triplets-phase05/20260809T221910Z-ABC-pid390310/
+```
+
+### 14.5 Current decision and next gate
+
+```text
+mapped prime/requeue: REJECTED and removed
+two-wave CodeKD lookahead: REDUCED to one wave
+owner-local progress: EXPERIMENT, source-tested, field-unadmitted
+payload width D2: EXPERIMENT, severe single-screen regression
+producer/helper width P2/H2: EXPERIMENT, diagnostic progress only
+aggregate candidate: NOT ADMITTED
+```
+
+Do not run the unchanged B candidate merely to obtain a favorable measurement.
+Before another broad campaign, inspect the generation-2 flattened-owner path
+and determine why P1/D2 lost useful compute while tickets and owner waits still
+advanced. Any correction must preserve the Phase 05 ownership and scientific
+contracts and must use one fixed width contrast. If B is unchanged, only the
+counterbalanced `BCA` and `CAB` runs can complete the existing attribution
+sequence; they cannot turn the observed regression into an admission by
+selection.
