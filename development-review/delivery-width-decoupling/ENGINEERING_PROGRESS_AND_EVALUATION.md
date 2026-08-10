@@ -811,3 +811,76 @@ bounds what remains, and fusion addresses residual duplicate CPU work.
 
 No build, field run, sanitizer, or scientific admission test was performed for
 this documentation-only review.
+
+## 16. Full-chain compiled-span recovery
+
+Status: `PROVISIONAL / RUNG 4 LOCAL WINNER`; field admission remains pending.
+
+The CodeKD-only result in Section 15 was causally incomplete. Disabling
+post-CodeKD delivery also removed the Quad, Star, verification, and sweep
+helper packages. The experiment therefore changed both data policy and useful
+work placement. Its rejection remains correct, but it does not justify
+removing downstream helper computation.
+
+The recovery candidate keeps the validated canonical span compiler and exact
+mapped-page plan, then reconnects successful CodeKD execution to the existing
+candidate-window and full downstream staged chain:
+
+```text
+descriptors
+  -> one canonical CodeKD topology traversal
+  -> exact mapped plan and IO_SUBMITTED
+  -> COMPUTE_READY retained spans
+  -> CodeKD results
+  -> candidate window
+  -> Quad and Star packages
+  -> verification query, sweep, preparation, and score
+  -> owner-only canonical retirement
+```
+
+The owner remains the only thread that mutates `solver_t`. Helpers execute
+only immutable packet stages. Exact native owner replay remains the fallback
+for unsupported input, incomplete planning, allocation refusal, delivery
+failure, cancellation, hit-capacity refusal, or span-execution failure.
+
+The first causal contract deliberately fixes W4 at one outer producer, one
+mapped delivery lane, one packet lookahead, and a 16 MiB global live mapped
+byte ceiling. This is a mechanism probe, not an admitted production optimum.
+
+Four counterbalanced one-index APOD1 pairs produced:
+
+| Metric | Phase 00 control | Full-chain candidate |
+| --- | ---: | ---: |
+| Median wall | 3.655 s | 2.975 s |
+| Median effective CPU | 120.0% | 145.5% |
+| Median major faults | 985.5 | 960.5 |
+| Median voluntary switches | 24,515.0 | 22,568.5 |
+
+Every pair favored the candidate. The paired median wall improvement was
+18.60 percent. All runs solved with index 4107 and produced the same normalized
+WCS digest. Downstream package classes and foreign useful claims remained
+active; the candidate did not reproduce the CPU collapse of the rejected
+CodeKD-only build.
+
+The isolated postimage passed compiled-span/scalar parity, staged lifecycle,
+solver, full integration, allocation-failure, ASan, UBSan, and Helgrind gates.
+TSan is unsupported on this VM because it fails during runtime startup. The
+same 23-path postimage was then clean-built in the active worktree and passed
+the focused suites and APOD4 W1/W4 scientific smoke again.
+
+Exact local evidence:
+
+```text
+base HEAD: a75ff4757f486d24666b8d97356f882038ace072
+review postimage tree: 2cfb0c9aefac5949abe943ebc5b0c807cdb59d37
+patch SHA-256: c59b2a8085311855d39a91e4d151413f8db54074ba3accd57c77997174554f4c
+active engine SHA-256: ef2bdf42ed6cc822d7a020545975fdf6fc34f0ee898f0398cff8deedd70aac36
+evidence directory:
+  run_outputs/full_chain_compiled_span_recovery_20260810T092905Z
+```
+
+The candidate is not yet `KEEP`. Rung 5 must compare APOD4, APOD1, and APOD5
+under fixed absolute producer, delivery, and byte widths at W1, W2, and W4,
+with full-manifest cold and immediate-repeat evidence, exact stop reasons, and
+scientific validation. The one-index local gain is insufficient to claim
+full-field scaling or cold-storage improvement.

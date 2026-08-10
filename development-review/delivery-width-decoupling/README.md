@@ -20,6 +20,9 @@ Read:
 3. `CONSUMPTION_BOUNDED_EXACT_DEMAND_RESULT.md` for the final implementation,
    causal measurement, rejection, and exact restoration result from the
    2026-08-10 bounded pipeline attempt.
+4. `FULL_CHAIN_COMPILED_SPAN_RECOVERY.md` for the corrected integration that
+   retains the complete downstream helper chain and its local admission
+   evidence.
 
 Communication is simplex from this branch: implementation status and evidence
 are updated here, while reviewer responses remain in
@@ -50,4 +53,6 @@ Current implementation decisions:
   rejected candidate, then removed by exact restoration;
 - CodeKD inspector/executor fusion: structurally correct but `REJECTED` as part
   of the complete pipeline because it did not repay lost downstream work;
-- aggregate candidate: `NOT ADMITTED`.
+- unchanged CodeKD-only/native-downstream candidate: `REJECTED`;
+- full-chain compiled-span replacement: `PROVISIONAL`, local Rung 4 winner;
+- aggregate field candidate: `NOT ADMITTED` until the Rung 5 matrix passes.
