@@ -17,6 +17,9 @@ Read:
 2. `PARALLEL_SOLVER_ARCHITECTURE.md` for design, ownership, data delivery,
    scheduling, fallback, and delivery-width deviations from the published
    baseline.
+3. `CONSUMPTION_BOUNDED_EXACT_DEMAND_RESULT.md` for the final implementation,
+   causal measurement, rejection, and exact restoration result from the
+   2026-08-10 bounded pipeline attempt.
 
 Communication is simplex from this branch: implementation status and evidence
 are updated here, while reviewer responses remain in
@@ -40,8 +43,10 @@ Current implementation decisions:
 - bounded owner-local progress: `EXPERIMENT`, focused-test verified;
 - producer and payload width: `EXPERIMENT`, one `ABC` screen complete and no
   width admitted;
-- delivery-stage ablation: `PROPOSED`, strongest next source experiment;
-- READY-to-consumption page-byte lease: `PROPOSED IF NEEDED`, not implemented;
-- CodeKD inspector/executor fusion: `DEFERRED`, requires residual profiling and
-  exact ordered-result parity;
+- delivery-stage ablation: `REJECTED`; removing downstream packages caused a
+  repeatable 33.3% median regression in the source-exact bounded probe;
+- READY-to-consumption page-byte lease: implemented and verified only in the
+  rejected candidate, then removed by exact restoration;
+- CodeKD inspector/executor fusion: structurally correct but `REJECTED` as part
+  of the complete pipeline because it did not repay lost downstream work;
 - aggregate candidate: `NOT ADMITTED`.
