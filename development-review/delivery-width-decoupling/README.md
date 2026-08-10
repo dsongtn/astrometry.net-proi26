@@ -29,8 +29,9 @@ Implementation snapshot documented here:
 
 ```text
 branch: test/delivery-width-decoupling
-source-bearing commit: 2db39ae1ede4602e893754770df4372cb538b398
-source tree: 06fe375c644aaf1ae1d1fe48e4a574e4e16d8a7c
+documentation HEAD before this result: 9cbba4738642c6a3ade7bbdf8675a7dfed836e8b
+active restored source tree: 5e486e9e0c6e0fc90d4942faf94ed3b82a7f70fa
+rejected candidate tree: bf65bf23d0d2a45f51b442e94b941854a9828286
 base: e07c44c2cd7995c684bfa20ab3dc7b861038e1b8
 review copy prepared: 2026-08-09
 last branch update: 2026-08-10

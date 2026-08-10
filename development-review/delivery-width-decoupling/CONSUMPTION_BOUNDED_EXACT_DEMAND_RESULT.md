@@ -15,6 +15,11 @@ decision: REJECT
 
 ## Iterations
 
+Counted as development cycles, there were five after Phase 00: two source
+iterations, two causal build variants, and one exact rollback. Counted only as
+distinct performance candidates, there were three, followed by a restored
+confirmation run.
+
 ```text
 production_source_iterations: 2
   1: complete D1 compiled exact-demand pipeline
@@ -61,7 +66,7 @@ The mechanism itself passed its focused gates:
 - balanced live-byte acquires and releases below 16 MiB;
 - exact owner replay on refusal and allocation failure;
 - no observed WCS or ordered-digest mismatch in the focused fixtures;
-- ASan, UBSan, Valgrind, and Helgrind checks passed;
+- ASan and UBSan checks passed, and Helgrind reported zero errors;
 - TSan could not start on this VM and remains `UNSUPPORTED`.
 
 No critical scientific, ownership, lifetime, or memory-safety defect caused
