@@ -284,9 +284,10 @@ static unsigned int* fitsbin_payload_page_sequences_get(
 /*
  * Drop only pages completed recently for the exact VMA. A mapping-lifetime
  * bit is not sufficient because the kernel may reclaim a populated page.
- * Limit reuse to the service admission window so READY never relies on an
- * arbitrarily old completion. Native mapped access remains authoritative.
- * Return SIZE_MAX when split output would overflow.
+ * Limit reuse to the service admission window and recheck residency on the
+ * I/O lane. This is a point-in-time check, not a pinning guarantee; native
+ * mapped access remains authoritative. Return SIZE_MAX when split output
+ * would overflow.
  */
 static size_t fitsbin_payload_filter_completed_pages(
     fitsbin_t* fb,
@@ -297,11 +298,16 @@ static size_t fitsbin_payload_filter_completed_pages(
     unsigned long long sequence,
     anbool account_cache_stats,
     unsigned long long* reused_pages) {
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
     fitsbin_mapped_span_t filtered[FITSBIN_PREFETCH_RANGE_LIMIT];
+    unsigned char* residency = NULL;
+    size_t residency_capacity = 0U;
+    unsigned int current_sequence = (unsigned int)sequence;
     unsigned long long hits = 0ULL;
     unsigned long long misses = 0ULL;
     size_t filtered_count = 0U;
     size_t i;
+#endif
 
     if (!fb || !spans || span_count > span_capacity ||
         span_capacity > FITSBIN_PREFETCH_RANGE_LIMIT || !page_size ||
@@ -309,14 +315,80 @@ static size_t fitsbin_payload_filter_completed_pages(
         return SIZE_MAX;
     }
     *reused_pages = 0ULL;
+#if !defined(__linux__) || !defined(MADV_POPULATE_READ)
+    (void)sequence;
+    (void)account_cache_stats;
+    return span_count;
+#else
     for (i = 0U; i < span_count; i++) {
         fitsbin_chunk_t* chunk = fitsbin_payload_mapping_chunk(
             fb, spans[i].map_begin, spans[i].map_end);
         unsigned int* sequences =
             fitsbin_payload_page_sequences_get(
-            fb, chunk, page_size, TRUE);
+            fb, chunk, page_size, FALSE);
+        size_t span_bytes = (size_t)(spans[i].end - spans[i].begin);
+        size_t span_pages = span_bytes / page_size;
         uintptr_t cursor = spans[i].begin;
-        unsigned int current_sequence = (unsigned int)sequence;
+        size_t span_page_index = 0U;
+        anbool has_recent_completion = FALSE;
+
+        if (span_bytes % page_size) {
+            span_pages++;
+        }
+        if (sequences && current_sequence) {
+            while (cursor < spans[i].end) {
+                size_t page_index = (size_t)(
+                    (cursor - spans[i].map_begin) / page_size);
+                unsigned int completed_sequence = __atomic_load_n(
+                    &sequences[page_index], __ATOMIC_ACQUIRE);
+
+                if (completed_sequence &&
+                    (unsigned int)(
+                        current_sequence - completed_sequence) <
+                        FITSBIN_PAYLOAD_IO_MAX_JOBS) {
+                    has_recent_completion = TRUE;
+                    break;
+                }
+                if (spans[i].end - cursor <= page_size) {
+                    break;
+                }
+                cursor += page_size;
+            }
+        }
+        if (!has_recent_completion) {
+            if (filtered_count >= span_capacity) {
+                free(residency);
+                return SIZE_MAX;
+            }
+            filtered[filtered_count++] = spans[i];
+            misses += span_pages;
+            continue;
+        }
+        if (span_pages > residency_capacity) {
+            unsigned char* candidate = realloc(residency, span_pages);
+
+            if (!candidate) {
+                if (filtered_count >= span_capacity) {
+                    free(residency);
+                    return SIZE_MAX;
+                }
+                filtered[filtered_count++] = spans[i];
+                misses += span_pages;
+                continue;
+            }
+            residency = candidate;
+            residency_capacity = span_pages;
+        }
+        if (mincore((void*)spans[i].begin, span_bytes, residency)) {
+            if (filtered_count >= span_capacity) {
+                free(residency);
+                return SIZE_MAX;
+            }
+            filtered[filtered_count++] = spans[i];
+            misses += span_pages;
+            continue;
+        }
+        cursor = spans[i].begin;
 
         while (cursor < spans[i].end) {
             uintptr_t next = spans[i].end - cursor < page_size
@@ -332,7 +404,8 @@ static size_t fitsbin_payload_filter_completed_pages(
                 completed_sequence &&
                 (unsigned int)(
                     current_sequence - completed_sequence) <
-                    FITSBIN_PAYLOAD_IO_MAX_JOBS;
+                    FITSBIN_PAYLOAD_IO_MAX_JOBS &&
+                (residency[span_page_index] & 1U);
 
             if (completed) {
                 hits++;
@@ -348,9 +421,11 @@ static size_t fitsbin_payload_filter_completed_pages(
                     filtered[filtered_count - 1U].end == cursor) {
                     filtered[filtered_count - 1U].end = next;
                     cursor = next;
+                    span_page_index++;
                     continue;
                 }
                 if (filtered_count >= span_capacity) {
+                    free(residency);
                     return SIZE_MAX;
                 }
                 output = &filtered[filtered_count++];
@@ -360,8 +435,10 @@ static size_t fitsbin_payload_filter_completed_pages(
                 output->end = next;
             }
             cursor = next;
+            span_page_index++;
         }
     }
+    free(residency);
     memcpy(spans, filtered, filtered_count * sizeof(*spans));
     *reused_pages = hits;
     if (account_cache_stats) {
@@ -371,6 +448,7 @@ static size_t fitsbin_payload_filter_completed_pages(
             &fb->payload_cache_misses, misses, __ATOMIC_RELAXED);
     }
     return filtered_count;
+#endif
 }
 
 void fitsbin_payload_mark_completed_span(
@@ -592,7 +670,6 @@ int fitsbin_prepare_mapped_spans(
     size_t coalesced = 0U;
     size_t aligned_bytes = 0U;
     size_t exact_bytes = 0U;
-    size_t gap_budget = 0U;
     size_t gap_bytes = 0U;
     size_t gap_merges = 0U;
     size_t logical_bytes = 0U;
@@ -764,31 +841,7 @@ int fitsbin_prepare_mapped_spans(
             reused_pages = 0ULL;
         }
     }
-    gap_budget = MIN(
-        byte_budget - exact_bytes,
-        exact_bytes /
-            FITSBIN_PAYLOAD_MAPPED_COALESCE_BUDGET_DIVISOR);
     for (i = 0U; i < merged; i++) {
-        if (coalesced &&
-            spans[i].map_begin ==
-                spans[coalesced - 1U].map_begin &&
-            spans[i].map_end ==
-                spans[coalesced - 1U].map_end &&
-            spans[i].begin > spans[coalesced - 1U].end) {
-            size_t gap = (size_t)(
-                spans[i].begin - spans[coalesced - 1U].end);
-
-            if (gap <=
-                    page_size *
-                        FITSBIN_PAYLOAD_MAPPED_COALESCE_GAP_PAGES &&
-                gap_bytes <= gap_budget &&
-                gap <= gap_budget - gap_bytes) {
-                spans[coalesced - 1U].end = spans[i].end;
-                gap_bytes += gap;
-                gap_merges++;
-                continue;
-            }
-        }
         spans[coalesced++] = spans[i];
     }
     for (i = 0U; i < coalesced; i++) {

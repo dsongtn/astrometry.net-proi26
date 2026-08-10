@@ -16,6 +16,6 @@ int main(void) {
             failures);
     return 1;
   }
-  printf("INDEX_SHARD_STAGED_TEST_OK cases=20\n");
+  printf("INDEX_SHARD_STAGED_TEST_OK cases=21\n");
   return 0;
 }

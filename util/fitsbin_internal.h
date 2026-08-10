@@ -56,14 +56,6 @@
     (256U * 1024U)
 
 /*
- * Join only a one-page hole inside one exact mapping, and spend no more than
- * one quarter of the ticket's exact aligned bytes on those holes. This cuts
- * small syscall fragments without recreating broad mmap readahead.
- */
-#define FITSBIN_PAYLOAD_MAPPED_COALESCE_GAP_PAGES 1U
-#define FITSBIN_PAYLOAD_MAPPED_COALESCE_BUDGET_DIVISOR 4U
-
-/*
  * File-offset readahead may bridge a slightly wider hole than mapped
  * completion. This changes only storage queue shape: the exact mapped spans
  * remain the sole MADV_POPULATE_READ and READY authority.

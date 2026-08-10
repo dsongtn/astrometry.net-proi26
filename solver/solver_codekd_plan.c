@@ -209,8 +209,6 @@ static void solver_codekd_page_workspace_cleanup(
     free(workspace->sort_entries);
     free(workspace->sort_scratch);
     free(workspace->sealed_ranges);
-    free(workspace->descriptor_spans);
-    free(workspace->group_spans);
     free(workspace);
 }
 
@@ -259,16 +257,8 @@ int solver_codekd_page_workspace_create(
         workspace->sealed_ranges = malloc(
             SOLVER_CODEKD_DELIVERY_RANGE_CAPACITY *
                 sizeof(*workspace->sealed_ranges));
-        workspace->descriptor_spans = malloc(
-            SOLVER_CODEKD_SPAN_CAPACITY *
-                sizeof(*workspace->descriptor_spans));
-        workspace->group_spans = malloc(
-            SOLVER_CODEKD_SPAN_CAPACITY *
-                sizeof(*workspace->group_spans));
         if (!workspace->sort_entries || !workspace->sort_scratch ||
-            !workspace->sealed_ranges ||
-            !workspace->descriptor_spans ||
-            !workspace->group_spans) {
+            !workspace->sealed_ranges) {
             status = 1;
         }
     }
@@ -280,7 +270,6 @@ int solver_codekd_page_workspace_create(
     workspace->page_limit = page_limit;
     workspace->sealed_range_capacity =
         SOLVER_CODEKD_DELIVERY_RANGE_CAPACITY;
-    workspace->span_capacity = SOLVER_CODEKD_SPAN_CAPACITY;
     solver_codekd_page_set_reset(&workspace->descriptor);
     solver_codekd_page_set_reset(&workspace->group);
     *workspace_out = workspace;
@@ -420,29 +409,6 @@ int solver_codekd_page_plan_emit(
         }
         page_key = next_page;
     }
-    return KDTREE_PREFETCH_EMIT_CONTINUE;
-}
-
-int solver_codekd_page_plan_emit_span(
-    void* opaque,
-    const kdtree_rangesearch_span_t* span) {
-    solver_codekd_page_plan_t* plan = opaque;
-    solver_codekd_page_workspace_t* workspace;
-
-    if (!plan || !span || !plan->workspace ||
-        span->left < 0 || span->right < span->left ||
-        (span->mode != KDTREE_RANGESEARCH_SPAN_FILTER &&
-         span->mode != KDTREE_RANGESEARCH_SPAN_ACCEPT_ALL)) {
-        return KDTREE_PREFETCH_EMIT_ERROR;
-    }
-    workspace = plan->workspace;
-    if (workspace->descriptor_span_count >=
-        workspace->span_capacity) {
-        plan->reason = SOLVER_CODEKD_PAGE_PLAN_RANGE_CAPACITY;
-        return KDTREE_PREFETCH_EMIT_REFUSED;
-    }
-    workspace->descriptor_spans[
-        workspace->descriptor_span_count++] = *span;
     return KDTREE_PREFETCH_EMIT_CONTINUE;
 }
 
@@ -732,9 +698,9 @@ int solver_codekd_search_packet_prepare_next_plan(
         !packet->tree->io || !packet->tree->io_is_fitsbin ||
         !packet->descriptors || !packet->slots ||
         !packet->page_workspace || !cancelled ||
-        !packet->descriptor_span_first ||
-        !packet->descriptor_span_count ||
-        packet->state != SOLVER_CODEKD_PACKET_DESCRIPTORS_READY ||
+        (packet->state != SOLVER_CODEKD_PACKET_DESCRIPTORS_READY &&
+         packet->state !=
+             SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED) ||
         packet->next_descriptor > packet->count) {
         return -1;
     }
@@ -745,10 +711,7 @@ int solver_codekd_search_packet_prepare_next_plan(
     packet->plan_end = 0U;
     packet->plan_range_count = 0U;
     packet->plan_logical_bytes = 0U;
-    packet->plan_aligned_bytes = 0U;
-    packet->plan_span_count = 0U;
     solver_codekd_page_set_reset(&workspace->group);
-    workspace->group_span_count = 0U;
 
     while (packet->next_descriptor < packet->count) {
         const solver_ab_descriptor_t* descriptor =
@@ -779,7 +742,6 @@ int solver_codekd_search_packet_prepare_next_plan(
                 packet->pending_descriptor_logical_bytes;
         } else {
             solver_codekd_page_set_reset(&workspace->descriptor);
-            workspace->descriptor_span_count = 0U;
             memset(&plan, 0, sizeof(plan));
             memset(&sink, 0, sizeof(sink));
             plan.source = source;
@@ -790,8 +752,6 @@ int solver_codekd_search_packet_prepare_next_plan(
             sink.userdata = &plan;
             sink.enabled = solver_codekd_page_plan_enabled;
             sink.emit = solver_codekd_page_plan_emit;
-            sink.emit_span = solver_codekd_page_plan_emit_span;
-            packet->page_stats.topology_traversals++;
             prepare_status = kdtree_rangesearch_prefetch_prepare(
                 packet->tree,
                 descriptor->code,
@@ -808,8 +768,7 @@ int solver_codekd_search_packet_prepare_next_plan(
             descriptor_logical_bytes = plan.logical_bytes;
             if (prepare_status !=
                     KDTREE_PREFETCH_PREPARE_COMPLETE ||
-                (!workspace->descriptor.count ||
-                 !workspace->descriptor_span_count)) {
+                !workspace->descriptor.count) {
                 if (prepare_status ==
                     KDTREE_PREFETCH_PREPARE_NOT_APPLICABLE) {
                     reason = SOLVER_CODEKD_PAGE_PLAN_NOT_APPLICABLE;
@@ -831,7 +790,6 @@ int solver_codekd_search_packet_prepare_next_plan(
                 solver_codekd_page_plan_record_refusal(packet, reason);
                 packet->slots[packet->next_descriptor].state =
                     SOLVER_CODEKD_RESULT_OWNER_REPLAY;
-                workspace->descriptor_span_count = 0U;
                 packet->next_descriptor++;
                 if (workspace->group.count) {
                     break;
@@ -840,19 +798,12 @@ int solver_codekd_search_packet_prepare_next_plan(
             }
         }
 
-        if (workspace->group_span_count > workspace->span_capacity ||
-            workspace->descriptor_span_count >
-                workspace->span_capacity -
-                    workspace->group_span_count) {
-            seal_status = 2;
-        } else {
-            seal_status = solver_codekd_page_plan_seal_union(
-                workspace,
-                TRUE,
-                &unique_pages,
-                &range_count,
-                &aligned_bytes);
-        }
+        seal_status = solver_codekd_page_plan_seal_union(
+            workspace,
+            TRUE,
+            &unique_pages,
+            &range_count,
+            &aligned_bytes);
         if (seal_status) {
             reason = seal_status == 2
                 ? SOLVER_CODEKD_PAGE_PLAN_RANGE_CAPACITY
@@ -872,7 +823,6 @@ int solver_codekd_search_packet_prepare_next_plan(
             packet->pending_descriptor_plan = FALSE;
             packet->pending_descriptor_raw_ranges = 0U;
             packet->pending_descriptor_logical_bytes = 0U;
-            workspace->descriptor_span_count = 0U;
             packet->next_descriptor++;
             continue;
         }
@@ -882,17 +832,6 @@ int solver_codekd_search_packet_prepare_next_plan(
         if (solver_codekd_page_set_merge_descriptor(workspace)) {
             return -1;
         }
-        packet->descriptor_span_first[packet->next_descriptor] =
-            workspace->group_span_count;
-        packet->descriptor_span_count[packet->next_descriptor] =
-            workspace->descriptor_span_count;
-        memcpy(
-            workspace->group_spans + workspace->group_span_count,
-            workspace->descriptor_spans,
-            workspace->descriptor_span_count *
-                sizeof(*workspace->group_spans));
-        workspace->group_span_count +=
-            workspace->descriptor_span_count;
         solver_codekd_page_plan_add_size(
             &packet->page_stats.raw_ranges,
             descriptor_raw_ranges);
@@ -937,16 +876,12 @@ int solver_codekd_search_packet_prepare_next_plan(
         packet->plan_end = group_end;
         packet->plan_range_count = range_count;
         packet->plan_logical_bytes = group_logical_bytes;
-        packet->plan_aligned_bytes = aligned_bytes;
-        packet->plan_span_count = workspace->group_span_count;
         packet->plan_complete = TRUE;
         packet->page_stats.descriptors_planned +=
             packet->plan_end - packet->plan_first;
         packet->page_stats.unique_pages += unique_pages;
         packet->page_stats.ranges_before_dedup += unique_pages;
         packet->page_stats.ranges_after_dedup += range_count;
-        packet->page_stats.spans_planned +=
-            workspace->group_span_count;
         solver_codekd_page_plan_add_size(
             &packet->page_stats.aligned_bytes, aligned_bytes);
         /*
@@ -971,17 +906,33 @@ int solver_codekd_packet_plan_codekd_pages(
     size_t range_capacity,
     size_t* range_count) {
     solver_codekd_search_packet_t* packet = opaque;
+    int plan_status;
+
     if (!packet || !cancelled || !ranges || !range_count) {
         errno = EINVAL;
         return -1;
     }
     *range_count = 0U;
-    if (cancelled(cancel_opaque)) {
-        packet->state = SOLVER_CODEKD_PACKET_STOPPED;
-        solver_codekd_page_plan_record_refusal(
-            packet, SOLVER_CODEKD_PAGE_PLAN_CANCELLED);
+    plan_status = solver_codekd_search_packet_prepare_next_plan(
+        packet, cancelled, cancel_opaque);
+    if (plan_status < 0) {
+        packet->state = SOLVER_CODEKD_PACKET_FAILED;
+        errno = EIO;
+        return -1;
+    }
+    if (plan_status == 2) {
         errno = ECANCELED;
         return -1;
+    }
+    if (!plan_status) {
+        if (packet->state != SOLVER_CODEKD_PACKET_RESULTS_READY ||
+            packet->plan_complete ||
+            packet->next_descriptor != packet->count) {
+            packet->state = SOLVER_CODEKD_PACKET_FAILED;
+            errno = EINVAL;
+            return -1;
+        }
+        return 0;
     }
     if (packet->state != SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE ||
         !packet->plan_complete ||
@@ -1401,8 +1352,6 @@ int solver_codekd_search_packet_cleanup(
     }
     solver_codekd_page_workspace_cleanup(packet->page_workspace);
     free(packet->slots);
-    free(packet->descriptor_span_first);
-    free(packet->descriptor_span_count);
     free(packet->inds);
     free(packet->sdists);
     free(packet->candidate_records);
@@ -1432,17 +1381,6 @@ void solver_codekd_packet_profile_accumulate(
     solver->profile.page_plan_logical_bytes += stats->logical_bytes;
     solver->profile.page_plan_aligned_bytes += stats->aligned_bytes;
     solver->profile.page_plan_overread_bytes += stats->overread_bytes;
-    solver->profile.page_plan_spans += stats->spans_planned;
-    solver->profile.page_plan_spans_executed +=
-        stats->spans_executed;
-    solver->profile.page_plan_topology_traversals +=
-        stats->topology_traversals;
-    solver->profile.page_plan_topology_replays_avoided +=
-        stats->topology_replays_avoided;
-    solver->profile.page_plan_execution_replays +=
-        stats->execution_replays;
-    solver->profile.page_plan_hit_capacity_replays +=
-        stats->hit_capacity_replays;
     solver->profile.page_plan_not_applicable +=
         stats->refusal_counts[SOLVER_CODEKD_PAGE_PLAN_NOT_APPLICABLE];
     solver->profile.page_plan_allocation_refused +=

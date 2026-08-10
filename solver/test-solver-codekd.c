@@ -76,9 +76,11 @@ int solver_test_codekd_detached_initial_planning(void) {
     if (!result.supported) {
         return 0;
     }
-    if (!result.queued_callback ||
+    if (!result.plan_prepared_before_submit ||
+        !result.queued_callback ||
         !result.success_compute_ready ||
         !result.repeated_cycles ||
+        !result.precomputed_quad_revalidated ||
         !result.fully_resident_compute_ready ||
         !result.empty_owner_replay ||
         !result.callback_error ||

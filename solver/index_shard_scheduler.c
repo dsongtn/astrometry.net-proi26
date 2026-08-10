@@ -296,7 +296,7 @@ int index_shard_claim_outer_locked(
   }
   shared->outer_states[candidate] =
       INDEX_SHARD_OUTER_RUNNING;
-  worker->ready_before_outer_eligible = FALSE;
+  worker->ready_before_outer_budget = 0U;
   shared->outer_unclaimed--;
   shared->outer_running++;
   shared->outer_claims++;
@@ -329,14 +329,67 @@ int index_shard_claim_outer_locked(
 }
 
 /*
+ * Return the number of compute lanes that may temporarily prefer already-
+ * ready foreign packet work over opening another cold index.
+ *
+ * The target follows actual COMPUTE_READY supply and is capped at half the
+ * pool. This rule never diverts more than half the non-owner lanes from
+ * claimable outer work; an existing static producer cap remains authoritative.
+ * When READY supply drains, the target becomes zero and the next free worker
+ * immediately claims outer work. IO_SUBMITTED, preparation, submission, and
+ * owner-only work never contribute to this target.
+ *
+ * queue_mutex must be held.
+ */
+static size_t index_shard_ready_helper_target_locked(
+    const index_shard_thread_state_t *shared) {
+  size_t limit;
+
+  if (!shared || shared->worker_count < 2 ||
+      !shared->staged_compute_ready) {
+    return 0U;
+  }
+  limit = (size_t)shared->worker_count / 2U;
+  return MIN(shared->staged_compute_ready, limit);
+}
+
+/*
+ * Decide whether this non-owner lane belongs to the current dynamic READY
+ * target. worker_count - outer_running includes the selecting lane and every
+ * other lane that is not presently inside an outer index. Existing static
+ * producer caps therefore remain authoritative and are never exceeded.
+ *
+ * queue_mutex must be held.
+ */
+static anbool index_shard_ready_helper_claimable_locked(
+    const index_shard_thread_state_t *shared) {
+  size_t nonowners;
+  size_t target;
+
+  if (!shared || shared->worker_count < 2 ||
+      shared->outer_running > (size_t)shared->worker_count ||
+      !index_shard_helper_outer_claimable_locked(shared)) {
+    return FALSE;
+  }
+  target = index_shard_ready_helper_target_locked(shared);
+  if (!target) {
+    return FALSE;
+  }
+  nonowners = (size_t)shared->worker_count - shared->outer_running;
+  return nonowners <= target;
+}
+
+/*
  * Select work from the current band without transferring index ownership.
  *
- * A worker that just completed one outer task may execute one already-ready
- * foreign staged computation before opening another cold index. The handoff
- * is consumed before any callback runs, so the next selection restores
- * canonical outer priority. All other inner work remains eligible only when
- * no outer task is immediately claimable. The reducer remains the only
- * authority for master result mutation.
+ * A free lane may execute an already-ready foreign staged computation before
+ * opening another cold index while it belongs to the bounded dynamic helper
+ * target above. The target shrinks with READY supply and, when the configured
+ * producer width permits, does not reduce claimable outer ownership below
+ * half the pool. A per-worker burst limit then forces outer reconsideration.
+ * All other inner work remains eligible only when no outer task is immediately
+ * claimable. The reducer remains the only authority for master result
+ * mutation.
  */
 index_shard_work_selection_t
 index_shard_select_work(
@@ -363,13 +416,13 @@ index_shard_select_work(
     index_shard_pass_state_snapshot(shared, &state);
     if (state.stop_requested || state.fatal_error ||
         state.solved_published) {
+      worker->ready_before_outer_budget = 0U;
       pthread_mutex_unlock(&shared->queue_mutex);
       return INDEX_SHARD_WORK_DONE;
     }
 
-    if (worker->ready_before_outer_eligible &&
-        index_shard_helper_outer_claimable_locked(shared)) {
-      worker->ready_before_outer_eligible = FALSE;
+    if (worker->ready_before_outer_budget &&
+        index_shard_ready_helper_claimable_locked(shared)) {
       inner_selection = index_shard_staged_select_locked(
           worker,
           shared,
@@ -377,15 +430,18 @@ index_shard_select_work(
           INDEX_SHARD_STAGED_SCOPE_FOREIGN,
           &inner_claim->staged);
       if (inner_selection < 0) {
+        worker->ready_before_outer_budget = 0U;
         pthread_mutex_unlock(&shared->queue_mutex);
         return INDEX_SHARD_WORK_ERROR;
       }
       if (!inner_selection) {
+        worker->ready_before_outer_budget--;
         inner_claim->kind = INDEX_SHARD_INNER_CLAIM_STAGED;
         shared->staged_ready_before_outer_claims++;
         pthread_mutex_unlock(&shared->queue_mutex);
         return INDEX_SHARD_WORK_HELPER;
       }
+      worker->ready_before_outer_budget = 0U;
     }
 
     index_shard_advance_canonical_cursor_locked(shared);

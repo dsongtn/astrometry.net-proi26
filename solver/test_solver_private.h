@@ -19,6 +19,7 @@ void test_solver_geometry_cache_deep_admission(void);
 
 void test_solver_ab_counter_boundaries(void);
 void test_solver_ab_descriptor_partition_count(void);
+void test_solver_ab_descriptor_split_equivalence(void);
 void test_solver_index_close_fds_failure_state(void);
 void test_solver_zero_initialized_payload_fd_is_unowned(void);
 

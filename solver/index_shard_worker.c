@@ -657,7 +657,7 @@ void *index_shard_worker_main(void *userdata) {
     ctx->pass_cleanup_seconds = 0.0;
     ctx->current_outer_active = FALSE;
     ctx->current_index_order = 0U;
-    ctx->ready_before_outer_eligible = FALSE;
+    ctx->ready_before_outer_budget = 0U;
 
     while (1) {
       index_shard_result_t *result = NULL;

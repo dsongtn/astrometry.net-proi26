@@ -283,19 +283,25 @@ void test_fitsbin_payload_async_direct_overlap(CuTest* ct) {
 void test_fitsbin_payload_async_mapped_population(CuTest* ct) {
     payload_fixture_t fixture;
     fitsbin_prefetch_range_t range;
-    fitsbin_pread_range_t direct_range;
     fitsbin_payload_io_ticket_t* ticket = NULL;
-    fitsbin_payload_io_ticket_t* reused_ticket = NULL;
+    fitsbin_payload_io_ticket_t* repeated_ticket = NULL;
     fitsbin_payload_io_stats_t stats;
-    unsigned char direct_byte = 0U;
-    int expired = -1;
-    int expired_ticket_present = 0;
-    int expired_waited = -1;
-    int reused = -1;
-    int reused_ticket_present = 0;
+#if defined(__linux__) && defined(MADV_POPULATE_READ) && \
+    defined(MADV_DONTNEED)
+    unsigned char resident_after_drop = 1U;
+#endif
+    uintptr_t page_begin = 0U;
+    long page_size = -1;
+    int dropped = -1;
+#if defined(__linux__) && defined(MADV_POPULATE_READ) && \
+    defined(MADV_DONTNEED)
+    int residency_status = -1;
+#endif
+    int repeated = -1;
+    int repeated_ticket_present = 0;
+    int repeated_waited = -1;
     int submitted;
     int waited = -1;
-    unsigned int i;
 
     payload_fixture_open_for_test(ct, &fixture);
     CuAssertIntEquals(
@@ -322,55 +328,35 @@ void test_fitsbin_payload_async_mapped_population(CuTest* ct) {
         ticket = NULL;
     }
 #if defined(MADV_POPULATE_READ)
-    reused = fitsbin_prefetch_ranges_submit(
-        fixture.fitsbin,
-        &range,
-        1U,
-        SIZE_MAX,
-        &reused_ticket);
-    reused_ticket_present = reused_ticket != NULL;
-    if (reused_ticket) {
-        (void)fitsbin_payload_io_ticket_wait(
-            fixture.fitsbin, reused_ticket);
-        fitsbin_payload_io_ticket_destroy(reused_ticket);
-        reused_ticket = NULL;
-    }
-    direct_range.data = fixture.chunk->data;
-    direct_range.size = sizeof(direct_byte);
-    direct_range.logical_size = sizeof(direct_byte);
-    direct_range.destination = &direct_byte;
-    for (i = 0U; i < PAYLOAD_COMPLETION_EXPIRY_TICKETS; i++) {
-        int direct_submitted;
-        int direct_waited = -1;
-
-        direct_submitted = fitsbin_pread_mapped_ranges_submit(
-            fixture.fitsbin,
-            &direct_range,
-            1U,
-            sizeof(direct_byte),
-            FITSBIN_PAYLOAD_IO_PRIORITY_CURRENT,
-            &ticket);
-        if (ticket) {
-            direct_waited = fitsbin_payload_io_ticket_wait(
-                fixture.fitsbin, ticket);
-            fitsbin_payload_io_ticket_destroy(ticket);
-            ticket = NULL;
+#if defined(MADV_DONTNEED)
+    page_size = sysconf(_SC_PAGESIZE);
+    if (page_size > 0) {
+        page_begin = (uintptr_t)range.data;
+        page_begin -= page_begin % (uintptr_t)page_size;
+        dropped = madvise(
+            (void*)page_begin, (size_t)page_size, MADV_DONTNEED);
+#if defined(__linux__)
+        if (!dropped) {
+            residency_status = mincore(
+                (void*)page_begin,
+                (size_t)page_size,
+                &resident_after_drop);
         }
-        CuAssertIntEquals(ct, 1, direct_submitted);
-        CuAssertIntEquals(ct, 1, direct_waited);
+#endif
     }
-    expired = fitsbin_prefetch_ranges_submit(
+#endif
+    repeated = fitsbin_prefetch_ranges_submit(
         fixture.fitsbin,
         &range,
         1U,
         SIZE_MAX,
-        &ticket);
-    expired_ticket_present = ticket != NULL;
-    if (ticket) {
-        expired_waited = fitsbin_payload_io_ticket_wait(
-            fixture.fitsbin, ticket);
-        fitsbin_payload_io_ticket_destroy(ticket);
-        ticket = NULL;
+        &repeated_ticket);
+    repeated_ticket_present = repeated_ticket != NULL;
+    if (repeated_ticket) {
+        repeated_waited = fitsbin_payload_io_ticket_wait(
+            fixture.fitsbin, repeated_ticket);
+        fitsbin_payload_io_ticket_destroy(repeated_ticket);
+        repeated_ticket = NULL;
     }
 #endif
     fitsbin_payload_io_service_stop();
@@ -380,17 +366,29 @@ void test_fitsbin_payload_async_mapped_population(CuTest* ct) {
 #if defined(MADV_POPULATE_READ)
     CuAssertIntEquals(ct, 1, submitted);
     CuAssert(ct, "async mapped population failed", waited > 0);
+#if defined(__linux__) && defined(MADV_DONTNEED)
+    CuAssertIntEquals(ct, 0, dropped);
+#endif
     CuAssertIntEquals(
-        ct, FITSBIN_PAYLOAD_IO_SUBMIT_READY, reused);
-    CuAssertIntEquals(ct, 0, reused_ticket_present);
-    CuAssertIntEquals(
-        ct, FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED, expired);
-    CuAssertIntEquals(ct, 1, expired_ticket_present);
-    CuAssert(ct, "expired mapped population failed",
-             expired_waited > 0);
+        ct, FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED, repeated);
+    CuAssertIntEquals(ct, 1, repeated_ticket_present);
+    CuAssert(ct, "repeated mapped population failed",
+             repeated_waited > 0);
     CuAssertPtrEquals(ct, NULL, ticket);
-    CuAssert(ct, "mapped completion aging issued too few fills",
-             stats.warm_calls >= 2U);
+#if defined(MADV_DONTNEED)
+    if (residency_status || !(resident_after_drop & 1U)) {
+        CuAssertIntEquals(ct, 2, (int)stats.warm_calls);
+        CuAssertIntEquals(ct, 0, (int)stats.cache_hits);
+    } else {
+        CuAssertIntEquals(ct, 1, (int)stats.warm_calls);
+        CuAssert(ct, "resident exact mapping completion was not reused",
+                 stats.cache_hits > 0U);
+    }
+#else
+    CuAssertIntEquals(ct, 1, (int)stats.warm_calls);
+    CuAssert(ct, "resident exact mapping completion was not reused",
+             stats.cache_hits > 0U);
+#endif
     CuAssert(ct, "async mapped population reported no pages",
              stats.warm_bytes > 0U);
 #else

@@ -74,6 +74,8 @@ typedef struct solver_profile {
     unsigned long long task_ranges_executed;
     unsigned long long task_ranges_submitted;
     unsigned long long task_ranges_inline;
+    unsigned long long descriptor_lead_splits;
+    unsigned long long descriptor_lead_work_units;
     unsigned long long parallel_batches;
     unsigned long long parallel_batches_observed;
     unsigned long long parallel_hypotheses;
@@ -90,12 +92,6 @@ typedef struct solver_profile {
     unsigned long long page_plan_logical_bytes;
     unsigned long long page_plan_aligned_bytes;
     unsigned long long page_plan_overread_bytes;
-    unsigned long long page_plan_spans;
-    unsigned long long page_plan_spans_executed;
-    unsigned long long page_plan_topology_traversals;
-    unsigned long long page_plan_topology_replays_avoided;
-    unsigned long long page_plan_execution_replays;
-    unsigned long long page_plan_hit_capacity_replays;
     unsigned long long page_plan_not_applicable;
     unsigned long long page_plan_allocation_refused;
     unsigned long long page_plan_source_mismatch;

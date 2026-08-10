@@ -80,34 +80,3 @@ int KDFUNC(kdtree_rangesearch_prefetch_prepare)
 
     return rc;
 }
-
-KD_DECLARE(kdtree_rangesearch_execute_spans,
-           kdtree_qres_t *,
-           (const kdtree_t *kd,
-            kdtree_qres_t *result,
-            const void *query,
-            double maxd2,
-            int options,
-            const kdtree_rangesearch_span_t *spans,
-            size_t span_count));
-
-kdtree_qres_t *KDFUNC(kdtree_rangesearch_execute_spans)
-     (const kdtree_t *kd,
-      kdtree_qres_t *result,
-      const void *query,
-      double maxd2,
-      int options,
-      const kdtree_rangesearch_span_t *spans,
-      size_t span_count) {
-    kdtree_qres_t *output = NULL;
-
-    if (!kd) {
-        return NULL;
-    }
-    KD_DISPATCH(kdtree_rangesearch_execute_spans,
-                kd->treetype,
-                output=,
-                (kd, result, query, maxd2, options,
-                 spans, span_count));
-    return output;
-}

@@ -590,12 +590,9 @@ run_flavor() {
         "$output_dir/${flavor}_n4.log" \
         1 \
         4
-    assert_bounded_producer_assistance \
+    assert_full_producer_assistance \
         "$flavor N4 tail lending" \
-        "$output_dir/${flavor}_n4.log" \
-        4 \
-        1 \
-        3
+        "$output_dir/${flavor}_n4.log"
     grep -q \
         '\[solver-geometry\] mode=compact-triangular' \
         "$output_dir/${flavor}_n4.log" ||
@@ -781,7 +778,7 @@ if [[ -z "$asan_wall_budget" ||
 fi
 
 printf \
-    'SOLVER_PARALLEL_SANITIZER_OK asan=passed ubsan=passed tsan=passed lsan=%s retained_state=index-mmap-hit,executor-quiescence bounded_producer=asan-tail,tsan-tail inverse_cache=asan-admit-hit,tsan-admit-hit adaptive_limits=asan-wall:%s,asan-cpu:%s,tsan-wall:%s,tsan-cpu:%s output=%s\n' \
+    'SOLVER_PARALLEL_SANITIZER_OK asan=passed ubsan=passed tsan=passed lsan=%s retained_state=index-mmap-hit,executor-quiescence full_owner=asan-tail,tsan-tail inverse_cache=asan-admit-hit,tsan-admit-hit adaptive_limits=asan-wall:%s,asan-cpu:%s,tsan-wall:%s,tsan-cpu:%s output=%s\n' \
     "$lsan_status" \
     "$asan_wall_budget" \
     "$asan_cpu_budget" \

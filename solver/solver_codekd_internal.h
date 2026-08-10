@@ -45,14 +45,6 @@
     FITSBIN_MMAP_PREFETCH_RANGE_LIMIT
 #define SOLVER_CODEKD_DELIVERY_BUDGET_BYTES \
     (2U * 1024U * 1024U)
-#define SOLVER_CODEKD_SPAN_CAPACITY 32768U
-#ifndef SOLVER_CODEKD_POST_CODEKD_DELIVERY_ENABLED
-#define SOLVER_CODEKD_POST_CODEKD_DELIVERY_ENABLED 1
-#endif
-#if SOLVER_CODEKD_POST_CODEKD_DELIVERY_ENABLED != 0 && \
-    SOLVER_CODEKD_POST_CODEKD_DELIVERY_ENABLED != 1
-#error "SOLVER_CODEKD_POST_CODEKD_DELIVERY_ENABLED must be 0 or 1"
-#endif
 /*
  * Keep the native attribution candidate at one descriptor wave. A controlled
  * build may select the rejected second wave without changing descriptor grain
@@ -170,11 +162,6 @@ typedef struct solver_codekd_page_workspace {
     solver_codekd_page_entry_t* sort_entries;
     solver_codekd_page_entry_t* sort_scratch;
     fitsbin_prefetch_range_t* sealed_ranges;
-    kdtree_rangesearch_span_t* descriptor_spans;
-    kdtree_rangesearch_span_t* group_spans;
-    size_t descriptor_span_count;
-    size_t group_span_count;
-    size_t span_capacity;
     size_t page_size;
     size_t page_limit;
     size_t sealed_range_capacity;
@@ -191,12 +178,6 @@ typedef struct solver_codekd_page_plan_stats {
     size_t logical_bytes;
     size_t aligned_bytes;
     size_t overread_bytes;
-    size_t spans_planned;
-    size_t spans_executed;
-    size_t topology_traversals;
-    size_t topology_replays_avoided;
-    size_t execution_replays;
-    size_t hit_capacity_replays;
     size_t refusal_counts[SOLVER_CODEKD_PAGE_PLAN_CANCELLED + 1U];
 } solver_codekd_page_plan_stats_t;
 
@@ -257,8 +238,6 @@ typedef struct solver_codekd_search_packet {
     const quadfile_t* quads;
     startree_t* starkd;
     solver_codekd_result_slot_t* slots;
-    size_t* descriptor_span_first;
-    size_t* descriptor_span_count;
     u32* inds;
     double* sdists;
     size_t hit_capacity;
@@ -270,8 +249,6 @@ typedef struct solver_codekd_search_packet {
     size_t plan_end;
     size_t plan_range_count;
     size_t plan_logical_bytes;
-    size_t plan_aligned_bytes;
-    size_t plan_span_count;
     size_t pending_descriptor_raw_ranges;
     size_t pending_descriptor_logical_bytes;
     size_t candidate_count;
@@ -479,9 +456,6 @@ void solver_codekd_page_plan_add_size(
 int solver_codekd_page_plan_emit(
     void* opaque,
     const kdtree_prefetch_hint_t* hint);
-int solver_codekd_page_plan_emit_span(
-    void* opaque,
-    const kdtree_rangesearch_span_t* span);
 int solver_codekd_page_plan_seal_union(
     solver_codekd_page_workspace_t* workspace,
     anbool include_descriptor,

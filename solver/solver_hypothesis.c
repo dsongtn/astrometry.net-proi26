@@ -2250,3 +2250,31 @@ size_t solver_ab_descriptor_partition_count(
     }
     return (size_t)task_count;
 }
+
+/*
+ * Split only when both contiguous pieces retain the existing minimum useful
+ * delivery grain. Returning zero preserves the normal partition unchanged.
+ */
+unsigned long long solver_ab_descriptor_lead_combinations(
+    unsigned long long task_combinations,
+    size_t expansion) {
+    unsigned long long minimum_combinations;
+
+    if (!task_combinations || !expansion) {
+        return 0ULL;
+    }
+    minimum_combinations =
+        SOLVER_AB_DESCRIPTOR_DELIVERY_MIN_HYPOTHESES /
+            (unsigned long long)expansion;
+    if (SOLVER_AB_DESCRIPTOR_DELIVERY_MIN_HYPOTHESES %
+            (unsigned long long)expansion) {
+        minimum_combinations++;
+    }
+    if (!minimum_combinations ||
+        task_combinations < minimum_combinations ||
+        task_combinations - minimum_combinations <
+            minimum_combinations) {
+        return 0ULL;
+    }
+    return minimum_combinations;
+}

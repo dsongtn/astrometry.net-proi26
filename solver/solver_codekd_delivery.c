@@ -87,27 +87,17 @@ int solver_codekd_search_packet_prepare(
 
     packet->slots = calloc(
         SOLVER_AB_DESCRIPTOR_CAPACITY, sizeof(*packet->slots));
-    packet->descriptor_span_first = calloc(
-        SOLVER_AB_DESCRIPTOR_CAPACITY,
-        sizeof(*packet->descriptor_span_first));
-    packet->descriptor_span_count = calloc(
-        SOLVER_AB_DESCRIPTOR_CAPACITY,
-        sizeof(*packet->descriptor_span_count));
     packet->inds = malloc(
         packet->hit_capacity * sizeof(*packet->inds));
     packet->sdists = malloc(
         packet->hit_capacity * sizeof(*packet->sdists));
-    if (!packet->slots ||
-        !packet->descriptor_span_first ||
-        !packet->descriptor_span_count ||
-        !packet->inds || !packet->sdists ||
+    if (!packet->slots || !packet->inds || !packet->sdists ||
         solver_codekd_page_workspace_create(
             &packet->page_workspace)) {
         (void)solver_codekd_search_packet_cleanup(packet);
         return 1;
     }
 
-#if SOLVER_CODEKD_POST_CODEKD_DELIVERY_ENABLED
     if (candidate_budget_bytes >=
         sizeof(*packet->candidate_records)) {
         packet->candidate_capacity = MIN(
@@ -144,9 +134,6 @@ int solver_codekd_search_packet_prepare(
             }
         }
     }
-#else
-    (void)candidate_budget_bytes;
-#endif
 
     packet->descriptors = descriptors;
     packet->tree = tree;
@@ -267,16 +254,15 @@ static int solver_codekd_packet_mark_outstanding_owner_replay(
     packet->plan_end = 0U;
     packet->plan_range_count = 0U;
     packet->plan_logical_bytes = 0U;
-    packet->plan_aligned_bytes = 0U;
-    packet->plan_span_count = 0U;
     packet->delivery_source = NULL;
     packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
     return 0;
 }
 
 /*
- * Submit one complete compute-side page plan. Provider lanes populate only
- * the copied physical ranges; they never traverse KD topology.
+ * Submit one complete compute-side page plan. Provider lanes refresh and
+ * populate only the copied exact mapped ranges; they never traverse KD
+ * topology.
  */
 int solver_codekd_packet_submit_pages(
     solver_codekd_search_packet_t* packet) {
@@ -293,11 +279,7 @@ int solver_codekd_packet_submit_pages(
         packet->next_descriptor > packet->count ||
         !packet->plan_range_count ||
         packet->plan_range_count >
-            packet->page_workspace->sealed_range_capacity ||
-        !packet->plan_aligned_bytes ||
-        packet->plan_aligned_bytes >
-            SOLVER_CODEKD_DELIVERY_BUDGET_BYTES ||
-        !packet->plan_span_count) {
+            packet->page_workspace->sealed_range_capacity) {
         return -1;
     }
     if (index_shard_worker_stop_requested()) {
@@ -322,7 +304,6 @@ int solver_codekd_packet_submit_pages(
     if (submit_status == FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED &&
         packet->delivery_ticket) {
         packet->delivery_source = source;
-        packet->state = SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED;
         return 1;
     }
     packet->delivery_ticket = NULL;
@@ -619,7 +600,6 @@ static int solver_codekd_packet_build_verify_queries(
     return 0;
 }
 
-#if SOLVER_CODEKD_POST_CODEKD_DELIVERY_ENABLED
 static anbool solver_codekd_packet_candidate_data_fully_resident(
     const solver_codekd_search_packet_t* packet) {
     fitsbin_t* star_source;
@@ -634,7 +614,6 @@ static anbool solver_codekd_packet_candidate_data_fully_resident(
     return fitsbin_payload_is_fully_resident(packet->quads->fb) &&
         fitsbin_payload_is_fully_resident(star_source);
 }
-#endif
 
 /*
  * Complete the CodeKD phase through one central transition. Resident
@@ -656,10 +635,6 @@ int solver_codekd_packet_finish_codekd(
             ? 0
             : -1;
     }
-#if !SOLVER_CODEKD_POST_CODEKD_DELIVERY_ENABLED
-    packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
-    return 0;
-#else
     if (!packet->hit_count || !packet->candidate_records ||
         !packet->candidate_capacity || packet->use_radec ||
         !packet->quads || !packet->starkd ||
@@ -675,7 +650,6 @@ int solver_codekd_packet_finish_codekd(
     packet->retire_hit_offset = 0U;
     packet->retire_descriptor_started = FALSE;
     return solver_codekd_packet_begin_candidate_window(packet);
-#endif
 }
 
 /*
@@ -1140,11 +1114,7 @@ int solver_codekd_packet_collect_pages(
         packet->state = SOLVER_CODEKD_PACKET_FAILED;
         return -1;
     }
-    /*
-     * Planned-ticket output is owned by the I/O lane until terminal
-     * publication. Poll's payload_io mutex edge makes those state writes
-     * visible here.
-     */
+    /* Poll's payload_io mutex edge makes terminal ticket data visible here. */
     io_state = packet->state;
     assert(!packet->delivery_ticket);
     if ((ticket_result == 0 && ticket_errno == ECANCELED) ||
@@ -1248,7 +1218,7 @@ int solver_codekd_packet_collect_pages(
     }
     if (ticket_result > 0 && packet->plan_complete &&
         packet->plan_range_count &&
-        io_state == SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED) {
+        packet->state == SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE) {
         packet->delivery_source = NULL;
         packet->state = SOLVER_CODEKD_PACKET_COMPUTE_READY;
         return 1;

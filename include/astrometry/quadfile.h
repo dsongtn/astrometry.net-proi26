@@ -72,9 +72,9 @@ int quadfile_prepare_stars(const quadfile_t* qf,
 
 /*
  * Submit a complete bounded set of Quad rows to the payload loader. The
- * returned ticket must be waited or cancelled before the quadfile is closed.
- * FITSBIN_PAYLOAD_IO_SUBMIT_READY returns without a ticket when the exact
- * live-mapping completion record already covers every requested page. Refusal
+ * returned ticket must be terminally collected and destroyed, or cancelled
+ * and drained, before the quadfile is closed. An accepted nonresident request
+ * is revalidated by the I/O lane before its ticket becomes READY. Refusal
  * returns zero and leaves the original mapped lookup authoritative.
  */
 int quadfile_prefetch_stars_submit(

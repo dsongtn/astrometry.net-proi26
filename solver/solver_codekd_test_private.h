@@ -50,9 +50,11 @@ typedef struct solver_codekd_test_reserve_result {
 
 typedef struct solver_codekd_test_detached_result {
     int supported;
+    int plan_prepared_before_submit;
     int queued_callback;
     int success_compute_ready;
     int repeated_cycles;
+    int precomputed_quad_revalidated;
     int fully_resident_compute_ready;
     int empty_owner_replay;
     int callback_error;

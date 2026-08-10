@@ -305,6 +305,9 @@ size_t solver_ab_descriptor_partition_count(
     size_t expansion,
     size_t max_task_combinations,
     size_t participants);
+unsigned long long solver_ab_descriptor_lead_combinations(
+    unsigned long long task_combinations,
+    size_t expansion);
 anbool solver_payload_candidate_data_fully_resident(
     const solver_t* solver);
 size_t solver_verification_wave_memory_budget(void);

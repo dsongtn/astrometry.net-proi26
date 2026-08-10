@@ -533,15 +533,16 @@ int fitsbin_prefetch_ranges(
  * refreshes its validated page-aligned spans on the I/O lane. It borrows the
  * fitsbin owner and its mappings.
  *
- * Return FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED with a ticket when queued,
- * FITSBIN_PAYLOAD_IO_SUBMIT_READY without a ticket when the exact live-mapping
- * completion record already covers every requested page, zero when the
- * optional service or bounded capacity is unavailable, and -1 for an invalid
- * or failed preparation. READY does not pin pages; the native mapped read
- * remains authoritative if the kernel has reclaimed one. The caller must keep
- * every source mapping live through blocking or polled collection before
- * closing the source fitsbin. A fully resident source returns zero without
- * creating a ticket. On a zero return caused by the service, errno
+ * Return FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED with a ticket when queued, zero when
+ * the optional service or bounded capacity is unavailable, and -1 for an
+ * invalid or failed preparation. Every accepted nonresident request is
+ * revalidated on an I/O lane. Pages completed recently for the exact live
+ * mapping generation may be reused; every other page receives a current
+ * population pass. READY means provider preparation is complete and execution
+ * is permitted, not that pages are pinned or guaranteed fault-free. The caller
+ * must keep every source mapping live through blocking or polled collection
+ * before closing the source fitsbin. A fully resident source returns zero
+ * without creating a ticket. On a zero return caused by the service, errno
  * distinguishes ENODEV, transient admission refusal EAGAIN, and permanent
  * size refusal E2BIG.
  */

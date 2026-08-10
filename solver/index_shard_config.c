@@ -149,9 +149,7 @@ int index_shard_config_payload_io_width(int worker_count) {
   if (worker_count < 1) {
     return -1;
   }
-  width = worker_count < INDEX_SHARD_PAYLOAD_IO_WIDTH_DEFAULT
-      ? worker_count
-      : INDEX_SHARD_PAYLOAD_IO_WIDTH_DEFAULT;
+  width = worker_count;
   if (INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT > 0 &&
       width > INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT) {
     width = INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT;
@@ -204,13 +202,14 @@ int index_shard_config_plan_widths(
   workers = (size_t)worker_count;
   if (detached_completion) {
     /*
-     * Keep cold-owner admission independent from delivery-lane width. This
-     * permits a later D-width attribution without silently widening P.
+     * A cold exact-demand owner can publish several page tickets. Limit
+     * simultaneous cold mappings to the live delivery width and leave the
+     * remaining compute workers eligible for already-published staged work.
      * Resident and loaded-index passes retain the full outer width.
      */
     producers = exact_demand &&
-        (size_t)INDEX_SHARD_EXACT_DEMAND_PRODUCER_WIDTH_DEFAULT < workers
-        ? (size_t)INDEX_SHARD_EXACT_DEMAND_PRODUCER_WIDTH_DEFAULT
+        (size_t)payload_io_width < workers
+        ? (size_t)payload_io_width
         : workers;
     helpers = workers - producers;
   } else {

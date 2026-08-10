@@ -462,17 +462,9 @@ static int solver_codekd_test_fixture_init(
     fixture->descriptors = calloc(1, sizeof(*fixture->descriptors));
     fixture->packet.slots = calloc(
         descriptor_count, sizeof(*fixture->packet.slots));
-    fixture->packet.descriptor_span_first = calloc(
-        descriptor_count,
-        sizeof(*fixture->packet.descriptor_span_first));
-    fixture->packet.descriptor_span_count = calloc(
-        descriptor_count,
-        sizeof(*fixture->packet.descriptor_span_count));
     fixture->packet.inds = calloc(8U, sizeof(*fixture->packet.inds));
     fixture->packet.sdists = calloc(8U, sizeof(*fixture->packet.sdists));
     if (!fixture->descriptors || !fixture->packet.slots ||
-        !fixture->packet.descriptor_span_first ||
-        !fixture->packet.descriptor_span_count ||
         !fixture->packet.inds || !fixture->packet.sdists ||
         solver_codekd_page_workspace_create(
             &fixture->packet.page_workspace)) {
@@ -598,11 +590,6 @@ static int solver_codekd_test_seed_plan(
     entry->populate_begin = begin;
     entry->populate_end = begin + chunk->mapsize;
     workspace->descriptor.count = 1U;
-    workspace->descriptor_spans[0].left = 0;
-    workspace->descriptor_spans[0].right = 3;
-    workspace->descriptor_spans[0].mode =
-        KDTREE_RANGESEARCH_SPAN_FILTER;
-    workspace->descriptor_span_count = 1U;
     workspace->page_limit = 1U;
     fixture->packet.pending_descriptor_plan = TRUE;
     fixture->packet.pending_descriptor_raw_ranges = 1U;
@@ -622,6 +609,7 @@ static void solver_codekd_test_ticket_drain(
 }
 
 static int solver_codekd_test_detached_success(
+    int* planned_before_submit,
     int* queued,
     int* compute_ready,
     int* repeated) {
@@ -639,9 +627,11 @@ static int solver_codekd_test_detached_success(
     int status;
     int result = -1;
 
-    if (!queued || !compute_ready || !repeated) {
+    if (!planned_before_submit || !queued || !compute_ready ||
+        !repeated) {
         return -1;
     }
+    *planned_before_submit = FALSE;
     *queued = FALSE;
     *compute_ready = FALSE;
     *repeated = FALSE;
@@ -698,48 +688,50 @@ static int solver_codekd_test_detached_success(
         if (status != INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY) {
             goto cleanup;
         }
+        if (!cycle) {
+            *planned_before_submit =
+                fixture.packet.state ==
+                    SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE &&
+                fixture.packet.plan_complete &&
+                fixture.packet.plan_first == 0U &&
+                fixture.packet.plan_end == 1U &&
+                fixture.packet.next_descriptor == 1U &&
+                fixture.packet.plan_range_count == 1U &&
+                fixture.packet.delivery_ticket == NULL &&
+                fixture.packet.delivery_source == NULL;
+        }
         status = solver_codekd_packet_staged_ops.submit(
             &fixture.input,
             sizeof(fixture.input),
             &fixture.packet,
             sizeof(fixture.packet),
             &completion_id);
-        if (!cycle &&
-            (status != INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED ||
-             !completion_id)) {
+        if (status != INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED ||
+            !completion_id) {
             goto cleanup;
         }
         if (!cycle) {
             *queued =
                 fixture.packet.state ==
-                    SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED &&
+                    SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE &&
                 fixture.packet.next_descriptor == 1U &&
                 fixture.packet.plan_complete &&
-                fixture.packet.plan_span_count == 1U &&
                 fixture.packet.delivery_ticket != NULL &&
                 fixture.packet.delivery_source == fixture.source;
             solver_codekd_test_gate_release(&gate);
             solver_codekd_test_ticket_drain(fixture.source, &blocker);
         }
-        if (status == INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED) {
-            if (!completion_id ||
-                solver_codekd_test_completion_wait(
-                    &completion, completion_id)) {
-                goto cleanup;
-            }
-            status = solver_codekd_packet_staged_ops.poll(
-                &fixture.input,
-                sizeof(fixture.input),
-                &fixture.packet,
-                sizeof(fixture.packet));
-            if (status != INDEX_SHARD_STAGED_IO_READY) {
-                goto cleanup;
-            }
-        } else if (status !=
-                   INDEX_SHARD_STAGED_SUBMIT_COMPUTE_READY) {
+        if (solver_codekd_test_completion_wait(
+                &completion, completion_id)) {
             goto cleanup;
         }
-        if (fixture.packet.state !=
+        status = solver_codekd_packet_staged_ops.poll(
+            &fixture.input,
+            sizeof(fixture.input),
+            &fixture.packet,
+            sizeof(fixture.packet));
+        if (status != INDEX_SHARD_STAGED_IO_READY ||
+            fixture.packet.state !=
                 SOLVER_CODEKD_PACKET_COMPUTE_READY ||
             !fixture.packet.plan_complete) {
             goto cleanup;
@@ -776,13 +768,9 @@ static int solver_codekd_test_detached_success(
         fixture.packet.state == SOLVER_CODEKD_PACKET_RESULTS_READY &&
         fixture.packet.next_descriptor == fixture.packet.count &&
         fixture.packet.hit_count == 2U &&
-        fixture.packet.page_stats.descriptors_planned == 2U &&
-        fixture.packet.page_stats.spans_planned == 2U &&
-        fixture.packet.page_stats.spans_executed == 2U &&
-        fixture.packet.page_stats.topology_replays_avoided == 2U &&
-        !fixture.packet.page_stats.execution_replays &&
-        !fixture.packet.page_stats.hit_capacity_replays;
-    result = *queued && *compute_ready && *repeated ? 0 : -1;
+        fixture.packet.page_stats.descriptors_planned == 2U;
+    result = *planned_before_submit && *queued && *compute_ready &&
+        *repeated ? 0 : -1;
 
 cleanup:
     if (gate_initialized) {
@@ -805,6 +793,140 @@ cleanup:
         solver_codekd_test_gate_destroy(&gate);
     }
     kdtree_free_query(native_result);
+    solver_codekd_test_fixture_cleanup(&fixture);
+    return result;
+}
+
+static int solver_codekd_test_precomputed_quad_revalidation(void) {
+    solver_codekd_test_fixture_t fixture;
+    solver_codekd_test_completion_t completion;
+    fitsbin_payload_io_ticket_t* prime_ticket = NULL;
+    fitsbin_chunk_t* chunk;
+    quadfile_t quads;
+    unsigned long long completion_id = 0ULL;
+    int completion_initialized = FALSE;
+    int notifier_set = FALSE;
+    int service_started = FALSE;
+    int prime_result;
+    int status;
+    int result = -1;
+
+    memset(&quads, 0, sizeof(quads));
+    if (solver_codekd_test_fixture_init(&fixture, 1U)) {
+        return -1;
+    }
+    chunk = fitsbin_get_chunk(fixture.source, 0);
+    if (!chunk || !chunk->data ||
+        chunk->data_file_size < sizeof(*quads.quadarray)) {
+        goto cleanup;
+    }
+    fixture.packet.candidate_records =
+        calloc(1, sizeof(*fixture.packet.candidate_records));
+    if (!fixture.packet.candidate_records) {
+        goto cleanup;
+    }
+    quads.fb = fixture.source;
+    quads.quadarray = chunk->data;
+    quads.numquads = 1U;
+    quads.dimquads = 1;
+    fixture.packet.quads = &quads;
+    fixture.packet.inds[0] = 0U;
+    fixture.packet.candidate_count = 1U;
+    fixture.packet.candidate_capacity = 1U;
+    fixture.packet.candidate_cursor = 0U;
+    fixture.packet.candidate_window_first = 0U;
+    fixture.packet.candidate_window_offset = 0U;
+    fixture.packet.candidate_window_count = 1U;
+    fixture.packet.state = SOLVER_CODEKD_PACKET_QUAD_SUBMIT_READY;
+
+    if (solver_codekd_test_completion_init(&completion)) {
+        goto cleanup;
+    }
+    completion_initialized = TRUE;
+    fitsbin_payload_io_service_stop();
+    fitsbin_payload_io_configure_workers(1);
+    if (fitsbin_payload_io_set_completion_notifier(
+            solver_codekd_test_completion_notify, &completion)) {
+        goto cleanup;
+    }
+    notifier_set = TRUE;
+    if (fitsbin_payload_io_service_start(1)) {
+        goto cleanup;
+    }
+    service_started = TRUE;
+
+    status = quadfile_prefetch_stars_submit(
+        &quads, fixture.packet.inds, 1, &prime_ticket);
+    if (status != FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED ||
+        !prime_ticket) {
+        goto cleanup;
+    }
+    prime_result = fitsbin_payload_io_ticket_wait(
+        fixture.source, prime_ticket);
+    status = fitsbin_payload_io_ticket_destroy_checked(prime_ticket);
+    if (!status) {
+        prime_ticket = NULL;
+    }
+    if (prime_result <= 0 || status) {
+        goto cleanup;
+    }
+
+    status = solver_codekd_packet_staged_ops.submit(
+        &fixture.input,
+        sizeof(fixture.input),
+        &fixture.packet,
+        sizeof(fixture.packet),
+        &completion_id);
+    if (status != INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED ||
+        !completion_id ||
+        fixture.packet.state !=
+            SOLVER_CODEKD_PACKET_QUAD_IO_SUBMITTED ||
+        !fixture.packet.delivery_ticket ||
+        fixture.packet.delivery_source != fixture.source ||
+        fixture.packet.candidate_quad_submitted != 1U) {
+        goto cleanup;
+    }
+    if (solver_codekd_test_completion_wait(
+            &completion, completion_id)) {
+        goto cleanup;
+    }
+    status = solver_codekd_packet_staged_ops.poll(
+        &fixture.input,
+        sizeof(fixture.input),
+        &fixture.packet,
+        sizeof(fixture.packet));
+    if (status != INDEX_SHARD_STAGED_IO_READY ||
+        fixture.packet.state !=
+            SOLVER_CODEKD_PACKET_QUAD_COMPUTE_READY ||
+        fixture.packet.delivery_ticket ||
+        fixture.packet.delivery_source ||
+        fixture.packet.candidate_quad_fallback ||
+        fixture.packet.candidate_quad_delivery_disabled ||
+        fixture.packet.candidate_star_delivery_disabled) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (prime_ticket) {
+        int ignored_result = 0;
+
+        (void)fitsbin_payload_io_ticket_drain_and_destroy(
+            fixture.source, &prime_ticket, &ignored_result);
+    }
+    (void)solver_codekd_search_packet_release_ticket(&fixture.packet);
+    if (service_started) {
+        fitsbin_payload_io_service_stop();
+    }
+    if (notifier_set) {
+        (void)fitsbin_payload_io_clear_completion_notifier(
+            solver_codekd_test_completion_notify, &completion);
+    }
+    fitsbin_payload_io_configure_workers(1);
+    if (completion_initialized) {
+        solver_codekd_test_completion_destroy(&completion);
+    }
+    fixture.packet.quads = NULL;
     solver_codekd_test_fixture_cleanup(&fixture);
     return result;
 }
@@ -1038,16 +1160,11 @@ static int solver_codekd_test_detached_callback_error(void) {
     int result;
 
     if (solver_codekd_test_fixture_init(&fixture, 1U) ||
-        solver_codekd_test_seed_plan(&fixture) ||
-        solver_codekd_packet_staged_ops.prepare(
-            &fixture.input,
-            sizeof(fixture.input),
-            &fixture.packet,
-            sizeof(fixture.packet)) !=
-                INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY) {
+        solver_codekd_test_seed_plan(&fixture)) {
         return -1;
     }
     memset(&range, 0, sizeof(range));
+    fixture.packet.state = SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED;
     errno = 0;
     status = solver_codekd_packet_plan_codekd_pages(
         &fixture.packet,
@@ -1140,7 +1257,8 @@ static int solver_codekd_test_detached_eagain(void) {
     int result = -1;
 
     memset(fillers, 0, sizeof(fillers));
-    if (solver_codekd_test_fixture_init(&fixture, 1U)) {
+    if (solver_codekd_test_fixture_init(&fixture, 1U) ||
+        solver_codekd_test_seed_plan(&fixture)) {
         return -1;
     }
     if (solver_codekd_test_gate_init(&gate)) {
@@ -1184,9 +1302,6 @@ static int solver_codekd_test_detached_eagain(void) {
     if (!capacity_reached) {
         goto cleanup;
     }
-    if (solver_codekd_test_seed_plan(&fixture)) {
-        goto cleanup;
-    }
     status = solver_codekd_packet_staged_ops.prepare(
         &fixture.input,
         sizeof(fixture.input),
@@ -1207,7 +1322,9 @@ static int solver_codekd_test_detached_eagain(void) {
             SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE ||
         fixture.packet.next_descriptor != 1U ||
         !fixture.packet.plan_complete ||
-        fixture.packet.plan_span_count != 1U ||
+        fixture.packet.plan_first != 0U ||
+        fixture.packet.plan_end != 1U ||
+        fixture.packet.plan_range_count != 1U ||
         fixture.packet.delivery_ticket ||
         fixture.packet.delivery_source) {
         goto cleanup;
@@ -1249,17 +1366,11 @@ static int solver_codekd_test_detached_cancellation(void) {
     int status;
     int result = -1;
 
-    if (solver_codekd_test_fixture_init(&fixture, 1U) ||
-        solver_codekd_test_seed_plan(&fixture) ||
-        solver_codekd_packet_staged_ops.prepare(
-            &fixture.input,
-            sizeof(fixture.input),
-            &fixture.packet,
-            sizeof(fixture.packet)) !=
-                INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY) {
+    if (solver_codekd_test_fixture_init(&fixture, 1U)) {
         return -1;
     }
     memset(&range, 0, sizeof(range));
+    fixture.packet.state = SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED;
     errno = 0;
     status = solver_codekd_packet_plan_codekd_pages(
         &fixture.packet,
@@ -1390,9 +1501,12 @@ int solver_codekd_test_run_detached_initial_planning(
         return 0;
     }
     (void)solver_codekd_test_detached_success(
+        &result->plan_prepared_before_submit,
         &result->queued_callback,
         &result->success_compute_ready,
         &result->repeated_cycles);
+    result->precomputed_quad_revalidated =
+        solver_codekd_test_precomputed_quad_revalidation() == 0;
     result->fully_resident_compute_ready =
         solver_codekd_test_fully_resident() == 0;
     result->empty_owner_replay =

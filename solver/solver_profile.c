@@ -58,6 +58,10 @@ void solver_profile_accumulate(solver_profile_t* total,
     total->task_ranges_executed += profile->task_ranges_executed;
     total->task_ranges_submitted += profile->task_ranges_submitted;
     total->task_ranges_inline += profile->task_ranges_inline;
+    total->descriptor_lead_splits +=
+        profile->descriptor_lead_splits;
+    total->descriptor_lead_work_units +=
+        profile->descriptor_lead_work_units;
     total->parallel_batches += profile->parallel_batches;
     total->parallel_batches_observed +=
         profile->parallel_batches_observed;
@@ -83,17 +87,6 @@ void solver_profile_accumulate(solver_profile_t* total,
         profile->page_plan_aligned_bytes;
     total->page_plan_overread_bytes +=
         profile->page_plan_overread_bytes;
-    total->page_plan_spans += profile->page_plan_spans;
-    total->page_plan_spans_executed +=
-        profile->page_plan_spans_executed;
-    total->page_plan_topology_traversals +=
-        profile->page_plan_topology_traversals;
-    total->page_plan_topology_replays_avoided +=
-        profile->page_plan_topology_replays_avoided;
-    total->page_plan_execution_replays +=
-        profile->page_plan_execution_replays;
-    total->page_plan_hit_capacity_replays +=
-        profile->page_plan_hit_capacity_replays;
     total->page_plan_not_applicable +=
         profile->page_plan_not_applicable;
     total->page_plan_allocation_refused +=
@@ -266,7 +259,8 @@ void solver_profile_report(const solver_t* solver) {
            "parallel_batches_observed=%llu "
            "parallel_hypotheses=%llu "
            "task_ranges_planned=%llu task_ranges_executed=%llu "
-           "task_ranges_inline=%llu allocation_failures=%llu "
+           "task_ranges_inline=%llu lead_splits=%llu "
+           "lead_work_units=%llu allocation_failures=%llu "
            "search_failures=%llu "
            "helper_tasks=%llu helper_combinations=%llu "
            "hypothesis_order=%016llx "
@@ -289,6 +283,8 @@ void solver_profile_report(const solver_t* solver) {
            profile->task_ranges_planned,
            profile->task_ranges_executed,
            profile->task_ranges_inline,
+           profile->descriptor_lead_splits,
+           profile->descriptor_lead_work_units,
            profile->allocation_failures,
            profile->search_failures,
            profile->ab_helper_tasks,
@@ -300,9 +296,6 @@ void solver_profile_report(const solver_t* solver) {
            "boundary_deferrals=%llu raw_hints=%llu unique_pages=%llu "
            "coalesced_ranges=%llu raw_hint_bytes=%llu aligned_bytes=%llu "
            "positive_alignment_delta_bytes=%llu "
-           "spans=%llu/%llu topology_traversals=%llu "
-           "topology_replays_avoided=%llu execution_replays=%llu "
-           "hit_capacity_replays=%llu "
            "refusals=%llu/%llu/%llu/%llu/%llu/"
            "%llu/%llu/%llu/%llu staged_claims=%llu/%llu "
            "io=%llu/%llu max_io=%zu max_ready=%zu "
@@ -323,12 +316,6 @@ void solver_profile_report(const solver_t* solver) {
            profile->page_plan_logical_bytes,
            profile->page_plan_aligned_bytes,
            profile->page_plan_overread_bytes,
-           profile->page_plan_spans,
-           profile->page_plan_spans_executed,
-           profile->page_plan_topology_traversals,
-           profile->page_plan_topology_replays_avoided,
-           profile->page_plan_execution_replays,
-           profile->page_plan_hit_capacity_replays,
            profile->page_plan_not_applicable,
            profile->page_plan_allocation_refused,
            profile->page_plan_source_mismatch,

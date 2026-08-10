@@ -1703,132 +1703,6 @@ void MANGLE(kdtree_rangesearch_continuation_cleanup)(
         KDTREE_RANGESEARCH_CONTINUATION_UNINITIALIZED;
 }
 
-static anbool MANGLE(kdtree_rangesearch_scan_span)
-     (const kdtree_t* kd,
-      kdtree_qres_t* res,
-      const etype* query,
-      double maxd2,
-      int D,
-      int L,
-      int R,
-      anbool do_dists,
-      anbool do_points,
-      kdtree_rangesearch_span_mode_t mode) {
-    int i;
-
-    if (!kd || !res || !query || D <= 0 ||
-        L < 0 || R < L || R >= kd->ndata ||
-        (mode != KDTREE_RANGESEARCH_SPAN_FILTER &&
-         mode != KDTREE_RANGESEARCH_SPAN_ACCEPT_ALL)) {
-        return FALSE;
-    }
-    for (i = L; i <= R; i++) {
-        dtype* data = KD_DATA(kd, D, i);
-        double dsqd = LARGE_VAL;
-
-        if (mode == KDTREE_RANGESEARCH_SPAN_FILTER) {
-            if (do_dists) {
-                anbool bailedout = FALSE;
-
-                dist2_bailout(kd, query, data, D, maxd2,
-                              &bailedout, &dsqd);
-                if (bailedout) {
-                    continue;
-                }
-            } else if (dist2_exceeds(
-                           kd, query, data, D, maxd2)) {
-                continue;
-            }
-        } else if (do_dists) {
-            dsqd = dist2(kd, query, data, D);
-        }
-        if (!add_result(kd, res, dsqd, KD_PERM(kd, i), data, D,
-                        do_dists, do_points)) {
-            return FALSE;
-        }
-    }
-    return TRUE;
-}
-
-kdtree_qres_t* MANGLE(kdtree_rangesearch_execute_spans)
-     (const kdtree_t* kd,
-      kdtree_qres_t* res,
-      const void* vquery,
-      double maxd2,
-      int options,
-      const kdtree_rangesearch_span_t* spans,
-      size_t span_count) {
-    const etype* query = vquery;
-    int D;
-    anbool do_dists;
-    anbool do_points;
-    size_t span_index;
-
-    if (!kd || !query || (!spans && span_count)) {
-        return NULL;
-    }
-#if defined(KD_DIM)
-    assert(kd->ndim == KD_DIM);
-    D = KD_DIM;
-#else
-    D = kd->ndim;
-#endif
-    if (D <= 0 || D > KDTREE_MAX_DIM) {
-        return NULL;
-    }
-    for (span_index = 0U; span_index < span_count; span_index++) {
-        const kdtree_rangesearch_span_t* span = &spans[span_index];
-
-        if (span->left < 0 || span->right < span->left ||
-            span->right >= kd->ndata ||
-            (span->mode != KDTREE_RANGESEARCH_SPAN_FILTER &&
-             span->mode != KDTREE_RANGESEARCH_SPAN_ACCEPT_ALL)) {
-            return NULL;
-        }
-    }
-    if (options & KD_OPTIONS_SORT_DISTS) {
-        options |= KD_OPTIONS_COMPUTE_DISTS;
-    }
-    do_dists = options & KD_OPTIONS_COMPUTE_DISTS;
-    do_points = options & KD_OPTIONS_RETURN_POINTS;
-    if (res) {
-        if (!res->capacity) {
-            resize_results(res, KDTREE_MAX_RESULTS, D,
-                           do_dists, do_points);
-        } else {
-            resize_results(res, res->capacity, D,
-                           do_dists, do_points);
-        }
-        res->nres = 0;
-    } else {
-        res = CALLOC(1, sizeof(kdtree_qres_t));
-        if (!res) {
-            SYSERROR("Failed to allocate kdtree_qres_t struct");
-            return NULL;
-        }
-        resize_results(res, KDTREE_MAX_RESULTS, D,
-                       do_dists, do_points);
-    }
-    for (span_index = 0U; span_index < span_count; span_index++) {
-        const kdtree_rangesearch_span_t* span = &spans[span_index];
-
-        if (!MANGLE(kdtree_rangesearch_scan_span)(
-                kd, res, query, maxd2, D,
-                span->left, span->right,
-                do_dists, do_points,
-                (kdtree_rangesearch_span_mode_t)span->mode)) {
-            return NULL;
-        }
-    }
-    if (!(options & KD_OPTIONS_NO_RESIZE_RESULTS)) {
-        resize_results(res, res->nres, D, do_dists, do_points);
-    }
-    if (options & KD_OPTIONS_SORT_DISTS) {
-        kdtree_qsort_results(res, kd->ndim);
-    }
-    return res;
-}
-
 kdtree_qres_t* MANGLE(kdtree_rangesearch_options)
      (const kdtree_t* kd, kdtree_qres_t* res, const void* vquery,
       double maxd2, int options)
@@ -1986,6 +1860,7 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options)
 
     while (stackpos >= 0) {
         int nodeid;
+        int i;
         int dim = -1;
         int L, R;
         ttype split = 0;
@@ -1996,13 +1871,64 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options)
 
 
         if (KD_IS_LEAF(kd, nodeid)) {
+            dtype* data;
+
             L = kdtree_left(kd, nodeid);
             R = kdtree_right(kd, nodeid);
-            if (!MANGLE(kdtree_rangesearch_scan_span)(
-                    kd, res, query, maxd2, D, L, R,
-                    do_dists, do_points,
-                    KDTREE_RANGESEARCH_SPAN_FILTER)) {
-                return NULL;
+
+            if (do_dists) {
+                for (i = L; i <= R; i++) {
+                    anbool bailedout = FALSE;
+                    double dsqd;
+
+                    data = KD_DATA(kd, D, i);
+
+                    dist2_bailout(kd,
+                                  query,
+                                  data,
+                                  D,
+                                  maxd2,
+                                  &bailedout,
+                                  &dsqd);
+
+                    if (bailedout) {
+                        continue;
+                    }
+
+                    if (!add_result(kd,
+                                    res,
+                                    dsqd,
+                                    KD_PERM(kd, i),
+                                    data,
+                                    D,
+                                    do_dists,
+                                    do_points)) {
+                        return NULL;
+                    }
+                }
+            } else {
+                for (i = L; i <= R; i++) {
+                    data = KD_DATA(kd, D, i);
+
+                    if (dist2_exceeds(kd,
+                                      query,
+                                      data,
+                                      D,
+                                      maxd2)) {
+                        continue;
+                    }
+
+                    if (!add_result(kd,
+                                    res,
+                                    LARGE_VAL,
+                                    KD_PERM(kd, i),
+                                    data,
+                                    D,
+                                    do_dists,
+                                    do_points)) {
+                        return NULL;
+                    }
+                }
             }
             continue;
         }
@@ -2083,11 +2009,20 @@ kdtree_qres_t* MANGLE(kdtree_rangesearch_options)
             if (wholenode) {
                 L = kdtree_left(kd, nodeid);
                 R = kdtree_right(kd, nodeid);
-                if (!MANGLE(kdtree_rangesearch_scan_span)(
-                        kd, res, query, maxd2, D, L, R,
-                        do_dists, do_points,
-                        KDTREE_RANGESEARCH_SPAN_ACCEPT_ALL)) {
-                    return NULL;
+                if (do_dists) {
+                    for (i=L; i<=R; i++) {
+                        double dsqd = dist2(kd, query, KD_DATA(kd, D, i), D);
+                        if (!add_result(kd, res, dsqd, KD_PERM(kd, i),
+                                        KD_DATA(kd, D, i), D,
+                                        do_dists, do_points))
+                            return NULL;
+                    }
+                } else {
+                    for (i=L; i<=R; i++)
+                        if (!add_result(kd, res, LARGE_VAL, KD_PERM(kd, i),
+                                        KD_DATA(kd, D, i), D,
+                                        do_dists, do_points))
+                            return NULL;
                 }
                 continue;
             }
@@ -3934,38 +3869,6 @@ static int MANGLE(kdtree_prefetch_emit_payload)
     return KDTREE_PREFETCH_EMIT_CONTINUE;
 }
 
-static int MANGLE(kdtree_prefetch_emit_span)
-     (int L,
-      int R,
-      kdtree_rangesearch_span_mode_t mode,
-      const kdtree_prefetch_sink_t *sink) {
-    kdtree_rangesearch_span_t span;
-    int status;
-
-    if (!sink) {
-        return KDTREE_PREFETCH_EMIT_ERROR;
-    }
-    if (!sink->emit_span) {
-        return KDTREE_PREFETCH_EMIT_CONTINUE;
-    }
-    if (L < 0 || R < L ||
-        (mode != KDTREE_RANGESEARCH_SPAN_FILTER &&
-         mode != KDTREE_RANGESEARCH_SPAN_ACCEPT_ALL)) {
-        return KDTREE_PREFETCH_EMIT_ERROR;
-    }
-    span.left = L;
-    span.right = R;
-    span.mode = (unsigned char)mode;
-    status = sink->emit_span(sink->userdata, &span);
-    if (status < 0) {
-        return KDTREE_PREFETCH_EMIT_ERROR;
-    }
-    if (status > 0) {
-        return KDTREE_PREFETCH_EMIT_REFUSED;
-    }
-    return KDTREE_PREFETCH_EMIT_CONTINUE;
-}
-
 static int MANGLE(kdtree_prefetch_emit_split_metadata)
      (const kdtree_t *kd,
       int nodeid,
@@ -4161,13 +4064,6 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
                     ? KDTREE_PREFETCH_PREPARE_ERROR
                     : KDTREE_PREFETCH_PREPARE_REFUSED;
             }
-            emit_status = MANGLE(kdtree_prefetch_emit_span)
-                (L, R, KDTREE_RANGESEARCH_SPAN_FILTER, sink);
-            if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
-                return emit_status < 0
-                    ? KDTREE_PREFETCH_PREPARE_ERROR
-                    : KDTREE_PREFETCH_PREPARE_REFUSED;
-            }
             continue;
         }
 
@@ -4272,13 +4168,6 @@ int MANGLE(kdtree_rangesearch_prefetch_prepare)
                 R = kdtree_right(kd, nodeid);
                 emit_status = MANGLE(kdtree_prefetch_emit_payload)
                     (kd, D, L, R, sink);
-                if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
-                    return emit_status < 0
-                        ? KDTREE_PREFETCH_PREPARE_ERROR
-                        : KDTREE_PREFETCH_PREPARE_REFUSED;
-                }
-                emit_status = MANGLE(kdtree_prefetch_emit_span)
-                    (L, R, KDTREE_RANGESEARCH_SPAN_ACCEPT_ALL, sink);
                 if (emit_status != KDTREE_PREFETCH_EMIT_CONTINUE) {
                     return emit_status < 0
                         ? KDTREE_PREFETCH_PREPARE_ERROR

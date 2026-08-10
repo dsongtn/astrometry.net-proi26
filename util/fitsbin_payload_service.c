@@ -158,8 +158,6 @@ static unsigned long long
 static unsigned long long
     fitsbin_payload_io_service_direct_ready = 0ULL;
 
-#define FITSBIN_PAYLOAD_READY_REVALIDATION_LIMIT 2U
-
 typedef struct fitsbin_payload_transport_metrics {
     unsigned long long direct_attempts;
     unsigned long long direct_policy_refused;
@@ -2301,12 +2299,6 @@ static size_t fitsbin_payload_io_refresh_reservation(
         return byte_budget;
     }
     mapped_bound = prepared_bytes + reused_bytes;
-    gap_headroom = mapped_bound /
-        FITSBIN_PAYLOAD_MAPPED_COALESCE_BUDGET_DIVISOR;
-    if (gap_headroom > SIZE_MAX - mapped_bound) {
-        return byte_budget;
-    }
-    mapped_bound += gap_headroom;
     if (!fitsbin_payload_io_batched_population_available()) {
         /*
          * The file-offset fallback may bridge another bounded set of gaps.
@@ -2336,12 +2328,10 @@ int fitsbin_prefetch_ranges_submit(
     size_t prepared_byte_count;
     size_t prepared_logical_byte_count;
     unsigned long long prepared_page_count;
-    unsigned long long reuse_sequence;
     size_t prepared_exact_span_count;
     unsigned long long prepared_reused_page_count;
     size_t prepared_coalesced_gap_count;
     size_t prepared_coalesced_gap_bytes;
-    unsigned int ready_attempt;
 #if defined(__linux__)
     int fd;
     int duplicate;
@@ -2384,79 +2374,28 @@ int fitsbin_prefetch_ranges_submit(
     }
     pthread_mutex_unlock(&fitsbin_payload_io_mutex);
 
-    for (ready_attempt = 0U;
-         ready_attempt < FITSBIN_PAYLOAD_READY_REVALIDATION_LIMIT;
-         ready_attempt++) {
-        anbool service_available;
-        anbool sequence_stable;
-
-        reuse_sequence = fitsbin_payload_io_sequence_hint();
-        if (fitsbin_prepare_mapped_spans(
-                fb,
-                ranges,
-                range_count,
-                byte_budget,
-                reuse_sequence,
-                FALSE,
-                prepared_spans,
-                FITSBIN_PREFETCH_RANGE_LIMIT,
-                &prepared_span_count,
-                &prepared_byte_count,
-                &prepared_logical_byte_count,
-                &prepared_page_count,
-                &prepared_exact_span_count,
-                &prepared_reused_page_count,
-                &prepared_coalesced_gap_count,
-                &prepared_coalesced_gap_bytes)) {
-            return -1;
-        }
-        if (prepared_span_count) {
-            break;
-        }
-        pthread_mutex_lock(&fitsbin_payload_io_mutex);
-        service_available =
-            fitsbin_payload_io_service_running &&
-            fitsbin_payload_io_service_accepting;
-        sequence_stable = service_available && reuse_sequence &&
-            __atomic_load_n(
-                &fitsbin_payload_io_next_sequence,
-                __ATOMIC_ACQUIRE) == reuse_sequence - 1ULL;
-        if (sequence_stable &&
-            fitsbin_payload_io_transport_metrics_enabled) {
-            fitsbin_payload_counter_add(
-                &fitsbin_payload_io_transport_metrics.
-                    mapped_immediate_ready,
-                1ULL);
-            fitsbin_payload_counter_add(
-                &fitsbin_payload_io_transport_metrics.
-                    mapped_exact_spans,
-                (unsigned long long)prepared_exact_span_count);
-            fitsbin_payload_counter_add(
-                &fitsbin_payload_io_transport_metrics.
-                    mapped_reused_pages,
-                prepared_reused_page_count);
-        }
-        pthread_mutex_unlock(&fitsbin_payload_io_mutex);
-        if (!service_available) {
-            errno = ENODEV;
-            return FITSBIN_PAYLOAD_IO_SUBMIT_UNAVAILABLE;
-        }
-        if (sequence_stable) {
-            __atomic_add_fetch(
-                &fb->payload_cache_hits,
-                prepared_reused_page_count,
-                __ATOMIC_RELAXED);
-            errno = 0;
-            return FITSBIN_PAYLOAD_IO_SUBMIT_READY;
-        }
+    if (fitsbin_prepare_mapped_spans(
+            fb,
+            ranges,
+            range_count,
+            byte_budget,
+            0ULL,
+            FALSE,
+            prepared_spans,
+            FITSBIN_PREFETCH_RANGE_LIMIT,
+            &prepared_span_count,
+            &prepared_byte_count,
+            &prepared_logical_byte_count,
+            &prepared_page_count,
+            &prepared_exact_span_count,
+            &prepared_reused_page_count,
+            &prepared_coalesced_gap_count,
+            &prepared_coalesced_gap_bytes)) {
+        return -1;
     }
-    if (!prepared_span_count) {
-        /*
-         * Admission changed during both bounded checks. Do not call stale
-         * completion metadata READY; let the authoritative mapped path run.
-         */
-        errno = EAGAIN;
-        return FITSBIN_PAYLOAD_IO_SUBMIT_UNAVAILABLE;
+    if (!prepared_span_count || prepared_reused_page_count) {
+        errno = EFAULT;
+        return -1;
     }
     ticket = fitsbin_payload_io_ticket_alloc();
     if (!ticket) {

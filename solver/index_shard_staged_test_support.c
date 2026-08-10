@@ -660,22 +660,16 @@ static int index_shard_staged_owner_rotation_test(void) {
   return failures;
 }
 
-int index_shard_ready_before_outer_test(void) {
+static int index_shard_staged_frontier_priority_test(void) {
   index_shard_pool_t pool;
   index_shard_worker_context_t contexts[2];
   index_shard_staged_group_t group;
-  index_shard_staged_task_t tasks[2];
-  index_shard_thread_state_t *shared;
+  index_shard_staged_task_t tasks[3];
   index_shard_inner_claim_t claim;
-  unsigned char outer_states[3] = {
-      INDEX_SHARD_OUTER_RUNNING,
-      INDEX_SHARD_OUTER_UNCLAIMED,
-      INDEX_SHARD_OUTER_UNCLAIMED
-  };
-  fitsbin_mmap_advice_t mmap_advice = FITSBIN_MMAP_ADVICE_NORMAL;
-  size_t index_order = SIZE_MAX;
-  index_shard_work_selection_t selection;
+  index_shard_thread_state_t *shared;
+  int rearmed_owner = -1;
   int failures = 0;
+  int i;
 
   memset(&pool, 0, sizeof(pool));
   memset(contexts, 0, sizeof(contexts));
@@ -686,34 +680,271 @@ int index_shard_ready_before_outer_test(void) {
   if (index_shard_staged_retire_test_init(shared)) {
     return 1;
   }
-
   pool.worker_count = 2;
-  pool.generation = 8U;
+  pool.generation = 23U;
   pool.contexts = contexts;
   shared->pool = &pool;
   shared->worker_count = 2;
   shared->observability_enabled = TRUE;
-  shared->outer_states = outer_states;
-  shared->nindexes = 3U;
-  shared->outer_unclaimed = 2U;
-  shared->outer_running = 1U;
-  shared->producer_width = 2U;
-  shared->canonical_scan_cursor = 1U;
+  for (i = 0; i < 2; i++) {
+    contexts[i].worker_id = i;
+    contexts[i].pool = &pool;
+    contexts[i].generation_seen = pool.generation;
+  }
+  contexts[0].current_outer_active = TRUE;
+  contexts[0].current_index_order = 9U;
+  contexts[0].staged_group_epoch = 61U;
+  contexts[0].published_staged_group = &group;
+  group.pool = &pool;
+  group.tasks = tasks;
+  group.task_count = 3U;
+  group.generation = pool.generation;
+  group.owner_epoch = contexts[0].staged_group_epoch;
+  group.owner_worker = 0;
+  group.owner_index_order = contexts[0].current_index_order;
+  failures += index_shard_staged_test_account(
+      shared, &group) != 0;
 
-  contexts[0].worker_id = 0;
-  contexts[0].pool = &pool;
-  contexts[0].generation_seen = pool.generation;
+  /* The canonical PREPARE frontier wins over later local computation. */
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[0],
+      INDEX_SHARD_STAGED_TASK_PREPARE_READY) != 0;
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[1],
+      INDEX_SHARD_STAGED_TASK_COMPUTE_READY) != 0;
+  failures += index_shard_owner_progress_select_locked(
+      &contexts[0], shared, &claim) != 0;
+  failures += claim.kind != INDEX_SHARD_INNER_CLAIM_STAGED;
+  failures += claim.staged.group != &group;
+  failures += claim.staged.task_index != 0U;
+  failures += claim.staged.kind !=
+      INDEX_SHARD_STAGED_CLAIM_PREPARE;
+  failures += !claim.staged.owner_claim;
+  failures += tasks[1].scheduler_state !=
+      INDEX_SHARD_STAGED_TASK_COMPUTE_READY;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  failures += index_shard_staged_complete_claim(
+      shared, &claim.staged,
+      INDEX_SHARD_STAGED_PREPARE_MORE,
+      0.0, 0ULL) != 0;
+
+  /* An uncredited frontier never selects a later credited submission. */
+  pthread_mutex_lock(&shared->queue_mutex);
+  shared->staged_submit_backpressure = TRUE;
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[0],
+      INDEX_SHARD_STAGED_TASK_SUBMIT_READY) != 0;
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[2],
+      INDEX_SHARD_STAGED_TASK_SUBMIT_READY) != 0;
+  failures += index_shard_staged_set_submit_wait_locked(
+      &group, &tasks[2], TRUE) != 0;
+  failures += index_shard_staged_rearm_one_submit_waiter_locked(
+      &pool, &rearmed_owner) != 1;
+  failures += rearmed_owner != 0;
+  failures += index_shard_owner_progress_select_locked(
+      &contexts[0], shared, &claim) != 0;
+  failures += claim.staged.task_index != 1U;
+  failures += claim.staged.kind !=
+      INDEX_SHARD_STAGED_CLAIM_EXECUTE;
+  failures += !claim.staged.owner_claim;
+  failures += tasks[0].scheduler_state !=
+      INDEX_SHARD_STAGED_TASK_SUBMIT_READY;
+  failures += tasks[2].scheduler_state !=
+      INDEX_SHARD_STAGED_TASK_SUBMIT_READY;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  failures += index_shard_staged_complete_claim(
+      shared, &claim.staged,
+      INDEX_SHARD_STAGED_EXECUTE_COMPUTE_READY,
+      0.0, 0ULL) != 0;
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[2],
+      INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  /* A credited frontier submit wins over the same later computation. */
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_set_submit_wait_locked(
+      &group, &tasks[0], TRUE) != 0;
+  failures += index_shard_staged_rearm_one_submit_waiter_locked(
+      &pool, &rearmed_owner) != 1;
+  failures += rearmed_owner != 0;
+  failures += index_shard_owner_progress_select_locked(
+      &contexts[0], shared, &claim) != 0;
+  failures += claim.staged.task_index != 0U;
+  failures += claim.staged.kind !=
+      INDEX_SHARD_STAGED_CLAIM_SUBMIT;
+  failures += !claim.staged.owner_claim;
+  failures += !claim.staged.submit_credit;
+  failures += tasks[1].scheduler_state !=
+      INDEX_SHARD_STAGED_TASK_COMPUTE_READY;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  failures += index_shard_staged_complete_claim(
+      shared, &claim.staged,
+      INDEX_SHARD_STAGED_SUBMIT_COMPUTE_READY,
+      0.0, 0ULL) != 0;
+
+  /* Incomplete frontier I/O never selects a later completed ticket. */
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[0],
+      INDEX_SHARD_STAGED_TASK_IO_SUBMITTED) != 0;
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[2],
+      INDEX_SHARD_STAGED_TASK_IO_SUBMITTED) != 0;
+  failures += index_shard_staged_set_completion_pending_locked(
+      &group, &tasks[2], TRUE) != 0;
+  failures += index_shard_owner_progress_select_locked(
+      &contexts[0], shared, &claim) != 0;
+  failures += claim.staged.task_index != 1U;
+  failures += claim.staged.kind !=
+      INDEX_SHARD_STAGED_CLAIM_EXECUTE;
+  failures += !claim.staged.owner_claim;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  failures += index_shard_staged_complete_claim(
+      shared, &claim.staged,
+      INDEX_SHARD_STAGED_EXECUTE_COMPUTE_READY,
+      0.0, 0ULL) != 0;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += index_shard_staged_set_completion_pending_locked(
+      &group, &tasks[2], FALSE) != 0;
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[2],
+      INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
+
+  /* A completed frontier ticket outranks later computation. */
+  failures += index_shard_staged_set_completion_pending_locked(
+      &group, &tasks[0], TRUE) != 0;
+  failures += index_shard_owner_progress_select_locked(
+      &contexts[0], shared, &claim) != 0;
+  failures += claim.staged.task_index != 0U;
+  failures += claim.staged.kind !=
+      INDEX_SHARD_STAGED_CLAIM_IO_POLL;
+  failures += !claim.staged.owner_claim;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  failures += index_shard_staged_complete_claim(
+      shared, &claim.staged,
+      INDEX_SHARD_STAGED_IO_PENDING,
+      0.0, 0ULL) != 0;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += tasks[0].completion_pending;
+  failures += index_shard_owner_progress_select_locked(
+      &contexts[0], shared, &claim) != 0;
+  failures += claim.staged.task_index != 1U;
+  failures += claim.staged.kind !=
+      INDEX_SHARD_STAGED_CLAIM_EXECUTE;
+  failures += !claim.staged.owner_claim;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  failures += index_shard_staged_complete_claim(
+      shared, &claim.staged,
+      INDEX_SHARD_STAGED_EXECUTE_COMPUTE_READY,
+      0.0, 0ULL) != 0;
+
+  /* Cancellation still claims the frontier I/O state without executing it. */
+  pthread_mutex_lock(&shared->queue_mutex);
+  group.cancelling = TRUE;
+  failures += index_shard_owner_progress_select_locked(
+      &contexts[0], shared, &claim) != 0;
+  failures += claim.staged.task_index != 0U;
+  failures += claim.staged.kind !=
+      INDEX_SHARD_STAGED_CLAIM_IO_CANCEL;
+  failures += !claim.staged.owner_claim;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  failures += index_shard_staged_complete_claim(
+      shared, &claim.staged, 0, 0.0, 0ULL) != 0;
+
+  /* The priority attempt retains the existing generation integrity gate. */
+  pthread_mutex_lock(&shared->queue_mutex);
+  group.cancelling = FALSE;
+  tasks[0].cancel_sent = FALSE;
+  group.cancel_sent_mask &= ~UINT64_C(1);
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[0],
+      INDEX_SHARD_STAGED_TASK_PREPARE_READY) != 0;
+  failures += index_shard_staged_set_state_locked(
+      shared, &group, &tasks[1],
+      INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
+  group.generation++;
+  failures += index_shard_owner_progress_select_locked(
+      &contexts[0], shared, &claim) != -1;
+  failures += !group.internal_error;
+  group.generation = pool.generation;
+  for (i = 0; i < 3; i++) {
+    failures += index_shard_staged_set_state_locked(
+        shared, &group, &tasks[i],
+        INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
+  }
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  failures += index_shard_staged_test_unaccount(
+      shared, &group) != 0;
+  contexts[0].published_staged_group = NULL;
+  index_shard_staged_retire_test_destroy(shared);
+  return failures;
+}
+
+int index_shard_ready_before_outer_test(void) {
+  index_shard_pool_t pool;
+  index_shard_worker_context_t contexts[4];
+  index_shard_staged_group_t group;
+  index_shard_staged_task_t tasks[4];
+  index_shard_thread_state_t *shared;
+  index_shard_inner_claim_t claims[3];
+  unsigned char outer_states[7] = {
+      INDEX_SHARD_OUTER_RUNNING,
+      INDEX_SHARD_OUTER_RUNNING,
+      INDEX_SHARD_OUTER_RUNNING,
+      INDEX_SHARD_OUTER_UNCLAIMED,
+      INDEX_SHARD_OUTER_UNCLAIMED,
+      INDEX_SHARD_OUTER_UNCLAIMED,
+      INDEX_SHARD_OUTER_UNCLAIMED
+  };
+  fitsbin_mmap_advice_t mmap_advice = FITSBIN_MMAP_ADVICE_NORMAL;
+  size_t index_order = SIZE_MAX;
+  index_shard_work_selection_t selection;
+  int failures = 0;
+  int i;
+
+  memset(&pool, 0, sizeof(pool));
+  memset(contexts, 0, sizeof(contexts));
+  memset(&group, 0, sizeof(group));
+  memset(tasks, 0, sizeof(tasks));
+  memset(claims, 0, sizeof(claims));
+  shared = &pool.shared;
+  if (index_shard_staged_retire_test_init(shared)) {
+    return 1;
+  }
+
+  pool.worker_count = 4;
+  pool.generation = 8U;
+  pool.contexts = contexts;
+  shared->pool = &pool;
+  shared->worker_count = 4;
+  shared->observability_enabled = TRUE;
+  shared->outer_states = outer_states;
+  shared->nindexes = 7U;
+  shared->outer_unclaimed = 4U;
+  shared->outer_running = 3U;
+  shared->producer_width = 4U;
+  shared->canonical_scan_cursor = 3U;
+
+  for (i = 0; i < 4; i++) {
+    contexts[i].worker_id = i;
+    contexts[i].pool = &pool;
+    contexts[i].generation_seen = pool.generation;
+  }
   contexts[0].current_outer_active = TRUE;
   contexts[0].current_index_order = 0U;
   contexts[0].staged_group_epoch = 31U;
   contexts[0].published_staged_group = &group;
-  contexts[1].worker_id = 1;
-  contexts[1].pool = &pool;
-  contexts[1].generation_seen = pool.generation;
 
   group.pool = &pool;
   group.tasks = tasks;
-  group.task_count = 2U;
+  group.task_count = 4U;
   group.generation = pool.generation;
   group.owner_epoch = contexts[0].staged_group_epoch;
   group.owner_worker = 0;
@@ -722,81 +953,211 @@ int index_shard_ready_before_outer_test(void) {
       shared, &group) != 0;
 
   /* No ready computation: the canonical outer task wins immediately. */
-  contexts[1].ready_before_outer_eligible = TRUE;
+  contexts[3].ready_before_outer_budget = 2U;
   selection = index_shard_select_work(
-      &contexts[1], shared, &index_order, &mmap_advice, &claim);
+      &contexts[3], shared, &index_order, &mmap_advice, &claims[0]);
   failures += selection != INDEX_SHARD_WORK_OUTER;
-  failures += index_order != 1U;
-  failures += contexts[1].ready_before_outer_eligible;
-  failures += outer_states[1] != INDEX_SHARD_OUTER_RUNNING;
+  failures += index_order != 3U;
+  failures += outer_states[3] != INDEX_SHARD_OUTER_RUNNING;
+  failures += shared->outer_running != 4U;
+  failures += contexts[3].ready_before_outer_budget != 0U;
   failures += shared->staged_ready_before_outer_claims != 0U;
 
-  /* Model completion of that outer task and publish two foreign packets. */
+  /* Model completion and publish enough work for two dynamic helper lanes. */
+  pthread_mutex_lock(&shared->queue_mutex);
+  outer_states[3] = INDEX_SHARD_OUTER_FINISHED;
+  shared->outer_running--;
+  contexts[3].ready_before_outer_budget = 2U;
+  for (i = 0; i < 4; i++) {
+    failures += index_shard_staged_set_state_locked(
+        shared, &group, &tasks[i],
+        INDEX_SHARD_STAGED_TASK_COMPUTE_READY) != 0;
+  }
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  memset(&claims[0], 0, sizeof(claims[0]));
+  index_order = SIZE_MAX;
+  selection = index_shard_select_work(
+      &contexts[3], shared, &index_order, &mmap_advice, &claims[0]);
+  failures += selection != INDEX_SHARD_WORK_HELPER;
+  failures += claims[0].kind != INDEX_SHARD_INNER_CLAIM_STAGED;
+  failures += claims[0].staged.group != &group;
+  failures += claims[0].staged.task_index != 0U;
+  failures += claims[0].staged.owner_claim;
+  failures += outer_states[4] != INDEX_SHARD_OUTER_UNCLAIMED;
+  failures += contexts[3].ready_before_outer_budget != 1U;
+  failures += shared->staged_ready_before_outer_claims != 1U;
+  failures += shared->staged_compute_ready != 3U;
+  failures += shared->staged_compute_running_global != 1U;
+  failures += group.compute_running != 1U;
+  failures += group.running_count != 1U;
+
+  /* A second finishing owner can fill the second half-pool helper lane. */
+  pthread_mutex_lock(&shared->queue_mutex);
+  outer_states[2] = INDEX_SHARD_OUTER_FINISHED;
+  shared->outer_running--;
+  contexts[2].ready_before_outer_budget = 2U;
+  pthread_mutex_unlock(&shared->queue_mutex);
+  memset(&claims[1], 0, sizeof(claims[1]));
+  index_order = SIZE_MAX;
+  selection = index_shard_select_work(
+      &contexts[2], shared, &index_order, &mmap_advice, &claims[1]);
+  failures += selection != INDEX_SHARD_WORK_HELPER;
+  failures += claims[1].kind != INDEX_SHARD_INNER_CLAIM_STAGED;
+  failures += claims[1].staged.group != &group;
+  failures += claims[1].staged.task_index != 1U;
+  failures += claims[1].staged.owner_claim;
+  failures += contexts[2].ready_before_outer_budget != 1U;
+  failures += shared->staged_ready_before_outer_claims != 2U;
+  failures += shared->staged_compute_ready != 2U;
+  failures += shared->staged_compute_running_global != 2U;
+  failures += shared->staged_max_compute_running_global != 2U;
+  failures += group.compute_running != 2U;
+  failures += group.running_count != 2U;
+
+  /* A third non-owner exceeds the half-pool target and must produce outer. */
   pthread_mutex_lock(&shared->queue_mutex);
   outer_states[1] = INDEX_SHARD_OUTER_FINISHED;
   shared->outer_running--;
-  contexts[1].ready_before_outer_eligible = TRUE;
-  failures += index_shard_staged_set_state_locked(
-      shared, &group, &tasks[0],
-      INDEX_SHARD_STAGED_TASK_COMPUTE_READY) != 0;
-  failures += index_shard_staged_set_state_locked(
-      shared, &group, &tasks[1],
-      INDEX_SHARD_STAGED_TASK_COMPUTE_READY) != 0;
+  contexts[1].ready_before_outer_budget = 2U;
   pthread_mutex_unlock(&shared->queue_mutex);
-
-  memset(&claim, 0, sizeof(claim));
+  memset(&claims[2], 0, sizeof(claims[2]));
   index_order = SIZE_MAX;
   selection = index_shard_select_work(
-      &contexts[1], shared, &index_order, &mmap_advice, &claim);
-  failures += selection != INDEX_SHARD_WORK_HELPER;
-  failures += claim.kind != INDEX_SHARD_INNER_CLAIM_STAGED;
-  failures += claim.staged.group != &group;
-  failures += claim.staged.task_index != 0U;
-  failures += claim.staged.owner_claim;
-  failures += contexts[1].ready_before_outer_eligible;
-  failures += outer_states[2] != INDEX_SHARD_OUTER_UNCLAIMED;
-  failures += shared->staged_ready_before_outer_claims != 1U;
+      &contexts[1], shared, &index_order, &mmap_advice, &claims[2]);
+  failures += selection != INDEX_SHARD_WORK_OUTER;
+  failures += index_order != 4U;
+  failures += outer_states[4] != INDEX_SHARD_OUTER_RUNNING;
+  failures += tasks[2].scheduler_state !=
+      INDEX_SHARD_STAGED_TASK_COMPUTE_READY;
+  failures += tasks[3].scheduler_state !=
+      INDEX_SHARD_STAGED_TASK_COMPUTE_READY;
+  failures += shared->outer_running != 2U;
+  failures += contexts[1].ready_before_outer_budget != 0U;
+  failures += shared->staged_ready_before_outer_claims != 2U;
+  failures += shared->staged_compute_ready != 2U;
+  failures += shared->staged_compute_running_global != 2U;
+  failures += group.compute_running != 2U;
+  failures += group.running_count != 2U;
+  failures += shared->outer_claims != 2U;
+  failures += shared->outer_unclaimed != 2U;
+  failures += shared->canonical_scan_cursor != 5U;
 
   failures += index_shard_staged_complete_claim(
-      shared, &claim.staged,
+      shared, &claims[0].staged,
       INDEX_SHARD_STAGED_EXECUTE_OK, 0.0, 0ULL) != 0;
+  failures += index_shard_staged_complete_claim(
+      shared, &claims[1].staged,
+      INDEX_SHARD_STAGED_EXECUTE_OK, 0.0, 0ULL) != 0;
+  failures += shared->staged_compute_running_global != 0U;
+  failures += group.compute_running != 0U;
+  failures += group.running_count != 0U;
 
-  /* The credit was consumed: the next outer task beats packet one. */
-  memset(&claim, 0, sizeof(claim));
+  /* As READY supply shrinks, one free lane returns to outer production. */
+  memset(&claims[0], 0, sizeof(claims[0]));
   index_order = SIZE_MAX;
   selection = index_shard_select_work(
-      &contexts[1], shared, &index_order, &mmap_advice, &claim);
+      &contexts[3], shared, &index_order, &mmap_advice, &claims[0]);
+  failures += selection != INDEX_SHARD_WORK_HELPER;
+  failures += claims[0].staged.task_index != 2U;
+  failures += contexts[3].ready_before_outer_budget != 0U;
+  failures += shared->staged_ready_before_outer_claims != 3U;
+  failures += shared->staged_compute_ready != 1U;
+  failures += shared->staged_compute_running_global != 1U;
+  failures += group.compute_running != 1U;
+  failures += group.running_count != 1U;
+  failures += index_shard_staged_complete_claim(
+      shared, &claims[0].staged,
+      INDEX_SHARD_STAGED_EXECUTE_OK, 0.0, 0ULL) != 0;
+  failures += shared->staged_compute_running_global != 0U;
+  failures += group.compute_running != 0U;
+  failures += group.running_count != 0U;
+
+  memset(&claims[0], 0, sizeof(claims[0]));
+  index_order = SIZE_MAX;
+  selection = index_shard_select_work(
+      &contexts[3], shared, &index_order, &mmap_advice, &claims[0]);
   failures += selection != INDEX_SHARD_WORK_OUTER;
-  failures += index_order != 2U;
-  failures += outer_states[2] != INDEX_SHARD_OUTER_RUNNING;
-  failures += tasks[1].scheduler_state !=
+  failures += index_order != 5U;
+  failures += outer_states[5] != INDEX_SHARD_OUTER_RUNNING;
+  failures += tasks[3].scheduler_state !=
       INDEX_SHARD_STAGED_TASK_COMPUTE_READY;
-  failures += shared->staged_ready_before_outer_claims != 1U;
+  failures += shared->outer_running != 3U;
+  failures += contexts[3].ready_before_outer_budget != 0U;
+  failures += shared->staged_ready_before_outer_claims != 3U;
+  failures += shared->staged_compute_ready != 1U;
+  failures += shared->staged_compute_running_global != 0U;
+  failures += shared->outer_claims != 3U;
+  failures += shared->outer_unclaimed != 1U;
+  failures += shared->canonical_scan_cursor != 6U;
 
   /* Terminal state always wins without consuming or claiming work. */
-  contexts[1].ready_before_outer_eligible = TRUE;
+  contexts[2].ready_before_outer_budget = 1U;
   pthread_mutex_lock(&shared->state_mutex);
   shared->stop_requested = TRUE;
   pthread_mutex_unlock(&shared->state_mutex);
   selection = index_shard_select_work(
-      &contexts[1], shared, &index_order, &mmap_advice, &claim);
+      &contexts[2], shared, &index_order, &mmap_advice, &claims[1]);
   failures += selection != INDEX_SHARD_WORK_DONE;
-  failures += !contexts[1].ready_before_outer_eligible;
-  failures += tasks[1].scheduler_state !=
+  failures += contexts[2].ready_before_outer_budget != 0U;
+  failures += tasks[3].scheduler_state !=
       INDEX_SHARD_STAGED_TASK_COMPUTE_READY;
 
   pthread_mutex_lock(&shared->queue_mutex);
-  failures += index_shard_staged_set_state_locked(
-      shared, &group, &tasks[0],
-      INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
-  failures += index_shard_staged_set_state_locked(
-      shared, &group, &tasks[1],
-      INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
+  for (i = 0; i < 4; i++) {
+    failures += index_shard_staged_set_state_locked(
+        shared, &group, &tasks[i],
+        INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
+  }
   pthread_mutex_unlock(&shared->queue_mutex);
   failures += index_shard_staged_test_unaccount(
       shared, &group) != 0;
+  failures += shared->staged_compute_ready != 0U;
+  failures += shared->staged_compute_running_global != 0U;
+  failures += group.compute_ready != 0U;
+  failures += group.compute_running != 0U;
+  failures += group.running_count != 0U;
+  for (i = 0; i < 4; i++) {
+    failures += contexts[i].ready_before_outer_budget != 0U;
+  }
   contexts[0].published_staged_group = NULL;
   index_shard_staged_retire_test_destroy(shared);
+  return failures;
+}
+
+static int index_shard_ready_budget_grant_test(void) {
+  index_shard_thread_state_t shared;
+  int failures = 0;
+
+  memset(&shared, 0, sizeof(shared));
+
+  shared.worker_count = 1;
+  shared.outer_running = 1U;
+  failures += index_shard_ready_before_outer_budget(&shared) != 0U;
+
+  shared.worker_count = 2;
+  shared.outer_running = 1U;
+  failures += index_shard_ready_before_outer_budget(&shared) != 1U;
+
+  shared.worker_count = 3;
+  shared.outer_running = 2U;
+  failures += index_shard_ready_before_outer_budget(&shared) != 1U;
+
+  shared.worker_count = 4;
+  shared.outer_running = 3U;
+  failures += index_shard_ready_before_outer_budget(&shared) != 2U;
+
+  shared.worker_count = 6;
+  shared.outer_running = 5U;
+  failures += index_shard_ready_before_outer_budget(&shared) != 2U;
+
+  shared.worker_count = 8;
+  shared.outer_running = 7U;
+  failures += index_shard_ready_before_outer_budget(&shared) != 2U;
+
+  shared.outer_running = 0U;
+  failures += index_shard_ready_before_outer_budget(&shared) != 0U;
+  failures += index_shard_ready_before_outer_budget(NULL) != 0U;
   return failures;
 }
 
@@ -1223,176 +1584,6 @@ int index_shard_staged_submit_backpressure_test(void) {
   return failures;
 }
 
-static size_t index_shard_staged_live_budget_bytes(
-    const void *input,
-    size_t input_bytes,
-    const void *output,
-    size_t output_bytes) {
-  (void)input;
-  (void)input_bytes;
-  if (!output || output_bytes != sizeof(size_t)) {
-    return 0U;
-  }
-  return *(const size_t *)output;
-}
-
-int index_shard_staged_live_budget_test(void) {
-  static const index_shard_staged_ops_t ops = {
-      "live-budget-test",
-      NULL,
-      NULL,
-      NULL,
-      NULL,
-      NULL,
-      NULL,
-      FALSE,
-      index_shard_staged_live_budget_bytes};
-  index_shard_pool_t pool;
-  index_shard_worker_context_t context;
-  index_shard_staged_group_t group;
-  index_shard_staged_task_t tasks[2];
-  index_shard_staged_claim_t claim;
-  index_shard_thread_state_t *shared;
-  size_t live_bytes[2] = {
-      10U * 1024U * 1024U,
-      10U * 1024U * 1024U};
-  int failures = 0;
-  size_t i;
-
-  memset(&pool, 0, sizeof(pool));
-  memset(&context, 0, sizeof(context));
-  memset(&group, 0, sizeof(group));
-  memset(tasks, 0, sizeof(tasks));
-  memset(&claim, 0, sizeof(claim));
-  shared = &pool.shared;
-  if (index_shard_staged_retire_test_init(shared)) {
-    return 1;
-  }
-  pool.worker_count = 1;
-  pool.generation = 12U;
-  pool.contexts = &context;
-  shared->pool = &pool;
-  shared->worker_count = 1;
-  shared->observability_enabled = TRUE;
-  shared->staged_live_bytes_limit =
-      INDEX_SHARD_STAGED_LIVE_BYTES_LIMIT;
-  context.worker_id = 0;
-  context.pool = &pool;
-  context.generation_seen = pool.generation;
-  context.current_outer_active = TRUE;
-  context.current_index_order = 7U;
-  context.staged_group_epoch = 51U;
-  context.published_staged_group = &group;
-  group.pool = &pool;
-  group.ops = &ops;
-  group.tasks = tasks;
-  group.task_count = 2U;
-  group.generation = pool.generation;
-  group.owner_epoch = context.staged_group_epoch;
-  group.owner_worker = 0;
-  group.owner_index_order = context.current_index_order;
-  for (i = 0U; i < 2U; i++) {
-    tasks[i].output = &live_bytes[i];
-    tasks[i].output_bytes = sizeof(live_bytes[i]);
-  }
-  failures += index_shard_staged_test_account(
-      shared, &group) != 0;
-
-  pthread_mutex_lock(&shared->queue_mutex);
-  for (i = 0U; i < 2U; i++) {
-    failures += index_shard_staged_set_state_locked(
-        shared, &group, &tasks[i],
-        INDEX_SHARD_STAGED_TASK_SUBMIT_READY) != 0;
-  }
-  failures += index_shard_staged_select_locked(
-      &context, shared,
-      INDEX_SHARD_STAGED_SELECT_SUBMIT,
-      INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
-      &claim) != 0;
-  failures += claim.task_index != 0U;
-  failures += tasks[0].retained_live_bytes != live_bytes[0];
-  failures += shared->staged_live_bytes != live_bytes[0];
-  failures += shared->staged_live_bytes_peak != live_bytes[0];
-  failures += shared->staged_live_acquires != 1U;
-  failures += shared->staged_live_releases != 0U;
-  pthread_mutex_unlock(&shared->queue_mutex);
-
-  failures += index_shard_staged_complete_claim(
-      shared, &claim,
-      INDEX_SHARD_STAGED_SUBMIT_COMPUTE_READY,
-      0.0, 0ULL) != 0;
-
-  pthread_mutex_lock(&shared->queue_mutex);
-  failures += tasks[0].scheduler_state !=
-      INDEX_SHARD_STAGED_TASK_COMPUTE_READY;
-  failures += tasks[0].retained_live_bytes != live_bytes[0];
-  failures += shared->staged_live_bytes != live_bytes[0];
-  failures += index_shard_staged_select_locked(
-      &context, shared,
-      INDEX_SHARD_STAGED_SELECT_SUBMIT,
-      INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
-      &claim) != 1;
-  failures += shared->staged_live_refusals != 1U;
-  failures += tasks[1].scheduler_state !=
-      INDEX_SHARD_STAGED_TASK_SUBMIT_READY;
-  failures += index_shard_staged_select_locked(
-      &context, shared,
-      INDEX_SHARD_STAGED_SELECT_COMPUTE,
-      INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
-      &claim) != 0;
-  failures += claim.task_index != 0U;
-  failures += shared->staged_live_bytes != live_bytes[0];
-  pthread_mutex_unlock(&shared->queue_mutex);
-
-  failures += index_shard_staged_complete_claim(
-      shared, &claim,
-      INDEX_SHARD_STAGED_EXECUTE_OK,
-      0.0, 0ULL) != 0;
-
-  pthread_mutex_lock(&shared->queue_mutex);
-  failures += tasks[0].retained_live_bytes != 0U;
-  failures += shared->staged_live_bytes != 0U;
-  failures += shared->staged_live_releases != 1U;
-  failures += index_shard_staged_select_locked(
-      &context, shared,
-      INDEX_SHARD_STAGED_SELECT_SUBMIT,
-      INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
-      &claim) != 0;
-  failures += claim.task_index != 1U;
-  failures += tasks[1].retained_live_bytes != live_bytes[1];
-  failures += shared->staged_live_bytes != live_bytes[1];
-  failures += shared->staged_live_bytes_peak != live_bytes[1];
-  failures += shared->staged_live_acquires != 2U;
-  failures += shared->staged_live_releases != 1U;
-  pthread_mutex_unlock(&shared->queue_mutex);
-
-  failures += index_shard_staged_complete_claim(
-      shared, &claim,
-      INDEX_SHARD_STAGED_SUBMIT_RETRY,
-      0.0, 0ULL) != 0;
-
-  pthread_mutex_lock(&shared->queue_mutex);
-  failures += tasks[1].retained_live_bytes != 0U;
-  failures += shared->staged_live_bytes != 0U;
-  failures += shared->staged_live_bytes_peak != live_bytes[1];
-  failures += shared->staged_live_acquires != 2U;
-  failures += shared->staged_live_releases != 2U;
-  failures += shared->staged_live_refusals != 1U;
-  failures += group.internal_error;
-  for (i = 0U; i < 2U; i++) {
-    failures += index_shard_staged_set_state_locked(
-        shared, &group, &tasks[i],
-        INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
-  }
-  pthread_mutex_unlock(&shared->queue_mutex);
-
-  failures += index_shard_staged_test_unaccount(
-      shared, &group) != 0;
-  context.published_staged_group = NULL;
-  index_shard_staged_retire_test_destroy(shared);
-  return failures;
-}
-
 int index_shard_completion_registry_test(void) {
   index_shard_pool_t pool;
   index_shard_worker_context_t contexts[2];
@@ -1527,13 +1718,11 @@ int index_shard_completion_inline_poll_case(
       NULL,
       NULL,
       NULL,
-      TRUE,
-      NULL};
+      TRUE};
   index_shard_pool_t pool;
   index_shard_worker_context_t contexts[2];
   index_shard_staged_group_t group;
   index_shard_staged_task_t task;
-  index_shard_staged_claim_t execute_claim;
   index_shard_thread_state_t *shared;
   anbool early = FALSE;
   int failures = 0;
@@ -1542,7 +1731,6 @@ int index_shard_completion_inline_poll_case(
   memset(contexts, 0, sizeof(contexts));
   memset(&group, 0, sizeof(group));
   memset(&task, 0, sizeof(task));
-  memset(&execute_claim, 0, sizeof(execute_claim));
   shared = &pool.shared;
   if (index_shard_staged_retire_test_init(shared)) {
     return 1;
@@ -1556,10 +1744,6 @@ int index_shard_completion_inline_poll_case(
   shared->staged_tickets_active = 1U;
   shared->staged_source_leases = 1U;
   shared->staged_io_submitted = 1U;
-  shared->staged_live_bytes_limit =
-      INDEX_SHARD_STAGED_LIVE_BYTES_LIMIT;
-  shared->staged_live_bytes = 4096U;
-  shared->staged_live_acquires = 1U;
   contexts[0].worker_id = 0;
   contexts[0].pool = &pool;
   contexts[0].generation_seen = pool.generation;
@@ -1578,7 +1762,6 @@ int index_shard_completion_inline_poll_case(
   group.io_submitted = 1U;
   task.output = &poll_status;
   task.output_bytes = sizeof(poll_status);
-  task.retained_live_bytes = 4096U;
   failures += index_shard_staged_test_account(
       shared, &group) != 0;
 
@@ -1619,34 +1802,6 @@ int index_shard_completion_inline_poll_case(
   failures += shared->completion_matches != 1U;
   failures += shared->completion_active != 0U;
   failures += shared->completion_registry_invalid != 0U;
-  failures += task.retained_live_bytes !=
-      (poll_status == INDEX_SHARD_STAGED_IO_READY ? 4096U : 0U);
-  failures += shared->staged_live_bytes !=
-      (poll_status == INDEX_SHARD_STAGED_IO_READY ? 4096U : 0U);
-  failures += shared->staged_live_releases !=
-      (poll_status == INDEX_SHARD_STAGED_IO_READY ? 0U : 1U);
-  if (poll_status == INDEX_SHARD_STAGED_IO_READY) {
-    failures += index_shard_staged_select_locked(
-        &contexts[0], shared,
-        INDEX_SHARD_STAGED_SELECT_COMPUTE,
-        INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
-        &execute_claim) != 0;
-    failures += execute_claim.task_index != 0U;
-  }
-  pthread_mutex_unlock(&shared->queue_mutex);
-
-  if (poll_status == INDEX_SHARD_STAGED_IO_READY) {
-    failures += index_shard_staged_complete_claim(
-        shared, &execute_claim,
-        INDEX_SHARD_STAGED_EXECUTE_OK,
-        0.0, 0ULL) != 0;
-  }
-
-  pthread_mutex_lock(&shared->queue_mutex);
-  failures += task.retained_live_bytes != 0U;
-  failures += shared->staged_live_bytes != 0U;
-  failures += shared->staged_live_acquires != 1U;
-  failures += shared->staged_live_releases != 1U;
   pthread_mutex_unlock(&shared->queue_mutex);
 
   failures += index_shard_staged_test_unaccount(
@@ -1941,12 +2096,13 @@ int index_shard_test_staged_retire_more(void) {
       index_shard_observability_counter_test() +
       index_shard_staged_mask_selection_test() +
       index_shard_staged_owner_rotation_test() +
+      index_shard_staged_frontier_priority_test() +
+      index_shard_ready_budget_grant_test() +
       index_shard_ready_before_outer_test() +
       index_shard_outer_cap_liveness_test() +
       index_shard_staged_submit_rearm_test() +
       index_shard_staged_submit_handoff_test() +
       index_shard_staged_submit_backpressure_test() +
-      index_shard_staged_live_budget_test() +
       index_shard_completion_registry_test() +
       index_shard_completion_inline_poll_test() +
       index_shard_execute_handoff_test() +

@@ -624,10 +624,30 @@ static int index_shard_mark_result_completed(
   return rc;
 }
 
+/*
+ * Bound one READY-first burst independently of configured pool width.
+ * The live caller holds queue_mutex; deterministic tests call this only on
+ * quiescent state.
+ */
+size_t index_shard_ready_before_outer_budget(
+    const index_shard_thread_state_t *shared) {
+  size_t helper_limit;
+
+  if (!shared || shared->worker_count < 2 ||
+      !shared->outer_running) {
+    return 0U;
+  }
+  helper_limit = (size_t)shared->worker_count / 2U;
+  return MIN(
+      MIN(shared->outer_running, helper_limit),
+      (size_t)INDEX_SHARD_READY_BEFORE_OUTER_BURST_MAX);
+}
+
 void index_shard_finish_outer_claim(
     index_shard_worker_context_t *worker,
     index_shard_thread_state_t *shared,
     size_t index_order) {
+  anbool lifecycle_valid = FALSE;
   int underflow = FALSE;
   int completion_failed;
 
@@ -656,13 +676,17 @@ void index_shard_finish_outer_claim(
   } else {
     shared->outer_states[index_order] =
         INDEX_SHARD_OUTER_FINISHED;
-    worker->ready_before_outer_eligible = TRUE;
+    lifecycle_valid = TRUE;
   }
   if (!shared->outer_running) {
     logerr("[index-shard] outer-running underflow\n");
     underflow = TRUE;
   } else {
     shared->outer_running--;
+    if (lifecycle_valid && !completion_failed) {
+      worker->ready_before_outer_budget =
+          index_shard_ready_before_outer_budget(shared);
+    }
   }
   if (!shared->outer_running) {
     index_shard_queue_broadcast_locked(shared);

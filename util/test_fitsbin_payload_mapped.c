@@ -5,6 +5,82 @@
 #include "test_fitsbin_payload_common.h"
 #include "fitsbin_internal.h"
 
+void test_fitsbin_payload_mapped_plan_keeps_unrequested_gap(CuTest* ct) {
+    payload_fixture_t fixture;
+    fitsbin_prefetch_range_t ranges[2];
+    fitsbin_mapped_span_t spans[2];
+    uintptr_t data_begin;
+    uintptr_t first_page;
+    size_t span_count = 0U;
+    size_t byte_count = 0U;
+    size_t logical_byte_count = 0U;
+    size_t exact_span_count = 0U;
+    size_t gap_count = 0U;
+    size_t gap_bytes = 0U;
+    unsigned long long page_count = 0ULL;
+    unsigned long long reused_pages = 0ULL;
+    long detected_page_size;
+    size_t page_size;
+
+    payload_fixture_open_for_test(ct, &fixture);
+    detected_page_size = sysconf(_SC_PAGESIZE);
+    CuAssert(ct, "failed to detect page size", detected_page_size > 0);
+    page_size = (size_t)detected_page_size;
+    data_begin = (uintptr_t)fixture.chunk->data;
+    first_page = data_begin;
+    if (first_page % (uintptr_t)page_size) {
+        first_page += (uintptr_t)page_size -
+            first_page % (uintptr_t)page_size;
+    }
+    CuAssert(
+        ct,
+        "payload fixture is too small for sparse mapped ranges",
+        first_page + 5U * page_size <=
+            data_begin + sizeof(fixture.bytes));
+    memset(ranges, 0, sizeof(ranges));
+    memset(spans, 0, sizeof(spans));
+    ranges[0].data = (const void*)first_page;
+    ranges[0].size = 2U * page_size;
+    ranges[1].data = (const void*)(first_page + 3U * page_size);
+    ranges[1].size = 2U * page_size;
+
+    CuAssertIntEquals(
+        ct,
+        0,
+        fitsbin_prepare_mapped_spans(
+            fixture.fitsbin,
+            ranges,
+            2U,
+            5U * page_size,
+            0ULL,
+            FALSE,
+            spans,
+            2U,
+            &span_count,
+            &byte_count,
+            &logical_byte_count,
+            &page_count,
+            &exact_span_count,
+            &reused_pages,
+            &gap_count,
+            &gap_bytes));
+    CuAssertIntEquals(ct, 2, (int)span_count);
+    CuAssertIntEquals(ct, 2, (int)exact_span_count);
+    CuAssertIntEquals(
+        ct, (int)(4U * page_size), (int)logical_byte_count);
+    CuAssertIntEquals(ct, (int)(4U * page_size), (int)byte_count);
+    CuAssertIntEquals(ct, 4, (int)page_count);
+    CuAssertIntEquals(ct, 0, (int)reused_pages);
+    CuAssertIntEquals(ct, 0, (int)gap_count);
+    CuAssertIntEquals(ct, 0, (int)gap_bytes);
+    CuAssert(
+        ct,
+        "sparse mapped ranges were not kept separate",
+        spans[0].end < spans[1].begin);
+
+    payload_fixture_close(&fixture);
+}
+
 void test_fitsbin_payload_deferred_mapped_plan(CuTest* ct) {
     payload_fixture_t fixture;
     fitsbin_payload_io_ticket_t* ticket = NULL;
@@ -92,9 +168,9 @@ void test_fitsbin_payload_deferred_mapped_plan(CuTest* ct) {
     CuAssertIntEquals(ct, 1, (int)stats.warm_calls);
     CuAssert(ct, "deferred mapped plan reported no pages",
              stats.warm_bytes > 0U);
-    CuAssert(ct, "mapped completion was not reused",
+    CuAssert(ct, "deferred mapped plan reused no exact pages",
              stats.cache_hits > 0U);
-    CuAssert(ct, "mapped completion recorded no first miss",
+    CuAssert(ct, "deferred mapped plan recorded no first miss",
              stats.cache_misses > 0U);
     CuAssertIntEquals(ct, 1, (int)stats.cache_allocations);
 #else
@@ -246,7 +322,7 @@ void test_fitsbin_payload_mapped_source_parallel_lanes(CuTest* ct) {
     CuAssertIntEquals(ct, 1, plans[1].calls);
     CuAssert(ct, "parallel mapped tickets issued invalid fill count",
              stats.warm_calls >= 1U && stats.warm_calls <= 2U);
-    CuAssert(ct, "parallel mapped tickets recorded no misses",
+    CuAssert(ct, "parallel mapped tickets recorded no first miss",
              stats.cache_misses > 0U);
 #else
     CuAssertIntEquals(ct, 0, first_submit);
@@ -488,7 +564,7 @@ void test_fitsbin_payload_precomputed_plan_refresh(CuTest* ct) {
     CuAssertIntEquals(ct, 1, second_wait);
     CuAssertIntEquals(ct, 1, first_plan.calls);
     CuAssertIntEquals(ct, 1, (int)stats.warm_calls);
-    CuAssert(ct, "precomputed refresh reused no pages",
+    CuAssert(ct, "precomputed refresh reused no exact pages",
              stats.cache_hits > 0U);
 #else
     CuAssertIntEquals(ct, 0, first_submit);
@@ -499,7 +575,7 @@ void test_fitsbin_payload_precomputed_plan_refresh(CuTest* ct) {
     payload_fixture_close(&fixture);
 }
 
-void test_fitsbin_payload_precomputed_plan_expands_after_reuse_expiry(
+void test_fitsbin_payload_precomputed_plan_revalidates_under_queue_pressure(
     CuTest* ct) {
     payload_fixture_t fixture;
 
@@ -715,8 +791,8 @@ void test_fitsbin_payload_precomputed_plan_expands_after_reuse_expiry(
         ct, FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED, warm_submit);
     CuAssertIntEquals(ct, 1, warm_wait);
     CuAssertIntEquals(
-        ct, FITSBIN_PAYLOAD_IO_SUBMIT_READY, probe_submit);
-    CuAssertIntEquals(ct, 0, probe_ticket_present);
+        ct, FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED, probe_submit);
+    CuAssertIntEquals(ct, 1, probe_ticket_present);
     CuAssertIntEquals(
         ct, FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED, blocker_submit);
     CuAssertIntEquals(ct, 0, blocker_started);
@@ -734,9 +810,9 @@ void test_fitsbin_payload_precomputed_plan_expands_after_reuse_expiry(
     CuAssertIntEquals(ct, 1, demand_waits_ok);
     CuAssertIntEquals(ct, 1, blocker_wait);
     CuAssertIntEquals(ct, 2, target_wait);
-    CuAssert(ct, "refresh expansion recorded no cache reuse",
+    CuAssert(ct, "queued exact mapping reuse was not observed",
              stats.cache_hits > 0U);
-    CuAssert(ct, "refresh expansion recorded no cache miss",
+    CuAssert(ct, "expired exact mapping pages were not repopulated",
              stats.cache_misses > 0U);
     CuAssertIntEquals(ct, 0, (int)stats.failures);
     CuAssertIntEquals(ct, 0, condition_status);

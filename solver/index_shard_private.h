@@ -180,8 +180,7 @@ typedef struct index_shard_helper_group index_shard_helper_group_t;
 typedef struct index_shard_staged_group index_shard_staged_group_t;
 
 #define INDEX_SHARD_COMPLETION_SLOT_NONE SIZE_MAX
-#define INDEX_SHARD_STAGED_LIVE_BYTES_LIMIT \
-  (16U * 1024U * 1024U)
+#define INDEX_SHARD_READY_BEFORE_OUTER_BURST_MAX 2U
 
 #if INDEX_SHARD_HELPER_MAX_TASKS > 64U
 #error "staged runnable masks require at most 64 tasks"
@@ -243,9 +242,6 @@ typedef struct index_shard_thread_state {
   size_t staged_compute_ready;
   size_t staged_reorder_ready;
   size_t staged_compute_running_global;
-  size_t staged_live_bytes;
-  size_t staged_live_bytes_peak;
-  size_t staged_live_bytes_limit;
   size_t staged_max_compute_running;
   size_t staged_max_compute_running_global;
   unsigned long long staged_completion_epoch;
@@ -340,9 +336,6 @@ typedef struct index_shard_thread_state {
   unsigned long long staged_submit_rearms;
   unsigned long long staged_submit_handoffs;
   unsigned long long staged_submit_deferrals;
-  unsigned long long staged_live_acquires;
-  unsigned long long staged_live_releases;
-  unsigned long long staged_live_refusals;
   unsigned long long staged_owner_wait_calls;
   double staged_owner_wait_seconds;
   size_t staged_max_io_submitted;
@@ -355,7 +348,6 @@ typedef struct index_shard_thread_state {
   unsigned long long staged_inline_poll_failures;
   unsigned long long staged_execute_claims;
   unsigned long long staged_owner_execute_claims;
-  double staged_prepare_seconds;
   double staged_submit_to_ready_seconds;
   double staged_ready_dwell_seconds;
   double staged_execute_seconds;
@@ -472,8 +464,7 @@ typedef enum index_shard_staged_task_state {
 /*
  * Heap-backed group whose task, input, output, and owner-context storage is
  * retained by the outwardly synchronous caller. queue_mutex protects every
- * field below. No operation callback runs while that mutex is held, except
- * the explicitly pure and nonblocking live_bytes accessor.
+ * field below. No operation callback runs while that mutex is held.
  */
 struct index_shard_staged_group {
   index_shard_pool_t *pool;
@@ -510,7 +501,6 @@ struct index_shard_staged_group {
   size_t inline_poll_claims;
   size_t execute_claims;
   size_t owner_execute_claims;
-  double prepare_seconds;
   double submit_to_ready_seconds;
   double ready_dwell_seconds;
   double execute_seconds;
@@ -621,11 +611,11 @@ typedef struct index_shard_worker_context {
   anbool current_outer_active;
   size_t current_index_order;
   /*
-   * Set after this worker finishes an outer index. The next selection may
-   * consume one foreign COMPUTE_READY staged packet before another outer
-   * claim; it never admits preparation, submission, polling, or owner work.
+   * After completing one outer index, this worker may execute one bounded
+   * burst of foreign COMPUTE_READY packets before its next outer claim.
+   * The reducer grants the burst; only successful foreign claims consume it.
    */
-  anbool ready_before_outer_eligible;
+  size_t ready_before_outer_budget;
   index_shard_helper_group_t *published_helper_group;
   unsigned long long helper_group_epoch;
   index_shard_staged_group_t *published_staged_group;
@@ -1023,6 +1013,8 @@ void index_shard_finish_outer_claim(
     index_shard_worker_context_t *worker,
     index_shard_thread_state_t *shared,
     size_t index_order);
+size_t index_shard_ready_before_outer_budget(
+    const index_shard_thread_state_t *shared);
 int index_shard_pool_reduce_first_valid(index_shard_pool_t *pool);
 int index_shard_report_committed_solution(
     onefield_t *bp,

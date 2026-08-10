@@ -427,12 +427,90 @@ int index_shard_owner_progress_select_locked(
     INDEX_SHARD_STAGED_SELECT_SUBMIT,
     INDEX_SHARD_STAGED_SELECT_PREPARE
   };
+  index_shard_staged_group_t *group;
+  index_shard_staged_select_class_t frontier_class =
+      INDEX_SHARD_STAGED_SELECT_COMPUTE;
+  anbool frontier_claimable = FALSE;
   size_t i;
 
   if (!worker || !shared || !claim) {
     return -1;
   }
   memset(claim, 0, sizeof(*claim));
+  group = worker->published_staged_group;
+  if (group && group->tasks &&
+      group->next_retire < group->task_count) {
+    index_shard_staged_task_t *frontier =
+        &group->tasks[group->next_retire];
+    uint64_t frontier_bit =
+        UINT64_C(1) << group->next_retire;
+
+    switch ((index_shard_staged_task_state_t)
+                frontier->scheduler_state) {
+    case INDEX_SHARD_STAGED_TASK_PREPARE_READY:
+      frontier_class = INDEX_SHARD_STAGED_SELECT_PREPARE;
+      frontier_claimable =
+          (group->prepare_ready_mask & frontier_bit) != 0U;
+      break;
+    case INDEX_SHARD_STAGED_TASK_SUBMIT_READY:
+      frontier_class = INDEX_SHARD_STAGED_SELECT_SUBMIT;
+      frontier_claimable =
+          ((shared->staged_submit_backpressure
+                ? group->submit_credit_mask
+                : group->submit_ready_mask) &
+           frontier_bit) != 0U;
+      break;
+    case INDEX_SHARD_STAGED_TASK_IO_SUBMITTED: {
+      uint64_t ready_mask = group->io_submitted_mask &
+          group->completion_pending_mask;
+
+      frontier_class = INDEX_SHARD_STAGED_SELECT_IO;
+      if (group->cancelling) {
+        ready_mask |= group->io_submitted_mask &
+            ~group->cancel_sent_mask;
+      }
+      frontier_claimable =
+          (ready_mask & frontier_bit) != 0U;
+      break;
+    }
+    case INDEX_SHARD_STAGED_TASK_COMPUTE_READY:
+      frontier_class = INDEX_SHARD_STAGED_SELECT_COMPUTE;
+      frontier_claimable =
+          (group->compute_ready_mask & frontier_bit) != 0U;
+      break;
+    case INDEX_SHARD_STAGED_TASK_OWNER_READY:
+      frontier_class = INDEX_SHARD_STAGED_SELECT_COMPUTE;
+      frontier_claimable =
+          !worker->staged_owner_callback_active &&
+          !worker->staged_owner_callback_group &&
+          (group->owner_ready_mask & frontier_bit) != 0U;
+      break;
+    default:
+      break;
+    }
+  }
+  if (frontier_claimable) {
+    int rc;
+
+    /*
+     * Every earlier task is already retired and absent from the runnable
+     * masks, so owner-scoped selection of this class claims next_retire.
+     * A missing submit credit or incomplete I/O ticket returns a normal miss
+     * and preserves the work-conserving class-order fallback below.
+     */
+    rc = index_shard_staged_select_locked(
+        worker,
+        shared,
+        frontier_class,
+        INDEX_SHARD_STAGED_SCOPE_OWNER,
+        &claim->staged);
+    if (rc <= 0) {
+      if (!rc) {
+        claim->kind = INDEX_SHARD_INNER_CLAIM_STAGED;
+      }
+      return rc;
+    }
+  }
   for (i = 0U; i < sizeof(classes) / sizeof(classes[0]); i++) {
     int rc = index_shard_staged_select_locked(
         worker,
