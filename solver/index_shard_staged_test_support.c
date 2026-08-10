@@ -1223,6 +1223,176 @@ int index_shard_staged_submit_backpressure_test(void) {
   return failures;
 }
 
+static size_t index_shard_staged_live_budget_bytes(
+    const void *input,
+    size_t input_bytes,
+    const void *output,
+    size_t output_bytes) {
+  (void)input;
+  (void)input_bytes;
+  if (!output || output_bytes != sizeof(size_t)) {
+    return 0U;
+  }
+  return *(const size_t *)output;
+}
+
+int index_shard_staged_live_budget_test(void) {
+  static const index_shard_staged_ops_t ops = {
+      "live-budget-test",
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      FALSE,
+      index_shard_staged_live_budget_bytes};
+  index_shard_pool_t pool;
+  index_shard_worker_context_t context;
+  index_shard_staged_group_t group;
+  index_shard_staged_task_t tasks[2];
+  index_shard_staged_claim_t claim;
+  index_shard_thread_state_t *shared;
+  size_t live_bytes[2] = {
+      10U * 1024U * 1024U,
+      10U * 1024U * 1024U};
+  int failures = 0;
+  size_t i;
+
+  memset(&pool, 0, sizeof(pool));
+  memset(&context, 0, sizeof(context));
+  memset(&group, 0, sizeof(group));
+  memset(tasks, 0, sizeof(tasks));
+  memset(&claim, 0, sizeof(claim));
+  shared = &pool.shared;
+  if (index_shard_staged_retire_test_init(shared)) {
+    return 1;
+  }
+  pool.worker_count = 1;
+  pool.generation = 12U;
+  pool.contexts = &context;
+  shared->pool = &pool;
+  shared->worker_count = 1;
+  shared->observability_enabled = TRUE;
+  shared->staged_live_bytes_limit =
+      INDEX_SHARD_STAGED_LIVE_BYTES_LIMIT;
+  context.worker_id = 0;
+  context.pool = &pool;
+  context.generation_seen = pool.generation;
+  context.current_outer_active = TRUE;
+  context.current_index_order = 7U;
+  context.staged_group_epoch = 51U;
+  context.published_staged_group = &group;
+  group.pool = &pool;
+  group.ops = &ops;
+  group.tasks = tasks;
+  group.task_count = 2U;
+  group.generation = pool.generation;
+  group.owner_epoch = context.staged_group_epoch;
+  group.owner_worker = 0;
+  group.owner_index_order = context.current_index_order;
+  for (i = 0U; i < 2U; i++) {
+    tasks[i].output = &live_bytes[i];
+    tasks[i].output_bytes = sizeof(live_bytes[i]);
+  }
+  failures += index_shard_staged_test_account(
+      shared, &group) != 0;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  for (i = 0U; i < 2U; i++) {
+    failures += index_shard_staged_set_state_locked(
+        shared, &group, &tasks[i],
+        INDEX_SHARD_STAGED_TASK_SUBMIT_READY) != 0;
+  }
+  failures += index_shard_staged_select_locked(
+      &context, shared,
+      INDEX_SHARD_STAGED_SELECT_SUBMIT,
+      INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
+      &claim) != 0;
+  failures += claim.task_index != 0U;
+  failures += tasks[0].retained_live_bytes != live_bytes[0];
+  failures += shared->staged_live_bytes != live_bytes[0];
+  failures += shared->staged_live_bytes_peak != live_bytes[0];
+  failures += shared->staged_live_acquires != 1U;
+  failures += shared->staged_live_releases != 0U;
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  failures += index_shard_staged_complete_claim(
+      shared, &claim,
+      INDEX_SHARD_STAGED_SUBMIT_COMPUTE_READY,
+      0.0, 0ULL) != 0;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += tasks[0].scheduler_state !=
+      INDEX_SHARD_STAGED_TASK_COMPUTE_READY;
+  failures += tasks[0].retained_live_bytes != live_bytes[0];
+  failures += shared->staged_live_bytes != live_bytes[0];
+  failures += index_shard_staged_select_locked(
+      &context, shared,
+      INDEX_SHARD_STAGED_SELECT_SUBMIT,
+      INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
+      &claim) != 1;
+  failures += shared->staged_live_refusals != 1U;
+  failures += tasks[1].scheduler_state !=
+      INDEX_SHARD_STAGED_TASK_SUBMIT_READY;
+  failures += index_shard_staged_select_locked(
+      &context, shared,
+      INDEX_SHARD_STAGED_SELECT_COMPUTE,
+      INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
+      &claim) != 0;
+  failures += claim.task_index != 0U;
+  failures += shared->staged_live_bytes != live_bytes[0];
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  failures += index_shard_staged_complete_claim(
+      shared, &claim,
+      INDEX_SHARD_STAGED_EXECUTE_OK,
+      0.0, 0ULL) != 0;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += tasks[0].retained_live_bytes != 0U;
+  failures += shared->staged_live_bytes != 0U;
+  failures += shared->staged_live_releases != 1U;
+  failures += index_shard_staged_select_locked(
+      &context, shared,
+      INDEX_SHARD_STAGED_SELECT_SUBMIT,
+      INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
+      &claim) != 0;
+  failures += claim.task_index != 1U;
+  failures += tasks[1].retained_live_bytes != live_bytes[1];
+  failures += shared->staged_live_bytes != live_bytes[1];
+  failures += shared->staged_live_bytes_peak != live_bytes[1];
+  failures += shared->staged_live_acquires != 2U;
+  failures += shared->staged_live_releases != 1U;
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  failures += index_shard_staged_complete_claim(
+      shared, &claim,
+      INDEX_SHARD_STAGED_SUBMIT_RETRY,
+      0.0, 0ULL) != 0;
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += tasks[1].retained_live_bytes != 0U;
+  failures += shared->staged_live_bytes != 0U;
+  failures += shared->staged_live_bytes_peak != live_bytes[1];
+  failures += shared->staged_live_acquires != 2U;
+  failures += shared->staged_live_releases != 2U;
+  failures += shared->staged_live_refusals != 1U;
+  failures += group.internal_error;
+  for (i = 0U; i < 2U; i++) {
+    failures += index_shard_staged_set_state_locked(
+        shared, &group, &tasks[i],
+        INDEX_SHARD_STAGED_TASK_STOPPED) != 0;
+  }
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  failures += index_shard_staged_test_unaccount(
+      shared, &group) != 0;
+  context.published_staged_group = NULL;
+  index_shard_staged_retire_test_destroy(shared);
+  return failures;
+}
+
 int index_shard_completion_registry_test(void) {
   index_shard_pool_t pool;
   index_shard_worker_context_t contexts[2];
@@ -1357,11 +1527,13 @@ int index_shard_completion_inline_poll_case(
       NULL,
       NULL,
       NULL,
-      TRUE};
+      TRUE,
+      NULL};
   index_shard_pool_t pool;
   index_shard_worker_context_t contexts[2];
   index_shard_staged_group_t group;
   index_shard_staged_task_t task;
+  index_shard_staged_claim_t execute_claim;
   index_shard_thread_state_t *shared;
   anbool early = FALSE;
   int failures = 0;
@@ -1370,6 +1542,7 @@ int index_shard_completion_inline_poll_case(
   memset(contexts, 0, sizeof(contexts));
   memset(&group, 0, sizeof(group));
   memset(&task, 0, sizeof(task));
+  memset(&execute_claim, 0, sizeof(execute_claim));
   shared = &pool.shared;
   if (index_shard_staged_retire_test_init(shared)) {
     return 1;
@@ -1383,6 +1556,10 @@ int index_shard_completion_inline_poll_case(
   shared->staged_tickets_active = 1U;
   shared->staged_source_leases = 1U;
   shared->staged_io_submitted = 1U;
+  shared->staged_live_bytes_limit =
+      INDEX_SHARD_STAGED_LIVE_BYTES_LIMIT;
+  shared->staged_live_bytes = 4096U;
+  shared->staged_live_acquires = 1U;
   contexts[0].worker_id = 0;
   contexts[0].pool = &pool;
   contexts[0].generation_seen = pool.generation;
@@ -1401,6 +1578,7 @@ int index_shard_completion_inline_poll_case(
   group.io_submitted = 1U;
   task.output = &poll_status;
   task.output_bytes = sizeof(poll_status);
+  task.retained_live_bytes = 4096U;
   failures += index_shard_staged_test_account(
       shared, &group) != 0;
 
@@ -1441,6 +1619,34 @@ int index_shard_completion_inline_poll_case(
   failures += shared->completion_matches != 1U;
   failures += shared->completion_active != 0U;
   failures += shared->completion_registry_invalid != 0U;
+  failures += task.retained_live_bytes !=
+      (poll_status == INDEX_SHARD_STAGED_IO_READY ? 4096U : 0U);
+  failures += shared->staged_live_bytes !=
+      (poll_status == INDEX_SHARD_STAGED_IO_READY ? 4096U : 0U);
+  failures += shared->staged_live_releases !=
+      (poll_status == INDEX_SHARD_STAGED_IO_READY ? 0U : 1U);
+  if (poll_status == INDEX_SHARD_STAGED_IO_READY) {
+    failures += index_shard_staged_select_locked(
+        &contexts[0], shared,
+        INDEX_SHARD_STAGED_SELECT_COMPUTE,
+        INDEX_SHARD_STAGED_SCOPE_GLOBAL_WITH_OWNER,
+        &execute_claim) != 0;
+    failures += execute_claim.task_index != 0U;
+  }
+  pthread_mutex_unlock(&shared->queue_mutex);
+
+  if (poll_status == INDEX_SHARD_STAGED_IO_READY) {
+    failures += index_shard_staged_complete_claim(
+        shared, &execute_claim,
+        INDEX_SHARD_STAGED_EXECUTE_OK,
+        0.0, 0ULL) != 0;
+  }
+
+  pthread_mutex_lock(&shared->queue_mutex);
+  failures += task.retained_live_bytes != 0U;
+  failures += shared->staged_live_bytes != 0U;
+  failures += shared->staged_live_acquires != 1U;
+  failures += shared->staged_live_releases != 1U;
   pthread_mutex_unlock(&shared->queue_mutex);
 
   failures += index_shard_staged_test_unaccount(
@@ -1740,6 +1946,7 @@ int index_shard_test_staged_retire_more(void) {
       index_shard_staged_submit_rearm_test() +
       index_shard_staged_submit_handoff_test() +
       index_shard_staged_submit_backpressure_test() +
+      index_shard_staged_live_budget_test() +
       index_shard_completion_registry_test() +
       index_shard_completion_inline_poll_test() +
       index_shard_execute_handoff_test() +

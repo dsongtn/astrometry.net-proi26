@@ -866,21 +866,40 @@ assert_equal \
     "$(match_set_key "$work_dir/regular_w4_exhaustive.log")" \
     "$(match_set_key "$work_dir/multipass_forward_w4.log")"
 
-segments="$(
+pipeline_metrics="$(
     awk '
         /\[solver\] page-pipeline/ {
             for (i = 1; i <= NF; i++) {
-                if ($i ~ /^windows=/) {
-                    split($i, value, "=")
-                    result = value[2]
+                split($i, value, "=")
+                if (value[1] == "spans" || value[1] == "tickets") {
+                    split(value[2], pair, "/")
+                    metric[value[1] "_first"] = pair[1]
+                    metric[value[1] "_second"] = pair[2]
+                } else if (value[1] ~ /^(descriptors|topology_traversals|topology_replays_avoided|execution_replays|hit_capacity_replays|candidate_delivery|windows)$/) {
+                    metric[value[1]] = value[2]
                 }
             }
         }
         END {
-            print result
+            printf "%s %s %s %s %s %s %s %s %s %s %s\n", \
+                metric["descriptors"], \
+                metric["spans_first"], \
+                metric["spans_second"], \
+                metric["topology_traversals"], \
+                metric["topology_replays_avoided"], \
+                metric["execution_replays"], \
+                metric["hit_capacity_replays"], \
+                metric["candidate_delivery"], \
+                metric["windows"], \
+                metric["tickets_first"], \
+                metric["tickets_second"]
         }
     ' "$work_dir/stream_w4_exhaustive.log"
 )"
+read -r descriptors span_planned span_executed topology_traversals \
+    topology_replays_avoided execution_replays hit_capacity_replays \
+    candidate_delivery delivery_windows tickets_submitted tickets_ready \
+    <<<"$pipeline_metrics"
 parallel_batches="$(
     awk '
         /\[solver\] phase-profile/ {
@@ -911,8 +930,23 @@ helper_tasks="$(
         }
     ' "$work_dir/stream_w4_exhaustive.log"
 )"
-if [[ -z "$segments" || "$segments" -le 1 ]]; then
-    printf 'tiny-buffer test did not force multiple delivery windows\n' >&2
+if [[ -z "$descriptors" || "$descriptors" -le 0 ||
+    "$span_planned" -le 0 ||
+    "$span_planned" -ne "$span_executed" ||
+    "$topology_traversals" -ne "$descriptors" ||
+    "$topology_replays_avoided" -ne "$descriptors" ||
+    "$execution_replays" -ne 0 ||
+    "$hit_capacity_replays" -ne 0 ]]; then
+    printf 'compiled CodeKD span-program structural gate failed: %s\n' \
+        "$pipeline_metrics" >&2
+    exit 1
+fi
+if [[ "$candidate_delivery" -le 0 ||
+    "$delivery_windows" -le 0 ||
+    "$tickets_submitted" -le 0 ||
+    "$tickets_submitted" -ne "$tickets_ready" ]]; then
+    printf 'full-chain post-CodeKD delivery gate failed: %s\n' \
+        "$pipeline_metrics" >&2
     exit 1
 fi
 if [[ -z "$parallel_batches" || "$parallel_batches" -le 0 ]]; then
@@ -1007,9 +1041,9 @@ assert_contains \
     "$work_dir/multi4_w4.log"
 
 # The tiny-packet build retains the same eight-index scientific result while
-# exercising real assistance only after every current-band index has been
-# claimed by an outer owner. More indexes than workers also proves executor
-# and owner-query reuse without reducing the production owner width.
+# exercising real assistance under the primary bounded-producer policy. More
+# indexes than workers also proves executor and owner-query reuse while one
+# producer drains the canonical outer queue.
 run_case \
     owner_credit_w1 \
     test-solver-streaming-integration \
@@ -1023,19 +1057,22 @@ run_case \
     "$winner_index" "$winner_index" "$winner_index" "$winner_index" \
     "$winner_index" "$winner_index" "$winner_index" "$winner_index"
 assert_equal \
-    "full-owner eight-index result" \
+    "bounded-producer eight-index result" \
     "$(result_key "$work_dir/owner_credit_w1.log")" \
     "$(result_key "$work_dir/owner_credit_w4.log")"
 assert_assist_lifecycle \
-    "full-owner tail lending" \
+    "bounded-producer tail lending" \
     "$work_dir/owner_credit_w4.log" \
     1 \
     2
-assert_full_producer_assistance \
-    "full-owner tail lending" \
-    "$work_dir/owner_credit_w4.log"
+assert_bounded_producer_assistance \
+    "bounded-producer tail lending" \
+    "$work_dir/owner_credit_w4.log" \
+    4 \
+    1 \
+    3
 assert_contains \
-    "full-owner test admission" \
+    "bounded-producer test admission" \
     'outer_admission=(full-producer|provider-bounded-exact-demand)$' \
     "$work_dir/owner_credit_w4.log"
 
@@ -1157,9 +1194,11 @@ if grep --exclude='allocation_failure_recovery.log' -qE \
 fi
 
 printf \
-    'SOLVER_PARALLEL_INTEGRATION_OK ranges=5 multipass=2 retained_state=field-hit,field-invalidate,index-release,inverse-invalidate,index-nohit multi=2,3,4 permuted=%s inverse_cache=admit-hit windows=%s parallel_batches=%s helper_tasks=%s output=%s\n' \
+    'SOLVER_PARALLEL_INTEGRATION_OK ranges=5 multipass=2 retained_state=field-hit,field-invalidate,index-release,inverse-invalidate,index-nohit multi=2,3,4 permuted=%s inverse_cache=admit-hit compiled_spans=%s/%s post_codekd_delivery=%s parallel_batches=%s helper_tasks=%s output=%s\n' \
     "yes" \
-    "$segments" \
+    "$span_planned" \
+    "$span_executed" \
+    "$candidate_delivery" \
     "$parallel_batches" \
     "$helper_tasks" \
     "$([[ "$temporary_output" -eq 1 ]] && printf transient || printf '%s' "$work_dir")" ||

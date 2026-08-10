@@ -37,11 +37,6 @@
 #include "solver_hypothesis_internal.h"
 #include "../libkd/kdtree_prefetch_internal.h"
 
-static anbool solver_codekd_owner_plan_cancelled(void* opaque) {
-    (void)opaque;
-    return index_shard_worker_stop_requested();
-}
-
 /*
  * Return zero when the bounded output arena is ready, one for an exact native
  * fallback, and minus one for an invalid packet request.
@@ -92,17 +87,27 @@ int solver_codekd_search_packet_prepare(
 
     packet->slots = calloc(
         SOLVER_AB_DESCRIPTOR_CAPACITY, sizeof(*packet->slots));
+    packet->descriptor_span_first = calloc(
+        SOLVER_AB_DESCRIPTOR_CAPACITY,
+        sizeof(*packet->descriptor_span_first));
+    packet->descriptor_span_count = calloc(
+        SOLVER_AB_DESCRIPTOR_CAPACITY,
+        sizeof(*packet->descriptor_span_count));
     packet->inds = malloc(
         packet->hit_capacity * sizeof(*packet->inds));
     packet->sdists = malloc(
         packet->hit_capacity * sizeof(*packet->sdists));
-    if (!packet->slots || !packet->inds || !packet->sdists ||
+    if (!packet->slots ||
+        !packet->descriptor_span_first ||
+        !packet->descriptor_span_count ||
+        !packet->inds || !packet->sdists ||
         solver_codekd_page_workspace_create(
             &packet->page_workspace)) {
         (void)solver_codekd_search_packet_cleanup(packet);
         return 1;
     }
 
+#if SOLVER_CODEKD_POST_CODEKD_DELIVERY_ENABLED
     if (candidate_budget_bytes >=
         sizeof(*packet->candidate_records)) {
         packet->candidate_capacity = MIN(
@@ -139,6 +144,9 @@ int solver_codekd_search_packet_prepare(
             }
         }
     }
+#else
+    (void)candidate_budget_bytes;
+#endif
 
     packet->descriptors = descriptors;
     packet->tree = tree;
@@ -259,15 +267,16 @@ static int solver_codekd_packet_mark_outstanding_owner_replay(
     packet->plan_end = 0U;
     packet->plan_range_count = 0U;
     packet->plan_logical_bytes = 0U;
+    packet->plan_aligned_bytes = 0U;
+    packet->plan_span_count = 0U;
     packet->delivery_source = NULL;
     packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
     return 0;
 }
 
 /*
- * Return two when resident planning makes the packet compute-ready, one when
- * submitted, zero on bounded capacity, and minus one when the unfinished
- * packet must use exact owner replay.
+ * Submit one complete compute-side page plan. Provider lanes populate only
+ * the copied physical ranges; they never traverse KD topology.
  */
 int solver_codekd_packet_submit_pages(
     solver_codekd_search_packet_t* packet) {
@@ -277,9 +286,18 @@ int solver_codekd_packet_submit_pages(
     if (!packet || !packet->tree || !packet->tree->io ||
         !packet->tree->io_is_fitsbin || !packet->page_workspace ||
         packet->delivery_source || packet->delivery_ticket ||
-        packet->state != SOLVER_CODEKD_PACKET_DESCRIPTORS_READY ||
-        packet->next_descriptor >= packet->count ||
-        packet->plan_complete || packet->plan_range_count) {
+        packet->state != SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE ||
+        !packet->plan_complete ||
+        packet->plan_first >= packet->plan_end ||
+        packet->plan_end > packet->next_descriptor ||
+        packet->next_descriptor > packet->count ||
+        !packet->plan_range_count ||
+        packet->plan_range_count >
+            packet->page_workspace->sealed_range_capacity ||
+        !packet->plan_aligned_bytes ||
+        packet->plan_aligned_bytes >
+            SOLVER_CODEKD_DELIVERY_BUDGET_BYTES ||
+        !packet->plan_span_count) {
         return -1;
     }
     if (index_shard_worker_stop_requested()) {
@@ -289,57 +307,32 @@ int solver_codekd_packet_submit_pages(
         return -1;
     }
     source = (fitsbin_t*)packet->tree->io;
-    packet->delivery_source = source;
-    packet->state = SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED;
     errno = 0;
-    submit_status = fitsbin_prefetch_ranges_planned_submit(
+    submit_status = fitsbin_prefetch_ranges_submit(
         source,
-        solver_codekd_packet_plan_codekd_pages,
-        packet,
+        packet->page_workspace->sealed_ranges,
+        packet->plan_range_count,
         SOLVER_CODEKD_DELIVERY_BUDGET_BYTES,
         &packet->delivery_ticket);
-    if (submit_status > 0 && packet->delivery_ticket) {
+    if (submit_status == FITSBIN_PAYLOAD_IO_SUBMIT_READY &&
+        !packet->delivery_ticket) {
+        packet->state = SOLVER_CODEKD_PACKET_COMPUTE_READY;
+        return 2;
+    }
+    if (submit_status == FITSBIN_PAYLOAD_IO_SUBMIT_QUEUED &&
+        packet->delivery_ticket) {
+        packet->delivery_source = source;
+        packet->state = SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED;
         return 1;
     }
     packet->delivery_ticket = NULL;
     packet->delivery_source = NULL;
     if (!submit_status && !errno &&
         fitsbin_payload_is_fully_resident(source)) {
-        int plan_status =
-            solver_codekd_search_packet_prepare_next_plan(
-                packet,
-                solver_codekd_owner_plan_cancelled,
-                NULL);
-
-        if (plan_status == 1 &&
-            packet->state ==
-                SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE &&
-            packet->plan_complete &&
-            packet->plan_first < packet->plan_end &&
-            packet->plan_end <= packet->next_descriptor &&
-            packet->next_descriptor <= packet->count &&
-            packet->plan_range_count &&
-            packet->page_workspace &&
-            packet->plan_range_count <=
-                packet->page_workspace->sealed_range_capacity) {
-            packet->state = SOLVER_CODEKD_PACKET_COMPUTE_READY;
-            return 2;
-        }
-        if (!plan_status &&
-            packet->state == SOLVER_CODEKD_PACKET_RESULTS_READY &&
-            !packet->plan_complete &&
-            packet->next_descriptor == packet->count) {
-            return -1;
-        }
-        if (plan_status == 2 &&
-            packet->state == SOLVER_CODEKD_PACKET_STOPPED) {
-            return -1;
-        }
-        packet->state = SOLVER_CODEKD_PACKET_FAILED;
-        return -1;
+        packet->state = SOLVER_CODEKD_PACKET_COMPUTE_READY;
+        return 2;
     }
     if (!submit_status && errno == EAGAIN) {
-        packet->state = SOLVER_CODEKD_PACKET_DESCRIPTORS_READY;
         return 0;
     }
     if (index_shard_worker_stop_requested()) {
@@ -626,6 +619,7 @@ static int solver_codekd_packet_build_verify_queries(
     return 0;
 }
 
+#if SOLVER_CODEKD_POST_CODEKD_DELIVERY_ENABLED
 static anbool solver_codekd_packet_candidate_data_fully_resident(
     const solver_codekd_search_packet_t* packet) {
     fitsbin_t* star_source;
@@ -640,6 +634,7 @@ static anbool solver_codekd_packet_candidate_data_fully_resident(
     return fitsbin_payload_is_fully_resident(packet->quads->fb) &&
         fitsbin_payload_is_fully_resident(star_source);
 }
+#endif
 
 /*
  * Complete the CodeKD phase through one central transition. Resident
@@ -661,6 +656,10 @@ int solver_codekd_packet_finish_codekd(
             ? 0
             : -1;
     }
+#if !SOLVER_CODEKD_POST_CODEKD_DELIVERY_ENABLED
+    packet->state = SOLVER_CODEKD_PACKET_RESULTS_READY;
+    return 0;
+#else
     if (!packet->hit_count || !packet->candidate_records ||
         !packet->candidate_capacity || packet->use_radec ||
         !packet->quads || !packet->starkd ||
@@ -676,6 +675,7 @@ int solver_codekd_packet_finish_codekd(
     packet->retire_hit_offset = 0U;
     packet->retire_descriptor_started = FALSE;
     return solver_codekd_packet_begin_candidate_window(packet);
+#endif
 }
 
 /*
@@ -1248,7 +1248,8 @@ int solver_codekd_packet_collect_pages(
     }
     if (ticket_result > 0 && packet->plan_complete &&
         packet->plan_range_count &&
-        packet->state == SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE) {
+        io_state == SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED) {
+        packet->delivery_source = NULL;
         packet->state = SOLVER_CODEKD_PACKET_COMPUTE_READY;
         return 1;
     }

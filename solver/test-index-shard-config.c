@@ -64,6 +64,18 @@ static void check_width_plan(int workers,
         (size_t)workers);
 }
 
+static void check_exact_width_plan(int workers, int io_width) {
+  size_t producers =
+      (size_t)INDEX_SHARD_EXACT_DEMAND_PRODUCER_WIDTH_DEFAULT <
+          (size_t)workers
+      ? (size_t)INDEX_SHARD_EXACT_DEMAND_PRODUCER_WIDTH_DEFAULT
+      : (size_t)workers;
+
+  check_width_plan(
+      workers, io_width, 1, 1,
+      producers, (size_t)workers - producers);
+}
+
 int main(void) {
   const char *expected_available =
       getenv("TEST_EXPECTED_AVAILABLE_CPUS");
@@ -108,14 +120,12 @@ int main(void) {
   CHECK(index_shard_config_payload_io_width(0) == -1);
   CHECK(index_shard_config_payload_io_width(1) == 1);
   CHECK(index_shard_config_payload_io_width(4) ==
-        (INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT > 0 &&
-         INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT < 4
-             ? INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT
+        (INDEX_SHARD_PAYLOAD_IO_WIDTH_DEFAULT < 4
+             ? INDEX_SHARD_PAYLOAD_IO_WIDTH_DEFAULT
              : 4));
   CHECK(index_shard_config_payload_io_width(8) ==
-        (INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT > 0 &&
-         INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT < 8
-             ? INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT
+        (INDEX_SHARD_PAYLOAD_IO_WIDTH_DEFAULT < 8
+             ? INDEX_SHARD_PAYLOAD_IO_WIDTH_DEFAULT
              : 8));
 
   CHECK(index_shard_config_exact_demand_pass(
@@ -142,14 +152,14 @@ int main(void) {
   check_width_plan(3, 1, 1, 0, 3U, 0U);
   check_width_plan(4, 2, 1, 0, 4U, 0U);
   check_width_plan(8, 4, 1, 0, 8U, 0U);
-  check_width_plan(2, 2, 1, 1, 2U, 0U);
-  check_width_plan(4, 4, 1, 1, 4U, 0U);
-  check_width_plan(5, 4, 1, 1, 4U, 1U);
-  check_width_plan(6, 4, 1, 1, 4U, 2U);
-  check_width_plan(6, 6, 1, 1, 6U, 0U);
-  check_width_plan(8, 4, 1, 1, 4U, 4U);
-  check_width_plan(8, 6, 1, 1, 6U, 2U);
-  check_width_plan(8, 8, 1, 1, 8U, 0U);
+  check_exact_width_plan(2, 2);
+  check_exact_width_plan(4, 4);
+  check_exact_width_plan(5, 4);
+  check_exact_width_plan(6, 4);
+  check_exact_width_plan(6, 6);
+  check_exact_width_plan(8, 4);
+  check_exact_width_plan(8, 6);
+  check_exact_width_plan(8, 8);
   check_width_plan(4, 0, 0, 0, 3U, 1U);
   {
     index_shard_width_plan_t invalid_plan = { 9U, 9U };

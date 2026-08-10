@@ -898,6 +898,51 @@ static anbool index_shard_staged_task_terminal(
       task->scheduler_state == INDEX_SHARD_STAGED_TASK_FAILED;
 }
 
+static size_t index_shard_staged_task_live_bytes(
+    const index_shard_staged_group_t *group,
+    size_t task_index) {
+  const index_shard_staged_task_t *task;
+
+  if (!group || !group->tasks || task_index >= group->task_count ||
+      !group->ops || !group->ops->live_bytes) {
+    return 0U;
+  }
+  task = &group->tasks[task_index];
+  return group->ops->live_bytes(
+      task->input, task->input_bytes,
+      task->output, task->output_bytes);
+}
+
+/* queue_mutex must be held. */
+static int index_shard_staged_release_live_bytes_locked(
+    index_shard_thread_state_t *shared,
+    index_shard_staged_group_t *group,
+    index_shard_staged_task_t *task) {
+  size_t bytes;
+
+  if (!shared || !group || !task) {
+    return -1;
+  }
+  bytes = task->retained_live_bytes;
+  if (!bytes) {
+    return 0;
+  }
+  if (bytes > shared->staged_live_bytes) {
+    task->retained_live_bytes = 0U;
+    shared->staged_live_bytes = 0U;
+    group->internal_error = TRUE;
+    return -1;
+  }
+  task->retained_live_bytes = 0U;
+  shared->staged_live_bytes -= bytes;
+  if (shared->staged_live_releases == ULLONG_MAX) {
+    group->internal_error = TRUE;
+    return -1;
+  }
+  shared->staged_live_releases++;
+  return 0;
+}
+
 /* queue_mutex must be held. */
 int index_shard_staged_set_state_locked(
     index_shard_thread_state_t *shared,
@@ -1325,6 +1370,7 @@ int index_shard_staged_select_locked(
     index_shard_staged_claim_t *claim) {
   index_shard_staged_group_t *best_group = NULL;
   size_t best_task = SIZE_MAX;
+  size_t best_live_bytes = 0U;
   index_shard_staged_claim_kind_t best_kind =
       INDEX_SHARD_STAGED_CLAIM_NONE;
   size_t start;
@@ -1337,6 +1383,10 @@ int index_shard_staged_select_locked(
   int offset;
 
   if (!worker || !worker->pool || !shared || !claim) {
+    return -1;
+  }
+  if (shared->staged_live_bytes >
+      shared->staged_live_bytes_limit) {
     return -1;
   }
   switch (select_scope) {
@@ -1459,6 +1509,25 @@ int index_shard_staged_select_locked(
     mask = index_shard_staged_select_mask_locked(
         shared, group, select_class, owner_allowed);
     task_index = index_shard_staged_lowest_task(mask);
+    while (select_class == INDEX_SHARD_STAGED_SELECT_SUBMIT &&
+           task_index != SIZE_MAX && task_index < group->task_count) {
+      size_t live_bytes = index_shard_staged_task_live_bytes(
+          group, task_index);
+
+      if (group->tasks[task_index].retained_live_bytes ||
+          live_bytes > shared->staged_live_bytes_limit) {
+        group->internal_error = TRUE;
+        return -1;
+      }
+      if (live_bytes <= shared->staged_live_bytes_limit -
+                            shared->staged_live_bytes) {
+        best_live_bytes = live_bytes;
+        break;
+      }
+      shared->staged_live_refusals++;
+      mask &= ~(UINT64_C(1) << task_index);
+      task_index = index_shard_staged_lowest_task(mask);
+    }
     if (task_index == SIZE_MAX || task_index >= group->task_count) {
       continue;
     }
@@ -1526,11 +1595,25 @@ int index_shard_staged_select_locked(
     claim->submit_credit =
         (best_group->submit_credit_mask &
          (UINT64_C(1) << best_task)) != UINT64_C(0);
-    if (shared->staged_submit_callbacks_active == SIZE_MAX ||
+    if ((best_live_bytes &&
+         (best_live_bytes > shared->staged_live_bytes_limit -
+                                shared->staged_live_bytes ||
+          best_group->tasks[best_task].retained_live_bytes ||
+          shared->staged_live_acquires == ULLONG_MAX)) ||
+        shared->staged_submit_callbacks_active == SIZE_MAX ||
         index_shard_staged_set_state_locked(
             shared, best_group, &best_group->tasks[best_task],
             INDEX_SHARD_STAGED_TASK_SUBMITTING)) {
       return -1;
+    }
+    if (best_live_bytes) {
+      best_group->tasks[best_task].retained_live_bytes =
+          best_live_bytes;
+      shared->staged_live_bytes += best_live_bytes;
+      shared->staged_live_bytes_peak = MAX(
+          shared->staged_live_bytes_peak,
+          shared->staged_live_bytes);
+      shared->staged_live_acquires++;
     }
     shared->staged_submit_callbacks_active++;
     best_group->submit_claims++;
@@ -1777,6 +1860,7 @@ int index_shard_staged_complete_claim(
   }
 
   if (claim->kind == INDEX_SHARD_STAGED_CLAIM_PREPARE) {
+    group->prepare_seconds += callback_seconds;
     switch ((index_shard_staged_prepare_status_t)callback_status) {
     case INDEX_SHARD_STAGED_PREPARE_MORE:
       (void)index_shard_staged_set_state_locked(
@@ -1906,6 +1990,21 @@ int index_shard_staged_complete_claim(
         break;
       }
     }
+    {
+      anbool retain_live_bytes =
+          (((index_shard_staged_submit_status_t)callback_status ==
+                INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED) &&
+           completion_id) ||
+          (((index_shard_staged_submit_status_t)callback_status ==
+                INDEX_SHARD_STAGED_SUBMIT_COMPUTE_READY) &&
+           !completion_id);
+
+      if (!retain_live_bytes &&
+          index_shard_staged_release_live_bytes_locked(
+              shared, group, task)) {
+        rc = -1;
+      }
+    }
   } else if (claim->kind == INDEX_SHARD_STAGED_CLAIM_IO_POLL) {
     switch ((index_shard_staged_io_status_t)callback_status) {
     case INDEX_SHARD_STAGED_IO_PENDING:
@@ -1928,6 +2027,11 @@ int index_shard_staged_complete_claim(
       break;
     case INDEX_SHARD_STAGED_IO_READY:
       (void)index_shard_staged_release_ticket_locked(shared, group, task);
+      if (group->cancelling &&
+          index_shard_staged_release_live_bytes_locked(
+              shared, group, task)) {
+        rc = -1;
+      }
       task->completion_id = 0ULL;
       (void)index_shard_staged_set_completion_pending_locked(
           group, task, FALSE);
@@ -1949,6 +2053,10 @@ int index_shard_staged_complete_claim(
       break;
     case INDEX_SHARD_STAGED_IO_FAILED:
       (void)index_shard_staged_release_ticket_locked(shared, group, task);
+      if (index_shard_staged_release_live_bytes_locked(
+              shared, group, task)) {
+        rc = -1;
+      }
       task->completion_id = 0ULL;
       (void)index_shard_staged_set_completion_pending_locked(
           group, task, FALSE);
@@ -1970,6 +2078,10 @@ int index_shard_staged_complete_claim(
       break;
     case INDEX_SHARD_STAGED_IO_CANCELLED:
       (void)index_shard_staged_release_ticket_locked(shared, group, task);
+      if (index_shard_staged_release_live_bytes_locked(
+              shared, group, task)) {
+        rc = -1;
+      }
       task->completion_id = 0ULL;
       (void)index_shard_staged_set_completion_pending_locked(
           group, task, FALSE);
@@ -1981,6 +2093,10 @@ int index_shard_staged_complete_claim(
     case INDEX_SHARD_STAGED_IO_ERROR:
     default:
       (void)index_shard_staged_release_ticket_locked(shared, group, task);
+      if (index_shard_staged_release_live_bytes_locked(
+              shared, group, task)) {
+        rc = -1;
+      }
       task->completion_id = 0ULL;
       (void)index_shard_staged_set_completion_pending_locked(
           group, task, FALSE);
@@ -2009,6 +2125,11 @@ int index_shard_staged_complete_claim(
     }
   } else {
     group->execute_seconds += callback_seconds;
+    if (claim->kind == INDEX_SHARD_STAGED_CLAIM_EXECUTE &&
+        index_shard_staged_release_live_bytes_locked(
+            shared, group, task)) {
+      rc = -1;
+    }
     switch ((index_shard_staged_execute_status_t)callback_status) {
     case INDEX_SHARD_STAGED_EXECUTE_MORE:
       (void)index_shard_staged_set_state_locked(
@@ -2273,6 +2394,10 @@ static void index_shard_staged_cancel_ready_locked(
     case INDEX_SHARD_STAGED_TASK_COMPUTE_READY:
     case INDEX_SHARD_STAGED_TASK_OWNER_READY:
     case INDEX_SHARD_STAGED_TASK_RESULTS_READY:
+      if (index_shard_staged_release_live_bytes_locked(
+              shared, group, task)) {
+        group->internal_error = TRUE;
+      }
       (void)index_shard_staged_set_state_locked(
           shared, group, task, INDEX_SHARD_STAGED_TASK_STOPPED);
       task->scheduler_result_seconds = 0.0;
@@ -2580,6 +2705,7 @@ index_shard_staged_run_ordered(
     tasks[i].scheduler_submit_seconds = 0.0;
     tasks[i].scheduler_ready_seconds = 0.0;
     tasks[i].scheduler_result_seconds = 0.0;
+    tasks[i].retained_live_bytes = 0U;
     if (index_shard_staged_set_state_locked(
             shared, group, &tasks[i],
             INDEX_SHARD_STAGED_TASK_PREPARE_READY)) {
@@ -2724,8 +2850,11 @@ index_shard_staged_run_ordered(
     group->internal_error = TRUE;
   }
   for (i = 0U; i < task_count; i++) {
-    if (tasks[i].completion_id || tasks[i].completion_pending) {
+    if (tasks[i].completion_id || tasks[i].completion_pending ||
+        tasks[i].retained_live_bytes) {
       group->internal_error = TRUE;
+      (void)index_shard_staged_release_live_bytes_locked(
+          shared, group, &tasks[i]);
     }
   }
   if (!group->cancelling &&
@@ -2783,6 +2912,7 @@ index_shard_staged_run_ordered(
   shared->staged_execute_claims += group->execute_claims;
   shared->staged_owner_execute_claims +=
       group->owner_execute_claims;
+  shared->staged_prepare_seconds += group->prepare_seconds;
   shared->staged_submit_to_ready_seconds +=
       group->submit_to_ready_seconds;
   shared->staged_ready_dwell_seconds +=
@@ -2814,6 +2944,7 @@ index_shard_staged_run_ordered(
     stats->poll_claims = group->poll_claims;
     stats->execute_claims = group->execute_claims;
     stats->owner_claims_executed = group->owner_execute_claims;
+    stats->prepare_seconds = group->prepare_seconds;
     stats->submit_to_ready_seconds = group->submit_to_ready_seconds;
     stats->ready_dwell_seconds = group->ready_dwell_seconds;
     stats->execute_seconds = group->execute_seconds;

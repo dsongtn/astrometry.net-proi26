@@ -139,15 +139,21 @@ assert_assist_lifecycle() {
     fi
 }
 
-assert_full_producer_assistance() {
+assert_bounded_producer_assistance() {
     local label="$1"
     local file="$2"
+    local expected_compute="$3"
+    local expected_producer="$4"
+    local expected_helper="$5"
     local values
-    local full_width
+    local width_match
     local ownership_complete
     local foreign_work
 
-    values="$(awk '
+    values="$(awk \
+        -v expected_compute="$expected_compute" \
+        -v expected_producer="$expected_producer" \
+        -v expected_helper="$expected_helper" '
         /\[index-shard\] pthread-pool submit / {
             compute = producer = helper = candidates = -1
             for (i = 1; i <= NF; i++) {
@@ -165,9 +171,11 @@ assert_full_producer_assistance() {
                     candidates = value[2] + 0
                 }
             }
-            if (compute > 0 && producer == compute && helper == 0 &&
-                candidates >= compute) {
-                full_width++
+            if (compute == expected_compute &&
+                producer == expected_producer &&
+                helper == expected_helper &&
+                candidates >= producer) {
+                width_match++
             }
             submitted_candidates = candidates
         }
@@ -207,14 +215,14 @@ assert_full_producer_assistance() {
             }
         }
         END {
-            print full_width + 0, ownership_complete + 0,
+            print width_match + 0, ownership_complete + 0,
                 foreign_work + 0
         }
     ' "$file")"
-    read -r full_width ownership_complete foreign_work <<<"$values"
+    read -r width_match ownership_complete foreign_work <<<"$values"
 
-    [[ "$full_width" -eq 1 ]] ||
-        die "$label did not retain full outer producer width"
+    [[ "$width_match" -eq 1 ]] ||
+        die "$label did not retain the requested compute/producer/helper widths"
     [[ "$ownership_complete" -eq 1 ]] ||
         die "$label did not complete every outer ownership claim"
     [[ "$foreign_work" -gt 0 ]] ||

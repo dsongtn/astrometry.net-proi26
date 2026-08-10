@@ -383,6 +383,12 @@ typedef index_shard_staged_execute_status_t
     void *output,
     size_t output_bytes);
 
+typedef size_t (*index_shard_staged_live_bytes_fn)(
+    const void *input,
+    size_t input_bytes,
+    const void *output,
+    size_t output_bytes);
+
 typedef struct index_shard_staged_ops {
   const char *name;
   index_shard_staged_prepare_fn prepare;
@@ -393,6 +399,12 @@ typedef struct index_shard_staged_ops {
   index_shard_staged_execute_fn owner;
   /* Safe to collect a notified terminal ticket on its delivery lane. */
   anbool terminal_poll_inline_safe;
+  /*
+   * Pure nonblocking accessor for exact mapped bytes retained from submit
+   * through final dereference. The scheduler calls it with queue_mutex held;
+   * it must not acquire locks or mutate task state.
+   */
+  index_shard_staged_live_bytes_fn live_bytes;
 } index_shard_staged_ops_t;
 
 typedef struct index_shard_staged_task {
@@ -412,6 +424,7 @@ typedef struct index_shard_staged_task {
   double scheduler_submit_seconds;
   double scheduler_ready_seconds;
   double scheduler_result_seconds;
+  size_t retained_live_bytes;
 } index_shard_staged_task_t;
 
 typedef enum index_shard_staged_retire_status {
@@ -448,6 +461,7 @@ typedef struct index_shard_staged_run_stats {
   size_t poll_claims;
   size_t execute_claims;
   size_t owner_claims_executed;
+  double prepare_seconds;
   double submit_to_ready_seconds;
   double ready_dwell_seconds;
   double execute_seconds;

@@ -61,6 +61,17 @@ typedef enum kdtree_prefetch_prepare_status {
     KDTREE_PREFETCH_PREPARE_REFUSED = 2
 } kdtree_prefetch_prepare_status_t;
 
+typedef enum kdtree_rangesearch_span_mode {
+    KDTREE_RANGESEARCH_SPAN_FILTER = 0,
+    KDTREE_RANGESEARCH_SPAN_ACCEPT_ALL = 1
+} kdtree_rangesearch_span_mode_t;
+
+typedef struct kdtree_rangesearch_span {
+    int left;
+    int right;
+    unsigned char mode;
+} kdtree_rangesearch_span_t;
+
 typedef struct kdtree_prefetch_sink {
     void *userdata;
 
@@ -70,6 +81,13 @@ typedef struct kdtree_prefetch_sink {
                 const kdtree_prefetch_hint_t *hint);
 
     int (*flush)(void *userdata);
+
+    /*
+     * Optional logical output. It is emitted only after every DATA/PERM hint
+     * covering the span has been accepted. The callback must copy the span.
+     */
+    int (*emit_span)(void *userdata,
+                     const kdtree_rangesearch_span_t *span);
 } kdtree_prefetch_sink_t;
 
 /*
@@ -90,5 +108,21 @@ int kdtree_rangesearch_prefetch_prepare(
     double maxd2,
     int options,
     const kdtree_prefetch_sink_t *sink);
+
+/*
+ * Execute one canonical span program without traversing KD topology again.
+ * All spans are validated before result storage is changed. The caller must
+ * supply spans emitted by a complete preparation using the same tree, query,
+ * radius, and options. On unsupported input this returns NULL, allowing the
+ * authoritative scalar search to run unchanged.
+ */
+kdtree_qres_t *kdtree_rangesearch_execute_spans(
+    const kdtree_t *kd,
+    kdtree_qres_t *result,
+    const void *query,
+    double maxd2,
+    int options,
+    const kdtree_rangesearch_span_t *spans,
+    size_t span_count);
 
 #endif

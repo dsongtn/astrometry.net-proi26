@@ -21,6 +21,20 @@
 #error "INDEX_SHARD_PAYLOAD_IO_WIDTH_LIMIT must be nonnegative"
 #endif
 
+#ifndef INDEX_SHARD_PAYLOAD_IO_WIDTH_DEFAULT
+#define INDEX_SHARD_PAYLOAD_IO_WIDTH_DEFAULT 1
+#endif
+#if INDEX_SHARD_PAYLOAD_IO_WIDTH_DEFAULT < 1
+#error "INDEX_SHARD_PAYLOAD_IO_WIDTH_DEFAULT must be positive"
+#endif
+
+#ifndef INDEX_SHARD_EXACT_DEMAND_PRODUCER_WIDTH_DEFAULT
+#define INDEX_SHARD_EXACT_DEMAND_PRODUCER_WIDTH_DEFAULT 1
+#endif
+#if INDEX_SHARD_EXACT_DEMAND_PRODUCER_WIDTH_DEFAULT < 1
+#error "INDEX_SHARD_EXACT_DEMAND_PRODUCER_WIDTH_DEFAULT must be positive"
+#endif
+
 #ifndef INDEX_SHARD_PRODUCER_WIDTH_LIMIT
 #define INDEX_SHARD_PRODUCER_WIDTH_LIMIT 0
 #endif
@@ -70,7 +84,7 @@ int index_shard_config_effective_workers(int configured_workers,
 
 /*
  * Resolve the payload completion-lane width independently from outer owner
- * admission. The default is one completion lane per configured worker.
+ * admission. The primary exact-demand build uses one completion lane.
  */
 int index_shard_config_payload_io_width(int worker_count);
 
@@ -88,10 +102,10 @@ int index_shard_config_exact_demand_pass(
     int full_cohort_resident);
 
 /*
- * When exact_demand is nonzero, bound simultaneous cold outer owners by
- * detached delivery capacity. Surplus compute threads remain available to
- * execute staged work. Resident and loaded-index passes use the full outer
- * width. Without detached completion, retain the fixed-helper policy.
+ * When exact_demand is nonzero, apply its independent cold-owner width.
+ * Surplus compute threads remain available to execute staged work. Resident
+ * and loaded-index passes use the full outer width. Without detached
+ * completion, retain the fixed-helper policy.
  */
 int index_shard_config_plan_widths(
     int worker_count,

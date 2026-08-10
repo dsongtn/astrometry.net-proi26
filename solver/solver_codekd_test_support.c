@@ -462,9 +462,17 @@ static int solver_codekd_test_fixture_init(
     fixture->descriptors = calloc(1, sizeof(*fixture->descriptors));
     fixture->packet.slots = calloc(
         descriptor_count, sizeof(*fixture->packet.slots));
+    fixture->packet.descriptor_span_first = calloc(
+        descriptor_count,
+        sizeof(*fixture->packet.descriptor_span_first));
+    fixture->packet.descriptor_span_count = calloc(
+        descriptor_count,
+        sizeof(*fixture->packet.descriptor_span_count));
     fixture->packet.inds = calloc(8U, sizeof(*fixture->packet.inds));
     fixture->packet.sdists = calloc(8U, sizeof(*fixture->packet.sdists));
     if (!fixture->descriptors || !fixture->packet.slots ||
+        !fixture->packet.descriptor_span_first ||
+        !fixture->packet.descriptor_span_count ||
         !fixture->packet.inds || !fixture->packet.sdists ||
         solver_codekd_page_workspace_create(
             &fixture->packet.page_workspace)) {
@@ -590,6 +598,11 @@ static int solver_codekd_test_seed_plan(
     entry->populate_begin = begin;
     entry->populate_end = begin + chunk->mapsize;
     workspace->descriptor.count = 1U;
+    workspace->descriptor_spans[0].left = 0;
+    workspace->descriptor_spans[0].right = 3;
+    workspace->descriptor_spans[0].mode =
+        KDTREE_RANGESEARCH_SPAN_FILTER;
+    workspace->descriptor_span_count = 1U;
     workspace->page_limit = 1U;
     fixture->packet.pending_descriptor_plan = TRUE;
     fixture->packet.pending_descriptor_raw_ranges = 1U;
@@ -691,32 +704,42 @@ static int solver_codekd_test_detached_success(
             &fixture.packet,
             sizeof(fixture.packet),
             &completion_id);
-        if (status != INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED ||
-            !completion_id) {
+        if (!cycle &&
+            (status != INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED ||
+             !completion_id)) {
             goto cleanup;
         }
         if (!cycle) {
             *queued =
                 fixture.packet.state ==
                     SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED &&
-                fixture.packet.next_descriptor == 0U &&
-                !fixture.packet.plan_complete &&
+                fixture.packet.next_descriptor == 1U &&
+                fixture.packet.plan_complete &&
+                fixture.packet.plan_span_count == 1U &&
                 fixture.packet.delivery_ticket != NULL &&
                 fixture.packet.delivery_source == fixture.source;
             solver_codekd_test_gate_release(&gate);
             solver_codekd_test_ticket_drain(fixture.source, &blocker);
         }
-        if (solver_codekd_test_completion_wait(
-                &completion, completion_id)) {
+        if (status == INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED) {
+            if (!completion_id ||
+                solver_codekd_test_completion_wait(
+                    &completion, completion_id)) {
+                goto cleanup;
+            }
+            status = solver_codekd_packet_staged_ops.poll(
+                &fixture.input,
+                sizeof(fixture.input),
+                &fixture.packet,
+                sizeof(fixture.packet));
+            if (status != INDEX_SHARD_STAGED_IO_READY) {
+                goto cleanup;
+            }
+        } else if (status !=
+                   INDEX_SHARD_STAGED_SUBMIT_COMPUTE_READY) {
             goto cleanup;
         }
-        status = solver_codekd_packet_staged_ops.poll(
-            &fixture.input,
-            sizeof(fixture.input),
-            &fixture.packet,
-            sizeof(fixture.packet));
-        if (status != INDEX_SHARD_STAGED_IO_READY ||
-            fixture.packet.state !=
+        if (fixture.packet.state !=
                 SOLVER_CODEKD_PACKET_COMPUTE_READY ||
             !fixture.packet.plan_complete) {
             goto cleanup;
@@ -753,7 +776,12 @@ static int solver_codekd_test_detached_success(
         fixture.packet.state == SOLVER_CODEKD_PACKET_RESULTS_READY &&
         fixture.packet.next_descriptor == fixture.packet.count &&
         fixture.packet.hit_count == 2U &&
-        fixture.packet.page_stats.descriptors_planned == 2U;
+        fixture.packet.page_stats.descriptors_planned == 2U &&
+        fixture.packet.page_stats.spans_planned == 2U &&
+        fixture.packet.page_stats.spans_executed == 2U &&
+        fixture.packet.page_stats.topology_replays_avoided == 2U &&
+        !fixture.packet.page_stats.execution_replays &&
+        !fixture.packet.page_stats.hit_capacity_replays;
     result = *queued && *compute_ready && *repeated ? 0 : -1;
 
 cleanup:
@@ -877,16 +905,7 @@ static int solver_codekd_test_fully_resident_empty(void) {
         sizeof(fixture.input),
         &fixture.packet,
         sizeof(fixture.packet));
-    if (status != INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY) {
-        goto cleanup;
-    }
-    status = solver_codekd_packet_staged_ops.submit(
-        &fixture.input,
-        sizeof(fixture.input),
-        &fixture.packet,
-        sizeof(fixture.packet),
-        &completion_id);
-    if (status != INDEX_SHARD_STAGED_SUBMIT_OWNER_READY ||
+    if (status != INDEX_SHARD_STAGED_PREPARE_RESULTS_READY ||
         completion_id ||
         fixture.packet.state != SOLVER_CODEKD_PACKET_RESULTS_READY ||
         fixture.packet.next_descriptor != fixture.packet.count ||
@@ -963,27 +982,8 @@ static int solver_codekd_test_detached_empty(void) {
         sizeof(fixture.input),
         &fixture.packet,
         sizeof(fixture.packet));
-    if (status != INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY) {
-        goto cleanup;
-    }
-    status = solver_codekd_packet_staged_ops.submit(
-        &fixture.input,
-        sizeof(fixture.input),
-        &fixture.packet,
-        sizeof(fixture.packet),
-        &completion_id);
-    if (status != INDEX_SHARD_STAGED_SUBMIT_IO_SUBMITTED ||
-        !completion_id ||
-        solver_codekd_test_completion_wait(
-            &completion, completion_id)) {
-        goto cleanup;
-    }
-    status = solver_codekd_packet_staged_ops.poll(
-        &fixture.input,
-        sizeof(fixture.input),
-        &fixture.packet,
-        sizeof(fixture.packet));
-    if (status != INDEX_SHARD_STAGED_IO_FAILED ||
+    if (status != INDEX_SHARD_STAGED_PREPARE_RESULTS_READY ||
+        completion_id ||
         fixture.packet.state != SOLVER_CODEKD_PACKET_RESULTS_READY ||
         fixture.packet.next_descriptor != fixture.packet.count ||
         fixture.packet.plan_complete ||
@@ -1038,11 +1038,16 @@ static int solver_codekd_test_detached_callback_error(void) {
     int result;
 
     if (solver_codekd_test_fixture_init(&fixture, 1U) ||
-        solver_codekd_test_seed_plan(&fixture)) {
+        solver_codekd_test_seed_plan(&fixture) ||
+        solver_codekd_packet_staged_ops.prepare(
+            &fixture.input,
+            sizeof(fixture.input),
+            &fixture.packet,
+            sizeof(fixture.packet)) !=
+                INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY) {
         return -1;
     }
     memset(&range, 0, sizeof(range));
-    fixture.packet.state = SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED;
     errno = 0;
     status = solver_codekd_packet_plan_codekd_pages(
         &fixture.packet,
@@ -1068,7 +1073,8 @@ static int solver_codekd_test_detached_refusal(void) {
     int status;
     int result = -1;
 
-    if (solver_codekd_test_fixture_init(&fixture, 2U)) {
+    if (solver_codekd_test_fixture_init(&fixture, 2U) ||
+        solver_codekd_test_seed_plan(&fixture)) {
         return -1;
     }
     fitsbin_payload_io_service_stop();
@@ -1178,6 +1184,9 @@ static int solver_codekd_test_detached_eagain(void) {
     if (!capacity_reached) {
         goto cleanup;
     }
+    if (solver_codekd_test_seed_plan(&fixture)) {
+        goto cleanup;
+    }
     status = solver_codekd_packet_staged_ops.prepare(
         &fixture.input,
         sizeof(fixture.input),
@@ -1195,8 +1204,10 @@ static int solver_codekd_test_detached_eagain(void) {
     if (status != INDEX_SHARD_STAGED_SUBMIT_RETRY ||
         completion_id ||
         fixture.packet.state !=
-            SOLVER_CODEKD_PACKET_DESCRIPTORS_READY ||
-        fixture.packet.next_descriptor != 0U ||
+            SOLVER_CODEKD_PACKET_PAGE_PLAN_COMPLETE ||
+        fixture.packet.next_descriptor != 1U ||
+        !fixture.packet.plan_complete ||
+        fixture.packet.plan_span_count != 1U ||
         fixture.packet.delivery_ticket ||
         fixture.packet.delivery_source) {
         goto cleanup;
@@ -1238,11 +1249,17 @@ static int solver_codekd_test_detached_cancellation(void) {
     int status;
     int result = -1;
 
-    if (solver_codekd_test_fixture_init(&fixture, 1U)) {
+    if (solver_codekd_test_fixture_init(&fixture, 1U) ||
+        solver_codekd_test_seed_plan(&fixture) ||
+        solver_codekd_packet_staged_ops.prepare(
+            &fixture.input,
+            sizeof(fixture.input),
+            &fixture.packet,
+            sizeof(fixture.packet)) !=
+                INDEX_SHARD_STAGED_PREPARE_SUBMIT_READY) {
         return -1;
     }
     memset(&range, 0, sizeof(range));
-    fixture.packet.state = SOLVER_CODEKD_PACKET_CODEKD_IO_SUBMITTED;
     errno = 0;
     status = solver_codekd_packet_plan_codekd_pages(
         &fixture.packet,
@@ -1262,6 +1279,9 @@ static int solver_codekd_test_detached_cancellation(void) {
     fixture.packet.page_plan_reason = SOLVER_CODEKD_PAGE_PLAN_NONE;
     memset(fixture.packet.page_stats.refusal_counts, 0,
            sizeof(fixture.packet.page_stats.refusal_counts));
+    if (solver_codekd_test_seed_plan(&fixture)) {
+        goto cleanup;
+    }
     if (solver_codekd_test_gate_init(&gate)) {
         goto cleanup;
     }

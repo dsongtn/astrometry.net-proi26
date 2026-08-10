@@ -162,11 +162,12 @@ static int index_shard_pool_submit(
       shared->staged_compute_ready ||
       shared->staged_reorder_ready ||
       shared->staged_compute_running_global ||
+      shared->staged_live_bytes ||
       shared->staged_submit_backpressure) {
     logerr("[index-shard] inner activity remained before pass "
            "helper_groups=%zu helper_ready=%zu preparations=%zu "
            "reservations=%zu "
-           "staged_groups=%zu tickets=%zu leases=%zu "
+           "staged_groups=%zu tickets=%zu leases=%zu live_bytes=%zu "
            "prepare_ready=%zu submit_ready=%zu submit_waiting=%zu "
            "submit_credit=%zu io_ready=%zu compute_ready=%zu "
            "reorder_ready=%zu "
@@ -178,6 +179,7 @@ static int index_shard_pool_submit(
            shared->staged_groups_active,
            shared->staged_tickets_active,
            shared->staged_source_leases,
+           shared->staged_live_bytes,
            shared->staged_prepare_ready,
            shared->staged_submit_ready,
            shared->staged_submit_waiting,
@@ -227,6 +229,10 @@ static int index_shard_pool_submit(
   shared->staged_compute_ready = 0U;
   shared->staged_reorder_ready = 0U;
   shared->staged_compute_running_global = 0U;
+  shared->staged_live_bytes = 0U;
+  shared->staged_live_bytes_peak = 0U;
+  shared->staged_live_bytes_limit =
+      INDEX_SHARD_STAGED_LIVE_BYTES_LIMIT;
   shared->staged_max_compute_running = 0U;
   shared->staged_max_compute_running_global = 0U;
   shared->staged_completion_epoch = 1U;
@@ -256,6 +262,9 @@ static int index_shard_pool_submit(
   shared->staged_submit_rearms = 0U;
   shared->staged_submit_handoffs = 0U;
   shared->staged_submit_deferrals = 0U;
+  shared->staged_live_acquires = 0U;
+  shared->staged_live_releases = 0U;
+  shared->staged_live_refusals = 0U;
   shared->staged_owner_wait_calls = 0U;
   shared->staged_owner_wait_seconds = 0.0;
   shared->staged_max_io_submitted = 0U;
@@ -268,6 +277,7 @@ static int index_shard_pool_submit(
   shared->staged_inline_poll_failures = 0U;
   shared->staged_execute_claims = 0U;
   shared->staged_owner_execute_claims = 0U;
+  shared->staged_prepare_seconds = 0.0;
   shared->staged_submit_to_ready_seconds = 0.0;
   shared->staged_ready_dwell_seconds = 0.0;
   shared->staged_execute_seconds = 0.0;
@@ -606,9 +616,11 @@ index_shard_solve_impl(onefield_t *bp,
       pool->shared.staged_compute_ready ||
       pool->shared.staged_reorder_ready ||
       pool->shared.staged_compute_running_global ||
+      pool->shared.staged_live_bytes ||
       pool->shared.staged_submit_backpressure) {
     logerr("[index-shard] staged activity remained after "
            "worker quiescence groups=%zu tickets=%zu leases=%zu "
+           "live_bytes=%zu "
            "prepare_ready=%zu submit_ready=%zu submit_waiting=%zu "
            "submit_credit=%zu io_ready=%zu compute_ready=%zu "
            "reorder_ready=%zu "
@@ -616,6 +628,7 @@ index_shard_solve_impl(onefield_t *bp,
            pool->shared.staged_groups_active,
            pool->shared.staged_tickets_active,
            pool->shared.staged_source_leases,
+           pool->shared.staged_live_bytes,
            pool->shared.staged_prepare_ready,
            pool->shared.staged_submit_ready,
            pool->shared.staged_submit_waiting,
@@ -625,6 +638,16 @@ index_shard_solve_impl(onefield_t *bp,
            pool->shared.staged_reorder_ready,
            pool->shared.staged_compute_running_global,
            pool->shared.staged_submit_backpressure);
+    rc = -1;
+    status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
+    helper_quiescence_valid = FALSE;
+  }
+  if (pool->shared.staged_live_acquires !=
+      pool->shared.staged_live_releases) {
+    logerr("[index-shard] staged live lease imbalance after "
+           "worker quiescence acquires=%llu releases=%llu\n",
+           pool->shared.staged_live_acquires,
+           pool->shared.staged_live_releases);
     rc = -1;
     status = INDEX_SHARD_SOLVE_TERMINAL_FAILURE;
     helper_quiescence_valid = FALSE;
@@ -892,12 +915,16 @@ index_shard_solve_impl(onefield_t *bp,
           "io_submitted=%llu io_completed=%llu submit_retries=%llu "
           "submit_rearms=%llu submit_handoffs=%llu "
           "submit_deferrals=%llu "
+          "live_bytes=%zu peak_live_bytes=%zu live_limit=%zu "
+          "live_acquires=%llu live_releases=%llu "
+          "live_refusals=%llu "
           "max_io_submitted=%zu max_compute_ready=%zu "
           "max_reorder_ready=%zu max_compute_running=%zu "
           "max_compute_running_global=%zu prepare_claims=%llu "
           "submit_claims=%llu poll_claims=%llu inline_polls=%llu "
           "inline_poll_failures=%llu execute_claims=%llu "
-          "owner_execute_claims=%llu submit_to_ready_sum=%.6f "
+          "owner_execute_claims=%llu prepare_sum=%.6f "
+          "submit_to_ready_sum=%.6f "
           "ready_dwell_sum=%.6f execute_sum=%.6f "
           "result_to_retire_sum=%.6f retire_sum=%.6f "
           "owner_waits=%llu owner_wait_seconds=%.6f\n",
@@ -916,6 +943,12 @@ index_shard_solve_impl(onefield_t *bp,
           pool->shared.staged_submit_rearms,
           pool->shared.staged_submit_handoffs,
           pool->shared.staged_submit_deferrals,
+          pool->shared.staged_live_bytes,
+          pool->shared.staged_live_bytes_peak,
+          pool->shared.staged_live_bytes_limit,
+          pool->shared.staged_live_acquires,
+          pool->shared.staged_live_releases,
+          pool->shared.staged_live_refusals,
           pool->shared.staged_max_io_submitted,
           pool->shared.staged_max_compute_ready,
           pool->shared.staged_max_reorder_ready,
@@ -928,6 +961,7 @@ index_shard_solve_impl(onefield_t *bp,
           pool->shared.staged_inline_poll_failures,
           pool->shared.staged_execute_claims,
           pool->shared.staged_owner_execute_claims,
+          pool->shared.staged_prepare_seconds,
           pool->shared.staged_submit_to_ready_seconds,
           pool->shared.staged_ready_dwell_seconds,
           pool->shared.staged_execute_seconds,
@@ -1056,6 +1090,9 @@ index_shard_solve_impl(onefield_t *bp,
           "descriptors=%llu complete=%llu boundary_deferrals=%llu "
           "raw_hints=%llu unique_pages=%llu coalesced_ranges=%llu "
           "logical_bytes=%llu aligned_bytes=%llu overread_bytes=%llu "
+          "spans=%llu/%llu topology_traversals=%llu "
+          "topology_replays_avoided=%llu execution_replays=%llu "
+          "hit_capacity_replays=%llu "
           "refusals=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu "
           "candidate_delivery=%llu quad=%llu/%llu/%llu "
           "star=%llu/%llu/%llu windows=%llu "
@@ -1075,6 +1112,12 @@ index_shard_solve_impl(onefield_t *bp,
           solver_profile.page_plan_logical_bytes,
           solver_profile.page_plan_aligned_bytes,
           solver_profile.page_plan_overread_bytes,
+          solver_profile.page_plan_spans,
+          solver_profile.page_plan_spans_executed,
+          solver_profile.page_plan_topology_traversals,
+          solver_profile.page_plan_topology_replays_avoided,
+          solver_profile.page_plan_execution_replays,
+          solver_profile.page_plan_hit_capacity_replays,
           solver_profile.page_plan_not_applicable,
           solver_profile.page_plan_allocation_refused,
           solver_profile.page_plan_source_mismatch,
