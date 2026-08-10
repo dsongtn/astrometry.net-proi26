@@ -27,7 +27,8 @@ Sections 1 through 13 preserve the reported six-hour development session on
 local time; the last field run completed at 23:02. Section 14 records the
 2026-08-09 to 2026-08-10 reduction work and supersedes the old candidate status
 and next gate in Sections 11 and 12. Section 15 records the later
-FITS/catalog-side proposal review.
+FITS/catalog-side proposal review. The current bounded continuation is recorded
+in `FINAL_REFERENCE_CONTINUATION.md` and supersedes any older next-action text.
 
 ## 2. Exact development identity
 
@@ -879,8 +880,67 @@ evidence directory:
   run_outputs/full_chain_compiled_span_recovery_20260810T092905Z
 ```
 
-The candidate is not yet `KEEP`. Rung 5 must compare APOD4, APOD1, and APOD5
-under fixed absolute producer, delivery, and byte widths at W1, W2, and W4,
-with full-manifest cold and immediate-repeat evidence, exact stop reasons, and
-scientific validation. The one-index local gain is insufficient to claim
-full-field scaling or cold-storage improvement.
+### 16.1 Rung 5 disposition
+
+Status: `REJECTED`; active source restored to Phase 00.
+
+The first quiet APOD1 pair showed 483 candidate tasks versus 551 control tasks.
+The reversed exact-AXY confirmation showed 577 candidate tasks versus 553
+control tasks. One material loss and one modest win did not establish the
+required repeatable field gain; combined candidate progress was 3.99 percent
+lower.
+
+Attribution ruled out the suspected integration faults. All retained spans
+executed, systematic replay and refusal were absent, and foreign helpers
+executed most compute packages while all downstream package classes remained
+active. Per-event delivery and owner-wait costs matched the control. There was
+therefore no evidence-earned localized correction available inside the
+bounded-persistence contract.
+
+APOD5 was neutral with additional resource cost. APOD4 improved on its cold
+run but regressed slightly on its immediate repeat. W1/W2/W4 scaling was not
+run because the candidate failed the field admission gate first.
+
+The candidate implementation and validation evidence remain preserved in the
+private mechanism-stop checkpoint and external evidence directory. The active
+worktree code paths were mechanically restored to the exact Phase 00 boundary,
+apart from retaining the later removal of one unrelated blank line at the end
+of `libkd/test_libkd.c`. The two pre-existing user-owned worktree changes were
+not modified.
+
+The post-rollback clean build installed engine SHA-256
+`1346f45b7d008b816593beb445196226e93ff205aa3ff19ec24ba81555a1078c`
+and configuration SHA-256
+`23e9c877b20bad9955ae8d0a799ee97a6cf096a83207072ce074f71731aa6c2a`.
+The configuration contains 349 unique indexes with ordered-manifest SHA-256
+`7ee54821c993f3a8ac16e212256d428bcf3a7b2f3308571866d3f2d88a27337e`.
+Candidate span symbols and telemetry strings are absent from the final linked
+engine. Focused unit and full W1/W4 integration gates passed on the restored
+source. The final private rollback boundary is
+`full-chain-compiled-span-recovery/phase-03-phase00-restored`.
+
+## 17. Single-pass exact-demand continuation disposition
+
+Status: `REJECTED / PHASE 08 RESTORED`.
+
+The final attempt applied the locally reviewed AMAC/PipeANN-style rescue
+direction without introducing another pool or payload representation. A
+bounded ring of exact native CodeKD continuations advanced to the next leaf,
+submitted that leaf's DATA/PERM page cover through the existing mapped
+provider, resumed after completion, and retained the complete Quad, Star, and
+verification helper chain. Owner-only canonical retirement and exact native
+fallback remained authoritative.
+
+The mechanism did not pass its one-index causal gate. The exact Phase 08
+control produced a 2.53-second immediate-repeat median and a 3.01-second
+index-advisory-evicted result. The best continuation observations remained
+approximately 2.67 and 3.10 seconds respectively. Wider rings reduced
+submissions and context switches but stopped improving wall time and increased
+RSS. A bulk topology advance and mapping-lifetime `mincore()` reuse were also
+neutral-to-negative and were removed.
+
+The production source and installed engine were restored to the exact Phase
+08 boundary. The rejected wavefront and bulk-advance symbols are absent from
+the final engine. Full design, measurements, and rollback details are in
+`FINAL_REFERENCE_CONTINUATION.md`; the source-pinned control capsule is in
+`evidence/phase08-exact-control/`.

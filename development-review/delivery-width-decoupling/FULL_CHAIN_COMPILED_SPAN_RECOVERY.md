@@ -1,6 +1,7 @@
 # Full-chain Compiled-span Recovery
 
-Status: `PROVISIONAL`; local Rung 4 winner; Rung 5 field admission pending.
+Status: `REJECTED`; local Rung 4 winner that failed repeatable Rung 5 field
+admission. Active source returned to the Phase 00 boundary.
 
 This is branch-local communication material for
 `test/delivery-width-decoupling`. It is not release documentation.
@@ -117,22 +118,47 @@ Completed against the exact postimage:
 TSan is `UNSUPPORTED` on the current VM because it aborts at startup before
 the test path runs.
 
-## Remaining decision gate
+## Rung 5 field decision
 
-The candidate remains `PROVISIONAL` until a source-identical Rung 5 campaign
-tests:
+The first quiet APOD1 candidate-then-control pair retired 483 candidate tasks
+and 551 control tasks, a 12.34 percent candidate loss. The exact-AXY reversed
+confirmation retired 577 candidate tasks and 553 control tasks, a 4.34 percent
+candidate gain. Combined progress was 3.99 percent lower for the candidate,
+and the paired directions disagreed materially.
 
-1. APOD4 shallow regression behavior;
-2. APOD1 and APOD5 independent deep behavior;
-3. W1, W2, and W4 with fixed absolute P1/D1/B16 MiB;
-4. full-manifest guest-page-cache-cold and immediate-repeat runs;
-5. stop-reason, winner, and normalized WCS validity;
-6. upper-tail latency, CPU, faults, input, context switches, and memory use.
+Verbose attribution favored the candidate by 5.50 percent, but its log volume
+changed execution economics and could not admit latency. It nevertheless
+closed the structural questions:
 
-`KEEP` requires repeatable end-to-end wall improvement and useful scaling.
-`REDUCE` applies if the full-chain mechanism wins but a separable compatibility
-or accounting path is unnecessary. `REJECT` applies if full-field performance
-does not preserve the local gain or if safety/scientific evidence fails.
+- all 2,027,792 retained spans executed;
+- there were no execution or hit-capacity replays;
+- there was no non-cancellation plan refusal;
+- foreign workers executed 61,003 compute packages versus 23,037 owner
+  packages;
+- Quad, Star, verification, and sweep stages remained active;
+- submit-to-ready and owner-wait cost per event matched the control.
+
+The candidate therefore did not fail because helper packages were removed,
+and attribution did not identify a stable localized correction. APOD5 was
+neutral with additional resource cost. APOD4 improved cold but regressed
+slightly on its immediate repeat. The required repeatable full-field gain was
+not established, so scaling was not admitted and the bounded-persistence rule
+ended the mechanism.
+
+The validated compiler, span-order, lifetime, fallback, and deterministic test
+material remain archived for possible future reuse. They are not production
+enabled. Active source was mechanically restored to the Phase 00 code boundary
+without changing the two pre-existing user-owned worktree edits.
+
+The restored boundary was then clean-built and installed. Every candidate
+production path matches the Phase 00 checkpoint, with only one unrelated final
+blank line omitted from `libkd/test_libkd.c`. Candidate identifiers are absent
+from the source, `libkd.a`, the built engine, and the installed engine. The
+restored integration path passed payload I/O, libkd, solver, worker-configuration,
+staged-lifecycle, engine-pass, canonical-order, W1/W4 scientific, cancellation,
+allocation-failure, and fallback checks. No post-rollback sanitizer rerun was
+required because the rollback re-established the previously validated Phase 00
+implementation without introducing production logic.
 
 ## Exact artifacts
 
@@ -147,6 +173,14 @@ private checkpoint:
   refs/local-checkpoints/astrometry.net-solver-tasks/
   full-chain-compiled-span-recovery/phase-01-full-chain-local-winner
 
+mechanism-stop checkpoint:
+  refs/local-checkpoints/astrometry.net-solver-tasks/
+  full-chain-compiled-span-recovery/phase-02-rung5-mechanism-stop
+
+restored-boundary checkpoint:
+  refs/local-checkpoints/astrometry.net-solver-tasks/
+  full-chain-compiled-span-recovery/phase-03-phase00-restored
+
 patch:
   run_outputs/full_chain_compiled_span_recovery_20260810T092905Z/
   full-chain-compiled-span-candidate.patch
@@ -157,4 +191,8 @@ patch SHA-256:
 compact evidence:
   run_outputs/full_chain_compiled_span_recovery_20260810T092905Z/
   EVIDENCE_SUMMARY.md
+
+final quiet confirmation:
+  run_outputs/full_chain_compiled_span_recovery_20260810T092905Z/
+  rung5-field-confirm-20260810T104453Z-pid816072/
 ```

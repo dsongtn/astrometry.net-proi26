@@ -1,0 +1,19 @@
+source_commit=eee1eda2683e7660a4ed900a92af2458dc24a9b2
+source_tree=1e21efc99b610ba7fdb2e83d9b0fea467b5b104e
+source_archive_sha256=235343120737ad2ce2b26ebe66232131e2166ba3cafb3fc93e06bd62729ffed1
+source_tracked_manifest_sha256=fcd5c900654e91be0051126bd15237ac404d6a749563763c66e29e0cd93b7662
+binary_sha256=9c4928497826cf45df0704404ab2ca536b4c08a561cfa080531701ca57783294
+binary_build_id=f5de1c40db52169756352e88b86b1462dac4526a
+compiler=gcc-13.3.0
+compile_revision=eee1eda2683e7660a4ed900a92af2458dc24a9b2
+compile_flags=-g -Wall -ffinite-math-only -fno-signaling-nans -pthread -march=native -O3 -fomit-frame-pointer -DNDEBUG -fpic -fPIC -Winline
+axy_sha256=65441f18a9b51e02a13318b92acca0fe38e00965006411467c985d04e35b7126
+index_sha256=0bfe80012338923d1a7db3a0660a00f67a79c9e8ca51563619001c32d6cb94d7
+workers=4
+cpu_affinity=0-3
+engine_arguments=-p -c none -i index-4107.fits -d RUN_DIR apod1.axy
+secondary_runtime_threads=1
+normalized_wcs_sha256=c739fee6dcd87f51aea100a7382b696ba1257fc3d9727db37146a9140ccd55ce
+output_isolation=bubblewrap bind-mounted one fresh private output directory over the AXY absolute output directory for each run
+file_eviction=POSIX_FADV_DONTNEED applied only to index-4107.fits before 04-index-advisory-evicted
+file_eviction_classification=index-only advisory eviction, not canonical cold

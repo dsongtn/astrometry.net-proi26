@@ -21,8 +21,13 @@ Read:
    causal measurement, rejection, and exact restoration result from the
    2026-08-10 bounded pipeline attempt.
 4. `FULL_CHAIN_COMPILED_SPAN_RECOVERY.md` for the corrected integration that
-   retains the complete downstream helper chain and its local admission
-   evidence.
+   retained the complete downstream helper chain, won locally, failed
+   repeatable field admission, and was restored to Phase 00.
+5. `FINAL_REFERENCE_CONTINUATION.md` for the exact-demand continuation attempt,
+   bounded causal measurements, rejected alternatives, and final exact Phase
+   08 restoration.
+6. `evidence/phase08-exact-control/` for the source-pinned one-index control
+   provenance, complete timing table, scientific digest, and capsule hashes.
 
 Communication is simplex from this branch: implementation status and evidence
 are updated here, while reviewer responses remain in
@@ -32,9 +37,9 @@ Implementation snapshot documented here:
 
 ```text
 branch: test/delivery-width-decoupling
-documentation HEAD before this result: 9cbba4738642c6a3ade7bbdf8675a7dfed836e8b
-active restored source tree: 5e486e9e0c6e0fc90d4942faf94ed3b82a7f70fa
-rejected candidate tree: bf65bf23d0d2a45f51b442e94b941854a9828286
+documentation HEAD before this result: a947b992e9cdbe757ab74c6b690e903272952bc1
+restored source checkpoint tree: 1e21efc99b610ba7fdb2e83d9b0fea467b5b104e
+rejected wavefront checkpoint tree: ba6bb0f241bc15511b8180ce3ec18f610a94f94e
 base: e07c44c2cd7995c684bfa20ab3dc7b861038e1b8
 review copy prepared: 2026-08-09
 last branch update: 2026-08-10
@@ -51,8 +56,24 @@ Current implementation decisions:
   repeatable 33.3% median regression in the source-exact bounded probe;
 - READY-to-consumption page-byte lease: implemented and verified only in the
   rejected candidate, then removed by exact restoration;
-- CodeKD inspector/executor fusion: structurally correct but `REJECTED` as part
-  of the complete pipeline because it did not repay lost downstream work;
+- CodeKD inspector/executor fusion: structurally correct and locally faster,
+  but not admitted because its full-field effect was not repeatable;
 - unchanged CodeKD-only/native-downstream candidate: `REJECTED`;
-- full-chain compiled-span replacement: `PROVISIONAL`, local Rung 4 winner;
-- aggregate field candidate: `NOT ADMITTED` until the Rung 5 matrix passes.
+- full-chain compiled-span replacement: `REJECTED`, despite its local Rung 4
+  win, because the two quiet APOD1 field pairs disagreed and combined progress
+  was lower;
+- positive-gap mapped-range bridging: `REMOVED`; overlap and adjacency merging
+  remain, while sparse mapped demand no longer reads an otherwise untouched
+  page solely to join two ranges;
+- in-place rolling descriptor prefix: `REJECTED` before implementation because
+  the existing all-or-nothing packet state cannot overlap one packet's CodeKD
+  tail with its own downstream retirement;
+- bounded first-packet lead split: `EXPERIMENT`; exact traversal equivalence,
+  lifecycle, sanitizer, allocation-failure, and small-fixture checks pass, but
+  no APOD1 field-performance claim exists yet;
+- single-pass CodeKD exact-demand wavefront: `REJECTED`; its best bounded
+  one-index measurements remained slower than the exact Phase 08 control;
+- mapping-lifetime `mincore()` reuse: `REJECTED`; it reduced population bytes
+  but added enough planning and system cost to remain neutral-to-negative;
+- aggregate field candidate: `NOT ADMITTED`; active source restored to the
+  exact Phase 08 boundary.
